@@ -84,6 +84,16 @@ This tiering is policy, not code invariant — enforced via deployment docs, not
 - `refs`: `HEAD` symbolic `ref: refs/heads/main` or detached hash or unborn; `read_head`/`write_head`/`read_ref`/`write_ref`/`resolve_head` all atomic.
 - `log` walks first-parent chain from `HEAD`, prints `commit hash`, `Author`, `Date`, message, supports `--oneline` and `--max-count`.
 
-## 8. Future (Phase 10)
+## 8. Remotes — Phase 5
 
-- `pack/` + delta, `fsck` full scan, `gc` reachability from `refs/*` + `HEAD`, streaming for large blobs, mmap for hot reads. Not in Phase 1-2.
+- Config `[remote "origin"] url = <path>` (filesystem path for Phase 5, `http` deferred). `config::add_remote`/`remove_remote`/`list_remotes`/`get_remote_url` parse INI sections `[remote "name"]`.
+- `remote.rs`: `resolve_remote_path` (handles `file://`, relative, `.itehaas` suffix, canonicalize, `http` error), `collect_reachable_objects` (commit→tree→blob→parents BFS, `HashSet` dedup), `transfer_objects` (collect reachable from `start_hash` via `write_object` hasher, copy missing `objects/ab/cdef` via `fs::copy`, algo mismatch check), `transfer_all_heads`, `list_remote_refs` (walk `refs/heads/*`).
+- `refs/remotes/<remote>/<branch>` stores fetched hash, not `refs/heads`. `fetch` transfers reachable from each remote `refs/heads/*` and updates `refs/remotes/<remote>/*`; does not touch working tree/index/`HEAD`.
+- `push` transfers reachable from local `refs/heads/<branch>` to remote, checks fast-forward via `merge::is_ancestor` (local repo, `NotFound→false`), rejects non-ff unless `--force`, then `write_ref` on remote.
+- `pull` = `fetch` + `merge` (`merge` with `refs/remotes/<remote>/<branch>` as feature, fast-forward or 3-way, `MERGE_HEAD` handling).
+- `clone <url> [<path>]`: `init` dest with remote's hasher, `add_remote` origin, `transfer_objects` for each remote head, `refs/remotes/origin/*` + `refs/heads/*` for HEAD branch, `checkout_branch_forced` (bypass dirty, since index empty vs HEAD with file).
+- Object reachability + `is_ancestor` (BFS, `NotFound→false`) ensures only missing objects copied, bounded concurrency (single process, `fs::copy`).
+
+## 9. Future (Phase 10)
+
+- `pack/` + delta, `fsck` full scan, `gc` reachability from `refs/*` + `HEAD`, streaming for large blobs, mmap for hot reads. Not in Phase 1-5.

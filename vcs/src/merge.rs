@@ -102,7 +102,11 @@ pub fn is_ancestor(repo: &Path, ancestor: &Hash, descendant: &Hash) -> Result<bo
     visited.insert(descendant.hex());
 
     while let Some(cur) = queue.pop_front() {
-        let obj = store::read_object(repo, &cur, hasher.as_ref())?;
+        let obj = match store::read_object(repo, &cur, hasher.as_ref()) {
+            Ok(o) => o,
+            Err(crate::error::ItehaasError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
         let parents = match obj {
             crate::object::Object::Commit(c) => c.parents,
             _ => vec![],

@@ -15,25 +15,25 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ## Current Status
 
-**Current Phase:** Phase 4 — Diff & Merge (Complete)
-**Current Task:** Phase 4 commit
-**Overall Progress:** 98 / ~140 tasks
+**Current Phase:** Phase 5 — Remote Repositories (Complete)
+**Current Task:** Phase 5 commit
+**Overall Progress:** 115 / ~140 tasks
 **Status:** ✅ Complete
 
 ### Last Completed
 
-- Phase 3 complete (refs, checkout, DAG, 44 tests)
-- Phase 4 implemented: diff (wt vs index, index vs HEAD, HEAD vs branch, unified via similar), merge (common ancestor BFS, is_ancestor, fast-forward, already-up-to-date, 3-way with O/A/B eq logic, conflict markers <<<<<<<, binary handling, MERGE_HEAD)
-- 11 new integration tests (phase4_tests.rs) + 44 existing = 55 passing; manual verified (fast-forward, 3-way no-conflict different files, conflict with markers and resolve, diff --staged and target, already-up-to-date, project success workflow init→branch→checkout→modify→merge)
-- Fixed commit to handle MERGE_HEAD second parent and cleanup, status now shows not_staged for conflicted (keeps current in index)
+- Phase 4 complete (diff, merge, 55 tests, fast-forward, 3-way, conflicts)
+- Phase 5 implemented: config [remote "name"], remote.rs (resolve_remote_path, collect_reachable_objects, transfer_objects, list_remote_refs), CLI remote/clone/fetch/push/pull, is_ancestor NotFound→false, checkout_forced for clone, push fast-forward check, merge for pull
+- 6 new integration tests (phase5_tests.rs) + 55 existing = 61 passing; manual verified (clone 3 objects, push 3 objects fast-forward, fetch 3 objects, pull fast-forward and 3-way merge, non-ff rejected, --force, divergent merge, remote -v, project workflow)
+- Fixed is_ancestor to handle missing descendant (returns false), push to check only local is_ancestor, clone to use forced checkout
 
 ### Currently Working On
 
-- Phase 4 commit + docs
+- Phase 5 commit + docs
 
 ### Next
 
-- Phase 5 — Remote Repositories (remote, clone, fetch, push, pull)
+- Phase 6 — Server & API (Fastify, Postgres, auth)
 
 ## Phase Status Table
 
@@ -44,7 +44,7 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 2 | Index, Staging & Workflow | ✅ Complete |
 | 3 | Branches & HEAD | ✅ Complete |
 | 4 | Diff & Merge | ✅ Complete |
-| 5 | Remotes | ⬜ Not Started |
+| 5 | Remotes | ✅ Complete |
 | 6 | Server & API | ⬜ Not Started |
 | 7 | Web Platform | ⬜ Not Started |
 | 8 | Collaboration | ⬜ Not Started |
@@ -329,27 +329,27 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 
 ### Scope
 
-- [ ] `itehaas remote` (add/list/remove)
-- [ ] Own HTTP transport protocol (initially, not Git compat)
-- [ ] `itehaas clone`
-- [ ] `itehaas fetch` (transfer objects, update `refs/remotes`)
-- [ ] `itehaas push` (send local objects to remote)
-- [ ] `itehaas pull` (fetch + merge)
-- [ ] Object transfer, ref advertisement
+- [x] `itehaas remote` (add/list/remove) — `vcs/src/config.rs:120`, `vcs/src/main.rs:700`, `remote -v` — 2026-09-01
+- [x] Own filesystem transport (initially, not Git compat; http deferred) — `vcs/src/remote.rs:1`, `resolve_remote_path` — 2026-09-01
+- [x] `itehaas clone` — `vcs/src/main.rs:1100`, `remote::transfer_objects` + `list_remote_refs` + `checkout_branch_forced` — 2026-09-01
+- [x] `itehaas fetch` (transfer objects, update `refs/remotes`) — `vcs/src/main.rs:1200`, `transfer_objects` for each remote ref — 2026-09-01
+- [x] `itehaas push` (send local objects to remote) — `vcs/src/main.rs:1400`, `is_ancestor` fast-forward check, `--force` — 2026-09-01
+- [x] `itehaas pull` (fetch + merge) — `vcs/src/main.rs:1500`, `fetch` + `merge` (fast-forward or 3-way) — 2026-09-01
+- [x] Object transfer, ref advertisement — `vcs/src/remote.rs:40`, `collect_reachable_objects` (commit→tree→blob→parents), `transfer_all_heads` — 2026-09-01
 
 ### Dependencies
 
-- Depends on: Phase 4 DAG, local repo complete
+- Depends on: Phase 4 DAG, local repo complete — met
 
 ### Definition of Done — Phase 5
 
-- [ ] Clone copies full history
-- [ ] Fetch brings new objects without merging working tree
-- [ ] Push sends missing objects to remote
-- [ ] Pull = fetch + merge
-- [ ] Handles concurrent push (rejected if non-fast-forward)
-- [ ] Tests for clone/fetch/push/pull, failure cases
-- [ ] Documentation updated
+- [x] Clone copies full history — `phase5_tests.rs:20`, manual `clone /tmp/origin /tmp/clone1` 3 objects, `base.txt` present, `refs/remotes/origin/main`
+- [x] Fetch brings new objects without merging working tree — manual `origin new` → `fetch` updates `refs/remotes/origin/main` (`b93e719`), working tree still old
+- [x] Push sends missing objects to remote — manual `clone1 feature` → `push` 3 objects, `origin` log shows `caca164`
+- [x] Pull = fetch + merge — manual `pull` fast-forward `b15de32` and 3-way merge `17aebb6` both verified, `ls *.txt` and `log --oneline`
+- [x] Handles concurrent push (rejected if non-fast-forward) — manual `origin diverge` vs `clone diverge` → `push` rejected, `push --force` succeeds, test `test_push_non_fast_forward_rejected`
+- [x] Tests for clone/fetch/push/pull, failure cases — 6 tests + CLI manual (hierarchical, dirty, invalid remote, already up to date)
+- [x] Documentation updated — `docs/architecture.md` Phase 5, `docs/storage.md` remotes, `PLAN.md`
 
 ## Phase 6 — Server & API
 
@@ -552,7 +552,7 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 
 ## Current Blockers
 
-- [ ] None — Phase 1 ready to commit
+- [ ] None
 
 ## Changelog
 
@@ -562,3 +562,4 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - 2026-09-01: Phase 2 complete — Index, staging, add/commit/status/log, 13 tests, 34 total.
 - 2026-09-01: Phase 3 complete — branches & checkout, DAG, 10 tests, 44 total.
 - 2026-09-01: Phase 4 complete — diff & merge, 11 tests, 55 total, fast-forward, 3-way, conflicts, project success workflow verified.
+- 2026-09-01: Phase 5 complete — remotes, clone/fetch/push/pull, 6 tests, 61 total, filesystem transport, fast-forward/non-ff, pull merge.

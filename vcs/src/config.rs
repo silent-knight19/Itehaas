@@ -131,3 +131,92 @@ pub fn write_user(repo: &Path, name: &str, email: &str) -> Result<()> {
     fs::write(config_path, content)?;
     Ok(())
 }
+
+pub fn add_remote(repo: &Path, name: &str, url: &str) -> Result<()> {
+    if name.is_empty() || name.contains(' ') || name.contains('/') || name.contains('"') {
+        return Err(ItehaasError::InvalidObject(format!("invalid remote name: {}", name)));
+    }
+    let config_path = repo.join(".itehaas").join("config");
+    let mut content = if config_path.exists() {
+        fs::read_to_string(&config_path)?
+    } else {
+        String::new()
+    };
+    let remote_header = format!("[remote \"{}\"]", name);
+    if content.contains(&remote_header) {
+        return Err(ItehaasError::Other(format!("remote '{}' already exists", name)));
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&format!("{} \n\turl = {}\n", remote_header, url));
+    fs::write(config_path, content)?;
+    Ok(())
+}
+
+pub fn remove_remote(repo: &Path, name: &str) -> Result<()> {
+    let config_path = repo.join(".itehaas").join("config");
+    if !config_path.exists() {
+        return Err(ItehaasError::Other(format!("remote '{}' not found", name)));
+    }
+    let content = fs::read_to_string(&config_path)?;
+    let remote_header = format!("[remote \"{}\"]", name);
+    if !content.contains(&remote_header) {
+        return Err(ItehaasError::Other(format!("remote '{}' not found", name)));
+    }
+    let mut out = String::new();
+    let mut skip = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == remote_header {
+            skip = true;
+            continue;
+        }
+        if skip && trimmed.starts_with('[') {
+            skip = false;
+        }
+        if !skip {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    fs::write(config_path, out)?;
+    Ok(())
+}
+
+pub fn list_remotes(repo: &Path) -> Result<Vec<(String, String)>> {
+    let config_path = repo.join(".itehaas").join("config");
+    if !config_path.exists() {
+        return Ok(vec![]);
+    }
+    let content = fs::read_to_string(&config_path)?;
+    let mut remotes = Vec::new();
+    let mut current_remote: Option<String> = None;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[remote \"") && trimmed.ends_with("\"]") {
+            let name = trimmed["[remote \"".len()..trimmed.len() - 2].to_string();
+            current_remote = Some(name);
+        } else if trimmed.starts_with('[') {
+            current_remote = None;
+        } else if let Some(ref name) = current_remote {
+            if trimmed.starts_with("url") {
+                if let Some(val) = trimmed.split('=').nth(1) {
+                    let url = val.trim().trim_matches('"').to_string();
+                    remotes.push((name.clone(), url));
+                }
+            }
+        }
+    }
+    Ok(remotes)
+}
+
+pub fn get_remote_url(repo: &Path, name: &str) -> Result<Option<String>> {
+    let remotes = list_remotes(repo)?;
+    for (n, url) in remotes {
+        if n == name {
+            return Ok(Some(url));
+        }
+    }
+    Ok(None)
+}

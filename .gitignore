@@ -1,8 +1,93 @@
-/target
-/node_modules
-/.itehaas
-/.vscode
-result
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+# Keep Cargo.lock for binary crates (commit it for reproducible builds)
+# Uncomment next line if this were a pure library:
+# Cargo.lock
+
+# Node.js
+node_modules/
+**/node_modules/
+.pnpm-store/
+.pnpm-debug.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.eslintcache
+.parcel-cache/
+.next/
+out/
+dist/
+build/
+.turbo/
+.vercel/
+.coverage/
+coverage/
+.nyc_output/
+
+# Itehaas VCS
+.itehaas/
+*.itehaas/
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# OS
 .DS_Store
+**/.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Env & Secrets
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+secrets/
+credentials.json
+serviceAccount.json
+
+# Logs & Temp
 *.log
+logs/
+tmp/
+temp/
+result
+result-*
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Testing & Coverage
+lcov.info
+coverage.xml
+*.profraw
+*.profdata
+tarpaulin-report.html
+cobertura.xml
+
+# Docker
+.docker/
+
+# Misc
+.cache/
+.parcel-cache

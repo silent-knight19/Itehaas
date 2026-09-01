@@ -7,6 +7,7 @@ pub mod index;
 pub mod merge;
 pub mod object;
 pub mod refs;
+pub mod remote;
 pub mod status;
 pub mod tree_builder;
 

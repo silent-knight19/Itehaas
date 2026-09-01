@@ -158,6 +158,60 @@ enum Commands {
         #[arg(short = 'm', long)]
         message: Option<String>,
     },
+    /// Manage remotes
+    Remote {
+        #[command(subcommand)]
+        command: Option<RemoteCommands>,
+        /// Verbose (show URLs)
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
+    /// Clone a repository
+    Clone {
+        /// Remote URL (filesystem path for Phase 5)
+        url: String,
+        /// Destination path
+        path: Option<PathBuf>,
+    },
+    /// Fetch from remote
+    Fetch {
+        /// Remote name (default origin)
+        remote: Option<String>,
+    },
+    /// Push to remote
+    Push {
+        /// Remote name (default origin)
+        remote: Option<String>,
+        /// Branch to push (default current branch)
+        branch: Option<String>,
+        /// Force push (allow non-fast-forward)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Pull from remote (fetch + merge)
+    Pull {
+        /// Remote name (default origin)
+        remote: Option<String>,
+        /// Branch to pull (default current branch)
+        branch: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteCommands {
+    /// Add a remote
+    Add {
+        name: String,
+        url: String,
+    },
+    /// Remove a remote
+    Remove {
+        name: String,
+    },
+    /// Remove a remote (alias)
+    Rm {
+        name: String,
+    },
 }
 
 fn find_repo_or_cwd() -> Result<PathBuf> {
@@ -334,6 +388,29 @@ fn main() -> Result<()> {
         Commands::Merge { branch, message } => {
             let repo = find_repo_or_cwd()?;
             cmd_merge(&repo, branch, message)?;
+        }
+        Commands::Remote { command, verbose } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_remote(&repo, command, verbose)?;
+        }
+        Commands::Clone { url, path } => {
+            cmd_clone(&url, path)?;
+        }
+        Commands::Fetch { remote } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_fetch(&repo, remote)?;
+        }
+        Commands::Push {
+            remote,
+            branch,
+            force,
+        } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_push(&repo, remote, branch, force)?;
+        }
+        Commands::Pull { remote, branch } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_pull(&repo, remote, branch)?;
         }
     }
     Ok(())
@@ -1169,6 +1246,274 @@ fn cmd_merge(repo: &Path, branch: String, message: Option<String>) -> Result<()>
     if let Some(msg) = message {
         println!("(custom message ignored for auto-merge, using default)");
         let _ = msg;
+    }
+    Ok(())
+}
+
+fn cmd_remote(repo: &Path, command: Option<RemoteCommands>, verbose: bool) -> Result<()> {
+    match command {
+        None => {
+            let remotes = config::list_remotes(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if remotes.is_empty() {
+                println!("No remotes");
+            } else {
+                for (name, url) in remotes {
+                    if verbose {
+                        println!("{} {} (fetch)", name, url);
+                        println!("{} {} (push)", name, url);
+                    } else {
+                        println!("{}", name);
+                    }
+                }
+            }
+        }
+        Some(RemoteCommands::Add { name, url }) => {
+            config::add_remote(repo, &name, &url).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            println!("Added remote '{}' -> {}", name, url);
+        }
+        Some(RemoteCommands::Remove { name }) | Some(RemoteCommands::Rm { name }) => {
+            config::remove_remote(repo, &name).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            println!("Removed remote '{}'", name);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_clone(url: &str, dest: Option<PathBuf>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    // Resolve remote path
+    let remote_path = {
+        let p = PathBuf::from(if url.starts_with("file://") { &url[7..] } else { url });
+        let ap = if p.is_absolute() { p } else { cwd.join(&p) };
+        // If ap is .itehaas dir, get parent
+        let cand = if ap.ends_with(".itehaas") {
+            ap.parent().unwrap().to_path_buf()
+        } else {
+            ap
+        };
+        cand.canonicalize().map_err(|_| anyhow::anyhow!("remote '{}' not found", url))?
+    };
+    if !remote_path.join(".itehaas").exists() {
+        anyhow::bail!("remote '{}' is not a repository", url);
+    }
+    let dest_path = if let Some(p) = dest {
+        if p.is_absolute() {
+            p
+        } else {
+            cwd.join(p)
+        }
+    } else {
+        // Derive from url basename
+        let base = remote_path.file_name().ok_or_else(|| anyhow::anyhow!("invalid remote url"))?;
+        let name = base.to_string_lossy().trim_end_matches(".itehaas").to_string();
+        let n = if name.is_empty() { "repo".to_string() } else { name };
+        cwd.join(n)
+    };
+    if dest_path.exists() {
+        anyhow::bail!("destination '{}' already exists", dest_path.display());
+    }
+    fs::create_dir_all(&dest_path)?;
+    let algo = config::read_hasher(&remote_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Init new repo
+    let new_repo = itehaas_lib::init(&dest_path, algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Copy config user? Not needed, but copy hasher already done via init
+    // Add remote origin
+    config::add_remote(&new_repo, "origin", url).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Copy objects and refs
+    let mut transferred = 0;
+    let remote_heads = itehaas_lib::remote::list_remote_refs(&remote_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if remote_heads.is_empty() {
+        println!("Cloned empty repository from {} to {}", url, dest_path.display());
+        return Ok(());
+    }
+    for (ref_name, hash) in &remote_heads {
+        transferred += itehaas_lib::remote::transfer_objects(&remote_path, &new_repo, hash)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // Write to refs/remotes/origin/*
+        let remote_ref = ref_name.replace("refs/heads/", "refs/remotes/origin/");
+        itehaas_lib::refs::write_ref(&new_repo, &remote_ref, hash)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    }
+    // Determine HEAD branch from remote
+    let remote_head = fs::read_to_string(remote_path.join(".itehaas").join("HEAD"))
+        .unwrap_or_else(|_| "ref: refs/heads/main".to_string());
+    let head_branch = if remote_head.trim().starts_with("ref: ") {
+        remote_head.trim()["ref: ".len()..].trim().to_string()
+    } else {
+        "refs/heads/main".to_string()
+    };
+    let head_branch_name = head_branch.strip_prefix("refs/heads/").unwrap_or("main");
+    // Find hash for that branch
+    let head_hash_opt = remote_heads
+        .iter()
+        .find(|(n, _)| n == &head_branch)
+        .map(|(_, h)| h.clone())
+        .or_else(|| remote_heads.first().map(|(_, h)| h.clone()));
+    if let Some(h) = head_hash_opt {
+        // Create local branch
+        itehaas_lib::refs::write_ref(&new_repo, &head_branch, &h)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        itehaas_lib::refs::write_head_ref(&new_repo, &head_branch)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // Checkout working tree (forced, since index is empty vs HEAD)
+        itehaas_lib::checkout::checkout_branch_forced(&new_repo, head_branch_name)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        println!(
+            "Cloned {} to {} ({} objects, branch {})",
+            url,
+            dest_path.display(),
+            transferred,
+            head_branch_name
+        );
+    } else {
+        println!("Cloned {} to {} (empty, {} objects)", url, dest_path.display(), transferred);
+    }
+    Ok(())
+}
+
+fn cmd_fetch(repo: &Path, remote_opt: Option<String>) -> Result<()> {
+    let remote_name = remote_opt.unwrap_or_else(|| "origin".to_string());
+    let url = config::get_remote_url(repo, &remote_name)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("remote '{}' not found", remote_name))?;
+    let remote_path = itehaas_lib::remote::resolve_remote_path(repo, &url)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let remote_algo = config::read_hasher(&remote_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if algo != remote_algo {
+        anyhow::bail!("hash algorithm mismatch: local {} vs remote {}", algo, remote_algo);
+    }
+    let remote_refs = itehaas_lib::remote::list_remote_refs(&remote_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if remote_refs.is_empty() {
+        println!("No refs from remote '{}'", remote_name);
+        return Ok(());
+    }
+    let mut fetched = 0;
+    for (ref_name, hash) in remote_refs {
+        // Transfer objects reachable from this ref that are missing locally
+        let already = itehaas_lib::object::store::object_path(repo, &hash).exists();
+        let transferred = itehaas_lib::remote::transfer_objects(&remote_path, repo, &hash)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        fetched += transferred;
+        // Update remote ref: refs/remotes/<remote>/<branch>
+        let branch = ref_name.strip_prefix("refs/heads/").unwrap();
+        let remote_ref = format!("refs/remotes/{}/{}", remote_name, branch);
+        itehaas_lib::refs::write_ref(repo, &remote_ref, &hash)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if already {
+            println!(" * branch {} -> {}", branch, &hash.hex()[..7]);
+        } else {
+            println!(" * new branch {} -> {}", branch, &hash.hex()[..7]);
+        }
+    }
+    println!("Fetched {} objects from {}", fetched, remote_name);
+    Ok(())
+}
+
+fn cmd_push(repo: &Path, remote_opt: Option<String>, branch_opt: Option<String>, force: bool) -> Result<()> {
+    let remote_name = remote_opt.unwrap_or_else(|| "origin".to_string());
+    let url = config::get_remote_url(repo, &remote_name)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("remote '{}' not found", remote_name))?;
+    let remote_path = itehaas_lib::remote::resolve_remote_path(repo, &url)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let remote_algo = config::read_hasher(&remote_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if algo != remote_algo {
+        anyhow::bail!("hash algorithm mismatch");
+    }
+    // Determine branch to push: current branch if not specified
+    let branch = if let Some(b) = branch_opt {
+        b
+    } else {
+        itehaas_lib::refs::current_branch(repo)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("cannot push detached HEAD, specify branch"))?
+    };
+    let local_ref = format!("refs/heads/{}", branch);
+    let local_hash = itehaas_lib::refs::read_ref(repo, &local_ref)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("branch '{}' has no commits", branch))?;
+    let remote_ref = format!("refs/heads/{}", branch);
+    let remote_hash_opt = itehaas_lib::refs::read_ref(&remote_path, &remote_ref)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    // Check fast-forward
+    if let Some(remote_hash) = &remote_hash_opt {
+        if remote_hash.hex() == local_hash.hex() {
+            println!("Already up to date.");
+            return Ok(());
+        }
+        if !force {
+            let is_ff = itehaas_lib::merge::is_ancestor(repo, remote_hash, &local_hash)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if !is_ff {
+                anyhow::bail!(
+                    "non-fast-forward push rejected (remote {} is not ancestor of local); use --force",
+                    &remote_hash.hex()[..7]
+                );
+            }
+        }
+    }
+
+    let transferred = itehaas_lib::remote::transfer_objects(repo, &remote_path, &local_hash)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    itehaas_lib::refs::write_ref(&remote_path, &remote_ref, &local_hash)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Also update remote's HEAD? Not needed
+    println!(
+        "Pushed {} to {} ({} objects)",
+        branch,
+        remote_name,
+        transferred
+    );
+    println!(" * {} -> {} {}", branch, remote_name, &local_hash.hex()[..7]);
+    Ok(())
+}
+
+fn cmd_pull(repo: &Path, remote_opt: Option<String>, branch_opt: Option<String>) -> Result<()> {
+    let remote_name = remote_opt.clone().unwrap_or_else(|| "origin".to_string());
+    // First fetch
+    cmd_fetch(repo, remote_opt.clone())?;
+    // Determine branch to merge: if branch_opt given, use that, else current
+    let target_branch = if let Some(b) = branch_opt {
+        b
+    } else {
+        itehaas_lib::refs::current_branch(repo)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("cannot pull detached HEAD without branch"))?
+    };
+    let remote_ref = format!("refs/remotes/{}/{}", remote_name, target_branch);
+    let remote_hash = itehaas_lib::refs::read_ref(repo, &remote_ref)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("remote branch '{}' not found after fetch", remote_ref))?;
+    let current_branch = itehaas_lib::refs::current_branch(repo)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("cannot pull in detached HEAD"))?;
+    let current_hash = itehaas_lib::refs::resolve_head(repo)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("HEAD has no commit"))?;
+
+    // If already up to date or fast-forward, handle
+    if remote_hash.hex() == current_hash.hex() {
+        println!("Already up to date.");
+        return Ok(());
+    }
+    // Use merge logic
+    let res = itehaas_lib::merge::merge(repo, &remote_ref, &remote_hash, &current_branch, &current_hash)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if res.already_up_to_date {
+        println!("Already up to date.");
+    } else if res.fast_forward {
+        println!("Fast-forward pull: {} -> {}", current_branch, target_branch);
+    } else if !res.conflicts.is_empty() {
+        println!("Pull resulted in conflicts:");
+        for c in res.conflicts {
+            println!("  CONFLICT in {}", c);
+        }
+        println!("Fix conflicts and commit.");
+    } else {
+        println!("Merge made: {} objects, {} staged", res.staged.len(), res.conflicts.len());
     }
     Ok(())
 }
