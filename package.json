@@ -1,0 +1,16 @@
+{
+  "name": "itehaas",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Git-inspired VCS + platform — monorepo root",
+  "scripts": {
+    "build:vcs": "cargo build -p itehaas",
+    "test:vcs": "cargo test -p itehaas",
+    "dev:server": "pnpm --filter server dev",
+    "dev:web": "pnpm --filter web dev"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,20 @@
+# Minimal — Phase 1 uses no services; Postgres added Phase 6
+# Run: docker compose up -d db
+# Bare-metal alternative: brew install postgresql@16 && brew services start postgresql@16
+
+# services:
+#   db:
+#     image: postgres:16-alpine
+#     environment:
+#       POSTGRES_DB: itehaas
+#       POSTGRES_USER: itehaas
+#       POSTGRES_PASSWORD: itehaas
+#     ports:
+#       - "5432:5432"
+#     volumes:
+#       - pgdata:/var/lib/postgresql/data
+
+# volumes:
+#   pgdata:
+
+# No services active in Phase 0/1
