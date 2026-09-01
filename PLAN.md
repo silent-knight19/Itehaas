@@ -15,26 +15,25 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ## Current Status
 
-**Current Phase:** Phase 2 — Index, Staging & Basic Workflow (Complete)
-**Current Task:** Phase 2 commit
-**Overall Progress:** 68 / ~140 tasks
+**Current Phase:** Phase 3 — Branches & HEAD (Complete)
+**Current Task:** Phase 3 commit
+**Overall Progress:** 82 / ~140 tasks
 **Status:** ✅ Complete
 
 ### Last Completed
 
-- Phase 1 complete (21 tests, CLI verified, empty blob 473a..., tree raw 32B)
-- Phase 2 implemented: Index (JSON BTreeMap, atomic), refs/HEAD (symbolic/unborn/detached), tree_builder (index → hierarchical trees), add (file/dir/., deletions, mode), commit (tree from index, parent, author, refs update), status (staged/not_staged/untracked with mode), log (walk first-parent, oneline)
-- 13 new integration tests (phase2_tests.rs) + 21 existing = 34 passing; manual workflow verified (init→add→commit→modify→add→commit→log, nested dirs, deletions, executable mode, mode change, binary, add from subdir)
-- Fixed commit parsing bug (committer prefix 10 not 7, now strip_prefix) and status mode comparison (hash+mode)
-- Manual CLI: `itehaas init → printf 'hello' > hello.txt → add → commit → modify → status → add . → commit → log --oneline` all green, 7 commits on /tmp/i2, empty-tree commit 6ef19b... verified
+- Phase 2 complete (Index, tree_builder, add/commit/status/log, 34 tests, mode fix)
+- Phase 3 implemented: refs branch helpers (list/create/delete/validate), checkout (working tree + index sync, dirty check, force, detached), CLI branch/checkout/switch, DAG independent histories
+- 10 new integration tests (phase3_tests.rs) + 34 existing = 44 passing; manual verified (branch create/list/delete, checkout switch/detached/-b with start point, hierarchical branch, dirty check, force, nested dirs, DAG, switch alias, invalid name)
+- Fixed tree/commit/tag parsing to strip_prefix (robust) and status to compare hash+mode
 
 ### Currently Working On
 
-- Phase 2 commit + docs
+- Phase 3 commit + docs
 
 ### Next
 
-- Phase 3 — Branches & HEAD (branch, checkout, DAG)
+- Phase 4 — Diff & Merge (diff, three-way merge, conflicts)
 
 ## Phase Status Table
 
@@ -43,8 +42,7 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 0 | Environment & Architecture | ✅ Complete |
 | 1 | Object Model & Store | ✅ Complete |
 | 2 | Index, Staging & Workflow | ✅ Complete |
-| 2 | Index, Staging & Workflow | ⬜ Not Started |
-| 3 | Branches & HEAD | ⬜ Not Started |
+| 3 | Branches & HEAD | ✅ Complete |
 | 4 | Diff & Merge | ⬜ Not Started |
 | 5 | Remotes | ⬜ Not Started |
 | 6 | Server & API | ⬜ Not Started |
@@ -280,23 +278,23 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 
 ### Scope
 
-- [ ] References (`refs/heads/*`, `refs/tags/*`)
-- [ ] `HEAD` (symbolic `ref: refs/heads/main` vs detached hash)
-- [ ] `itehaas branch` (list/create/delete)
-- [ ] `itehaas checkout` / `switch` (update HEAD + working tree)
-- [ ] `itehaas log` follows DAG correctly
+- [x] References (`refs/heads/*`, `refs/tags/*`) — `vcs/src/refs.rs:1`, list/create/delete/validate — 2026-09-01
+- [x] `HEAD` (symbolic `ref: refs/heads/main` vs detached hash) — `vcs/src/refs.rs:7`, unborn/detached handling — 2026-09-01
+- [x] `itehaas branch` (list/create/delete) — `vcs/src/main.rs:600`, validate, hierarchical, -d/-D — 2026-09-01
+- [x] `itehaas checkout` / `switch` (update HEAD + working tree) — `vcs/src/checkout.rs:1`, `vcs/src/main.rs:700`, -b/-c, -f, dirty check — 2026-09-01
+- [x] `itehaas log` follows DAG correctly — `vcs/src/main.rs:568`, first-parent walk, per-branch history — 2026-09-01
 
 ### Dependencies
 
-- Depends on: Phase 2 workflow, commit DAG
+- Depends on: Phase 2 workflow, commit DAG — met
 
 ### Definition of Done — Phase 3
 
-- [ ] Branches point to commits (no history duplication)
-- [ ] HEAD correctly tracks checked-out branch/commit
-- [ ] Checkout switches working tree and index
-- [ ] Tests for branch creation, checkout, detached HEAD
-- [ ] Documentation updated
+- [x] Branches point to commits (no history duplication) — `phase3_tests.rs:20`, DAG test shows independent histories sharing base
+- [x] HEAD correctly tracks checked-out branch/commit — `phase3_tests.rs:30`, symbolic vs detached, `read_head`/`write_head`
+- [x] Checkout switches working tree and index — `phase3_tests.rs:40`, `checkout.rs:1`, flatten + delete + write + index sync, nested dirs
+- [x] Tests for branch creation, checkout, detached HEAD — 10 tests + CLI manual (hierarchical, dirty, force, switch alias, invalid name)
+- [x] Documentation updated — `docs/storage.md` refs, `docs/architecture.md`, `PLAN.md`
 
 ## Phase 4 — Diff & Merge
 

@@ -104,6 +104,41 @@ enum Commands {
         /// Value (if setting)
         value: Option<String>,
     },
+    /// List, create, or delete branches
+    Branch {
+        /// Branch name to create (omit to list)
+        name: Option<String>,
+        /// Start point for new branch (default HEAD)
+        start_point: Option<String>,
+        /// Delete branch (use -d)
+        #[arg(short = 'd', long, group = "branch_action")]
+        delete: bool,
+        /// Force delete (use -D)
+        #[arg(short = 'D', long, group = "branch_action")]
+        force_delete: bool,
+    },
+    /// Switch branches or restore working tree
+    Checkout {
+        /// Branch or commit to checkout
+        target: Option<String>,
+        /// Create new branch before checkout (-b)
+        #[arg(short = 'b')]
+        create_branch: Option<String>,
+        /// Force checkout (ignore dirty working tree)
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
+    /// Switch branches (alias for checkout)
+    Switch {
+        /// Branch to switch to
+        branch: Option<String>,
+        /// Create new branch (-c)
+        #[arg(short = 'c')]
+        create_branch: Option<String>,
+        /// Force switch
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
 }
 
 fn find_repo_or_cwd() -> Result<PathBuf> {
@@ -238,6 +273,36 @@ fn main() -> Result<()> {
         Commands::Config { key, value } => {
             let repo = find_repo_or_cwd()?;
             cmd_config(&repo, key, value)?;
+        }
+        Commands::Branch {
+            name,
+            start_point,
+            delete,
+            force_delete,
+        } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_branch(&repo, name, start_point, delete, force_delete)?;
+        }
+        Commands::Checkout {
+            target,
+            create_branch,
+            force,
+        } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_checkout(&repo, target, create_branch, force)?;
+        }
+        Commands::Switch {
+            branch,
+            create_branch,
+            force,
+        } => {
+            let repo = find_repo_or_cwd()?;
+            // switch maps to checkout: if create_branch Some, then target is branch's start_point
+            if let Some(new_branch) = create_branch {
+                cmd_checkout(&repo, branch, Some(new_branch), force)?;
+            } else {
+                cmd_checkout(&repo, branch, None, force)?;
+            }
         }
     }
     Ok(())
@@ -590,6 +655,306 @@ fn cmd_config(repo: &Path, key: Option<String>, value: Option<String>) -> Result
                 anyhow::bail!("unknown config key: {} (supported: user.name, user.email)", k);
             }
         }
+    }
+    Ok(())
+}
+
+fn cmd_branch(
+    repo: &Path,
+    name: Option<String>,
+    start_point: Option<String>,
+    delete: bool,
+    force_delete: bool,
+) -> Result<()> {
+    if delete || force_delete {
+        let n = name.ok_or_else(|| anyhow::anyhow!("branch name required for deletion"))?;
+        if start_point.is_some() {
+            anyhow::bail!("cannot use start point with -d/-D");
+        }
+        itehaas_lib::refs::delete_branch(repo, &n).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        println!("Deleted branch {}", n);
+        return Ok(());
+    }
+    if let Some(n) = name {
+        // Create new branch
+        itehaas_lib::refs::validate_branch_name(&n).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // Check exists
+        let ref_name = format!("refs/heads/{}", n);
+        if itehaas_lib::refs::read_ref(repo, &ref_name)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .is_some()
+        {
+            anyhow::bail!("branch '{}' already exists", n);
+        }
+        // Resolve start point
+        let start = start_point.unwrap_or_else(|| "HEAD".to_string());
+        let hash = itehaas_lib::refs::resolve_rev(repo, &start)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("failed to resolve start point '{}'", start))?;
+        // Ensure start point is a commit
+        let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let obj = itehaas_lib::object::store::read_object(repo, &hash, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if !matches!(obj, Object::Commit(_)) {
+            anyhow::bail!("start point '{}' is not a commit", start);
+        }
+        itehaas_lib::refs::create_branch(repo, &n, &hash).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        println!("Created branch '{}' at {}", n, &hash.hex()[..7]);
+    } else {
+        // List
+        let branches = itehaas_lib::refs::list_branches(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let current = itehaas_lib::refs::current_branch(repo)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .unwrap_or_default();
+        let head = itehaas_lib::refs::read_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let is_detached = matches!(head, itehaas_lib::refs::Head::Detached(_));
+        if branches.is_empty() {
+            println!("No branches");
+            if is_detached {
+                println!("HEAD detached");
+            }
+            return Ok(());
+        }
+        for b in branches {
+            if b == current && !is_detached {
+                println!("* {}", b);
+            } else {
+                println!("  {}", b);
+            }
+        }
+        if is_detached {
+            if let itehaas_lib::refs::Head::Detached(h) = head {
+                println!("(HEAD detached at {})", &h.hex()[..7]);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_checkout(
+    repo: &Path,
+    target: Option<String>,
+    create_branch: Option<String>,
+    force: bool,
+) -> Result<()> {
+    // checkout -b <new> [start_point]
+    if let Some(new_branch) = create_branch {
+        // Validate new branch name
+        itehaas_lib::refs::validate_branch_name(&new_branch).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let ref_name = format!("refs/heads/{}", new_branch);
+        if itehaas_lib::refs::read_ref(repo, &ref_name)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .is_some()
+        {
+            anyhow::bail!("branch '{}' already exists", new_branch);
+        }
+        // Resolve start point
+        let start = target.unwrap_or_else(|| "HEAD".to_string());
+        let hash = itehaas_lib::refs::resolve_rev(repo, &start)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("failed to resolve start point '{}'", start))?;
+        // Check is commit
+        let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let obj = itehaas_lib::object::store::read_object(repo, &hash, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if !matches!(obj, Object::Commit(_)) {
+            anyhow::bail!("start point '{}' is not a commit", start);
+        }
+        itehaas_lib::refs::create_branch(repo, &new_branch, &hash)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // Now checkout that branch
+        if force {
+            // For force, bypass clean check via direct checkout with force flag
+            // Temporarily implement by calling checkout with force logic
+            // We'll use internal checkout that respects force
+            checkout_with_force(repo, &hash, false, Some(&new_branch), force)?;
+        } else {
+            itehaas_lib::checkout::checkout_branch(repo, &new_branch)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+        println!("Switched to a new branch '{}'", new_branch);
+        return Ok(());
+    }
+
+    // No create_branch — target is required
+    let tgt = target.ok_or_else(|| anyhow::anyhow!("target branch or commit required"))?;
+
+    // First, check if target is a branch
+    let branch_hash = itehaas_lib::refs::read_ref(repo, &format!("refs/heads/{}", tgt))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    if let Some(hash) = branch_hash {
+        // Checkout branch
+        if force {
+            checkout_with_force(repo, &hash, false, Some(&tgt), true)?;
+        } else {
+            itehaas_lib::checkout::checkout_branch(repo, &tgt)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+        println!("Switched to branch '{}'", tgt);
+        return Ok(());
+    }
+
+    // Try as hash or HEAD
+    let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Try HEAD
+    if tgt == "HEAD" {
+        let h = itehaas_lib::refs::resolve_head(repo)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("HEAD is unborn, no commit"))?;
+        if force {
+            checkout_with_force(repo, &h, true, None, true)?;
+        } else {
+            itehaas_lib::checkout::checkout_detached(repo, &h)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+        println!("Note: switching to '{}'.", tgt);
+        println!("You are in 'detached HEAD' state.");
+        return Ok(());
+    }
+
+    // Try as hash
+    if tgt.len() == algo.hex_len() {
+        if let Ok(hash) = Hash::from_hex(algo, &tgt) {
+            let path = itehaas_lib::object::store::object_path(repo, &hash);
+            if path.exists() {
+                let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let obj = itehaas_lib::object::store::read_object(repo, &hash, hasher.as_ref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if matches!(obj, Object::Commit(_)) {
+                    if force {
+                        checkout_with_force(repo, &hash, true, None, true)?;
+                    } else {
+                        itehaas_lib::checkout::checkout_detached(repo, &hash)
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    }
+                    println!("Note: switching to '{}'.", &tgt[..7]);
+                    println!("You are in 'detached HEAD' state.");
+                    return Ok(());
+                } else {
+                    anyhow::bail!("object '{}' is not a commit", tgt);
+                }
+            }
+        }
+    }
+
+    // Try resolve_rev as last fallback (covers branch via resolve_rev)
+    if let Some(hash) = itehaas_lib::refs::resolve_rev(repo, &tgt)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    {
+        // Check if it's a commit
+        let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let obj = itehaas_lib::object::store::read_object(repo, &hash, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if matches!(obj, Object::Commit(_)) {
+            // If target was a branch name, we would have caught earlier; this is hash path
+            if force {
+                checkout_with_force(repo, &hash, true, None, true)?;
+            } else {
+                itehaas_lib::checkout::checkout_detached(repo, &hash)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            }
+            println!("Note: switching to '{}'.", &tgt[..7.min(tgt.len())]);
+            println!("You are in 'detached HEAD' state.");
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("target '{}' not found (branch or commit)", tgt);
+}
+
+fn checkout_with_force(
+    repo: &Path,
+    hash: &Hash,
+    detached: bool,
+    branch: Option<&str>,
+    _force: bool,
+) -> Result<()> {
+    // For now, force just bypasses the clean check by directly calling low-level checkout
+    // We need a force version that doesn't check status
+    // Temporarily implement here by duplicating checkout logic without status check
+    let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let target_commit_obj = itehaas_lib::object::store::read_object(repo, hash, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let target_tree_hash = match target_commit_obj {
+        Object::Commit(c) => c.tree,
+        _ => anyhow::bail!("target is not a commit"),
+    };
+    let target_map =
+        itehaas_lib::tree_builder::flatten_tree_root(repo, &target_tree_hash, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Get current map for deletion (if HEAD exists)
+    let current_head = itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let current_map = if let Some(head_hash) = current_head {
+        let obj = itehaas_lib::object::store::read_object(repo, &head_hash, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let cur_tree = match obj {
+            Object::Commit(c) => c.tree,
+            _ => anyhow::bail!("HEAD is not a commit"),
+        };
+        itehaas_lib::tree_builder::flatten_tree_root(repo, &cur_tree, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    // Delete files not in target
+    for (path, _) in &current_map {
+        if !target_map.contains_key(path) {
+            let abs = repo.join(path);
+            if abs.exists() {
+                std::fs::remove_file(&abs)?;
+                if let Some(parent) = abs.parent() {
+                    let mut cur = parent.to_path_buf();
+                    while cur != *repo && cur.starts_with(repo) {
+                        match std::fs::remove_dir(&cur) {
+                            Ok(_) => {
+                                if let Some(p) = cur.parent() {
+                                    cur = p.to_path_buf();
+                                } else {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (path, (hash, mode)) in &target_map {
+        let abs = repo.join(path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let obj = itehaas_lib::object::store::read_object(repo, hash, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let content = match obj {
+            Object::Blob(b) => b.content,
+            _ => anyhow::bail!("tree entry {} is not blob", path),
+        };
+        std::fs::write(&abs, &content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = if *mode == 0o100755 { 0o755 } else { 0o644 };
+            let _ = std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(perm));
+        }
+    }
+    // Update index
+    let mut index = itehaas_lib::index::Index::new();
+    for (path, (hash, mode)) in target_map {
+        let entry = itehaas_lib::index::IndexEntry::new(path, hash, mode);
+        index.add_or_update(entry);
+    }
+    index.save(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if detached {
+        itehaas_lib::refs::write_head_detached(repo, hash).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    } else if let Some(branch) = branch {
+        let ref_name = format!("refs/heads/{}", branch);
+        itehaas_lib::refs::write_head_ref(repo, &ref_name).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     }
     Ok(())
 }

@@ -164,3 +164,81 @@ pub fn resolve_rev(repo: &Path, rev: &str) -> Result<Option<Hash>> {
     }
     Ok(None)
 }
+
+/// List all branches (refs/heads/*)
+pub fn list_branches(repo: &Path) -> Result<Vec<String>> {
+    let heads_dir = repo.join(".itehaas").join("refs").join("heads");
+    if !heads_dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut branches = Vec::new();
+    for entry in walkdir::WalkDir::new(&heads_dir).min_depth(1) {
+        let entry = entry.map_err(|e| ItehaasError::Other(e.to_string()))?;
+        let path = entry.path();
+        if path.is_file() {
+            let rel = path.strip_prefix(&heads_dir).unwrap();
+            let name = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+            branches.push(name);
+        }
+    }
+    branches.sort();
+    Ok(branches)
+}
+
+/// Validate branch name
+pub fn validate_branch_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(ItehaasError::InvalidObject("branch name cannot be empty".into()));
+    }
+    if name == "HEAD" {
+        return Err(ItehaasError::InvalidObject("branch name cannot be HEAD".into()));
+    }
+    if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+        return Err(ItehaasError::InvalidObject(format!("invalid branch name: {}", name)));
+    }
+    if name.contains(' ') || name.contains("..") || name.contains('~') || name.contains('^') || name.contains(':') || name.contains('?') || name.contains('*') || name.contains('[') || name.contains('\\') {
+        return Err(ItehaasError::InvalidObject(format!("invalid branch name: {}", name)));
+    }
+    if name.ends_with(".lock") || name.contains("@{") {
+        return Err(ItehaasError::InvalidObject(format!("invalid branch name: {}", name)));
+    }
+    // No component starting with .
+    for part in name.split('/') {
+        if part.is_empty() || part.starts_with('.') {
+            return Err(ItehaasError::InvalidObject(format!("invalid branch name: {}", name)));
+        }
+    }
+    Ok(())
+}
+
+/// Create a new branch at given hash
+pub fn create_branch(repo: &Path, name: &str, hash: &Hash) -> Result<()> {
+    validate_branch_name(name)?;
+    let ref_name = format!("refs/heads/{}", name);
+    if read_ref(repo, &ref_name)?.is_some() {
+        return Err(ItehaasError::Other(format!("branch '{}' already exists", name)));
+    }
+    write_ref(repo, &ref_name, hash)
+}
+
+/// Delete a branch
+pub fn delete_branch(repo: &Path, name: &str) -> Result<()> {
+    validate_branch_name(name)?;
+    let ref_name = format!("refs/heads/{}", name);
+    let current = current_branch(repo)?;
+    if let Some(cur) = current {
+        if cur == name {
+            return Err(ItehaasError::Other(format!("cannot delete branch '{}' which is currently checked out", name)));
+        }
+    }
+    let ref_path = repo.join(".itehaas").join(&ref_name);
+    if !ref_path.exists() {
+        return Err(ItehaasError::Other(format!("branch '{}' not found", name)));
+    }
+    std::fs::remove_file(&ref_path)?;
+    // Clean up empty parent dirs (e.g., refs/heads/feature)
+    if let Some(parent) = ref_path.parent() {
+        let _ = std::fs::remove_dir(parent); // ignore if not empty
+    }
+    Ok(())
+}
