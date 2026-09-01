@@ -2,39 +2,17 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
-import { query } from '../db';
-import { config } from '../config';
+import { query, getClient } from '../db';
 import { repoPathFor, execItehaas } from '../lib/vcs';
-import { sessionCookieName } from '../lib/auth';
+import { getSessionUser, requireAuth } from '../middleware/auth';
+import { canRead, canWrite, isAdmin } from '../lib/permissions';
 
-async function requireAuth(req: any, reply: any) {
-  const sessionId = req.cookies[sessionCookieName()];
-  if (!sessionId) {
-    reply.status(401).send({ error: 'not authenticated' });
-    return null;
-  }
-  const res = await query(
-    `SELECT u.id, u.username FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = $1 AND s.expires_at > now()`,
-    [sessionId]
-  );
-  if (res.rows.length === 0) {
-    reply.status(401).send({ error: 'session expired' });
-    return null;
-  }
-  return res.rows[0] as { id: string; username: string };
-}
-
-async function canRead(repoId: string, userId: string | null, visibility: string): Promise<boolean> {
-  if (visibility === 'public') return true;
-  if (!userId) return false;
-  const res = await query(`SELECT 1 FROM repository_members WHERE repo_id = $1 AND user_id = $2`, [repoId, userId]);
-  if (res.rows.length > 0) return true;
-  const owner = await query(`SELECT owner_id FROM repositories WHERE id = $1`, [repoId]);
-  return owner.rows[0]?.owner_id === userId;
+function validateOwnerRepo(owner: string, repo: string): boolean {
+  return /^[a-zA-Z0-9._-]{1,100}$/.test(owner) && /^[a-zA-Z0-9._-]{1,100}$/.test(repo);
 }
 
 export async function repoRoutes(app: FastifyInstance) {
-  // Create repo
+  // Create repo: POST /api/repos
   app.post('/api/repos', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
@@ -48,30 +26,35 @@ export async function repoRoutes(app: FastifyInstance) {
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { name, description, visibility } = parsed.data;
 
-    // Check existing
     const exists = await query(`SELECT id FROM repositories WHERE owner_id = $1 AND name = $2`, [user.id, name]);
     if (exists.rows.length > 0) return reply.status(409).send({ error: 'repository already exists' });
 
-    const repoRes = await query(
-      `INSERT INTO repositories (owner_id, name, description, visibility) VALUES ($1, $2, $3, $4) RETURNING id, name, description, visibility, default_branch, created_at`,
-      [user.id, name, description, visibility]
-    );
-    const repo = repoRes.rows[0];
+    const client = await getClient();
+    let repo: any = null;
+    try {
+      await client.query('BEGIN');
+      const repoRes = await client.query(
+        `INSERT INTO repositories (owner_id, name, description, visibility) VALUES ($1, $2, $3, $4) RETURNING id, name, description, visibility, default_branch, created_at`,
+        [user.id, name, description, visibility]
+      );
+      repo = repoRes.rows[0];
+      await client.query(`INSERT INTO repository_members (repo_id, user_id, role) VALUES ($1, $2, 'admin')`, [repo.id, user.id]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
 
-    // Add owner as admin member
-    await query(`INSERT INTO repository_members (repo_id, user_id, role) VALUES ($1, $2, 'admin')`, [repo.id, user.id]);
-
-    // Create VCS repo on filesystem
     const repoPath = repoPathFor(user.username, name);
     try {
       await fs.promises.mkdir(path.dirname(repoPath), { recursive: true });
       const res = await execItehaas(['init', repoPath]);
       if (res.code !== 0) {
-        // Rollback DB
         await query(`DELETE FROM repositories WHERE id = $1`, [repo.id]);
         return reply.status(500).send({ error: `vcs init failed: ${res.stderr}` });
       }
-      // Ensure hasher is sha256 (default)
     } catch (e: any) {
       await query(`DELETE FROM repositories WHERE id = $1`, [repo.id]);
       return reply.status(500).send({ error: e.message });
@@ -80,37 +63,44 @@ export async function repoRoutes(app: FastifyInstance) {
     return reply.status(201).send({ repo: { ...repo, owner: user.username } });
   });
 
-  // List repos (public + user's)
+  // List repos (public + user's) with pagination
   app.get('/api/repos', async (req, reply) => {
-    const sessionId = (req.cookies as any)[sessionCookieName()];
-    let userId: string | null = null;
-    if (sessionId) {
-      const r = await query(`SELECT user_id FROM sessions WHERE id = $1 AND expires_at > now()`, [sessionId]);
-      if (r.rows.length > 0) userId = r.rows[0].user_id;
-    }
+    const user = await getSessionUser(req as any);
+    const userId = user?.id ?? null;
 
-    const q = userId
-      ? `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.created_at, u.username as owner
+    const qLimit = Math.min(Math.max(parseInt((req.query as any)?.limit ?? '100', 10) || 100, 1), 100);
+    const qOffset = Math.max(parseInt((req.query as any)?.offset ?? '0', 10) || 0, 0);
+
+    const baseWhere = userId
+      ? `WHERE r.visibility = 'public' OR r.owner_id = $1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id = r.id AND m.user_id = $1)`
+      : `WHERE r.visibility = 'public'`;
+
+    const sql = `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.created_at, r.updated_at, u.username as owner
          FROM repositories r JOIN users u ON r.owner_id = u.id
-         WHERE r.visibility = 'public' OR r.owner_id = $1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id = r.id AND m.user_id = $1)
-         ORDER BY r.updated_at DESC LIMIT 100`
-      : `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.created_at, u.username as owner
-         FROM repositories r JOIN users u ON r.owner_id = u.id WHERE r.visibility = 'public' ORDER BY r.updated_at DESC LIMIT 100`;
+         ${baseWhere}
+         ORDER BY r.updated_at DESC LIMIT $${userId ? 2 : 1} OFFSET $${userId ? 3 : 2}`;
 
-    const params = userId ? [userId] : [];
-    const res = await query(q, params);
+    const params = userId ? [userId, String(qLimit), String(qOffset)] : [String(qLimit), String(qOffset)];
+    // pg expects params for LIMIT/OFFSET as text but we use int via parse, simpler to inline
+    const res = await query(
+      userId
+        ? `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.created_at, r.updated_at, u.username as owner
+           FROM repositories r JOIN users u ON r.owner_id = u.id
+           WHERE r.visibility = 'public' OR r.owner_id = $1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id = r.id AND m.user_id = $1)
+           ORDER BY r.updated_at DESC LIMIT ${qLimit} OFFSET ${qOffset}`
+        : `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.created_at, r.updated_at, u.username as owner
+           FROM repositories r JOIN users u ON r.owner_id = u.id WHERE r.visibility = 'public' ORDER BY r.updated_at DESC LIMIT ${qLimit} OFFSET ${qOffset}`,
+      userId ? [userId] : []
+    );
     return reply.send({ repos: res.rows });
   });
 
   // Get single repo
   app.get('/api/repos/:owner/:repo', async (req, reply) => {
     const { owner, repo } = req.params as any;
-    const sessionId = (req.cookies as any)[sessionCookieName()];
-    let userId: string | null = null;
-    if (sessionId) {
-      const r = await query(`SELECT user_id FROM sessions WHERE id = $1 AND expires_at > now()`, [sessionId]);
-      if (r.rows.length > 0) userId = r.rows[0].user_id;
-    }
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const user = await getSessionUser(req as any);
+    const userId = user?.id ?? null;
 
     const res = await query(
       `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.created_at, r.updated_at, u.username as owner, u.id as owner_id
@@ -122,16 +112,62 @@ export async function repoRoutes(app: FastifyInstance) {
     const ok = await canRead(row.id, userId, row.visibility);
     if (!ok) return reply.status(404).send({ error: 'not found' });
 
-    // Try to get HEAD info via VCS
-    let head: string | null = null;
-    let branches: string[] = [];
-    try {
-      const repoPath = repoPathFor(owner, repo);
-      const headRes = await execItehaas(['log', '--oneline'], { cwd: repoPath });
-      // Not needed for now
-    } catch {}
-
     return reply.send({ repo: row });
+  });
+
+  // Update repo (PATCH) - admin only
+  app.patch('/api/repos/:owner/:repo', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    if (owner !== user.username) {
+      // only owner can patch via username check, but also allow admin member? For now owner only for visibility change
+      // Check admin
+      const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id = u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+      if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+      const can = await isAdmin(r.rows[0].id, user.id);
+      if (!can) return reply.status(403).send({ error: 'forbidden' });
+    }
+
+    const schema = z.object({
+      description: z.string().max(500).optional(),
+      visibility: z.enum(['public', 'private']).optional(),
+      default_branch: z.string().min(1).max(100).regex(/^[a-zA-Z0-9._/-]+$/).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
+    const { description, visibility, default_branch } = parsed.data;
+    if (description === undefined && visibility === undefined && default_branch === undefined) {
+      return reply.status(400).send({ error: 'no fields to update' });
+    }
+
+    const fields: string[] = [];
+    const vals: any[] = [];
+    let idx = 1;
+    if (description !== undefined) { fields.push(`description = $${idx++}`); vals.push(description); }
+    if (visibility !== undefined) { fields.push(`visibility = $${idx++}`); vals.push(visibility); }
+    if (default_branch !== undefined) { fields.push(`default_branch = $${idx++}`); vals.push(default_branch); }
+    vals.push(owner);
+    vals.push(repo);
+    // Need owner_id join: update via id lookup
+    const idRes = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$${idx++} AND r.name=$${idx++}`, vals.slice(-2));
+    // Simpler: get id then update
+    const repoIdRes = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (repoIdRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const repoId = repoIdRes.rows[0].id;
+    const setClause = fields.join(', ');
+    const updateVals = [...vals.slice(0, -2), repoId];
+    // rebuild with correct placeholders
+    const finalFields: string[] = [];
+    const finalVals: any[] = [];
+    let fIdx = 1;
+    if (description !== undefined) { finalFields.push(`description = $${fIdx++}`); finalVals.push(description); }
+    if (visibility !== undefined) { finalFields.push(`visibility = $${fIdx++}`); finalVals.push(visibility); }
+    if (default_branch !== undefined) { finalFields.push(`default_branch = $${fIdx++}`); finalVals.push(default_branch); }
+    finalVals.push(repoId);
+    const upd = await query(`UPDATE repositories SET ${finalFields.join(', ')}, updated_at = now() WHERE id = $${fIdx} RETURNING id, name, description, visibility, default_branch, updated_at`, finalVals);
+    return reply.send({ repo: upd.rows[0] });
   });
 
   // Delete repo (owner only)
@@ -139,6 +175,7 @@ export async function repoRoutes(app: FastifyInstance) {
     const user = await requireAuth(req, reply);
     if (!user) return;
     const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     if (owner !== user.username) return reply.status(403).send({ error: 'forbidden' });
 
     const res = await query(
@@ -148,6 +185,7 @@ export async function repoRoutes(app: FastifyInstance) {
     if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const repoId = res.rows[0].id;
 
+    // Verify admin (owner is always admin)
     await query(`DELETE FROM repositories WHERE id = $1`, [repoId]);
 
     const repoPath = repoPathFor(owner, repo);
@@ -158,13 +196,123 @@ export async function repoRoutes(app: FastifyInstance) {
     return reply.send({ ok: true });
   });
 
-  // List refs / branches via VCS
+  // Members: list
+  app.get('/api/repos/:owner/:repo/members', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const user = await getSessionUser(req as any);
+    const res = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const { id: repoId, visibility } = res.rows[0];
+    const ok = await canRead(repoId, user?.id ?? null, visibility);
+    if (!ok) return reply.status(404).send({ error: 'not found' });
+
+    const members = await query(
+      `SELECT u.username, u.email, m.role, m.created_at FROM repository_members m JOIN users u ON m.user_id=u.id WHERE m.repo_id=$1 ORDER BY m.created_at`,
+      [repoId]
+    );
+    // include owner as admin if not in members? Owner is inserted as admin, so list covers.
+    return reply.send({ members: members.rows });
+  });
+
+  // Members: add
+  app.post('/api/repos/:owner/:repo/members', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+
+    const res = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const repoId = res.rows[0].id;
+    if (!(await isAdmin(repoId, user.id))) return reply.status(403).send({ error: 'forbidden' });
+
+    const schema = z.object({
+      username: z.string().min(3).max(32).regex(/^[a-zA-Z0-9._-]+$/),
+      role: z.enum(['read', 'write', 'admin']).default('read'),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
+    const { username, role } = parsed.data;
+
+    const target = await query(`SELECT id FROM users WHERE username=$1`, [username]);
+    if (target.rows.length === 0) return reply.status(404).send({ error: 'user not found' });
+    const targetId = target.rows[0].id;
+    if (targetId === user.id) return reply.status(400).send({ error: 'cannot add yourself' });
+
+    try {
+      await query(`INSERT INTO repository_members (repo_id, user_id, role) VALUES ($1,$2,$3)`, [repoId, targetId, role]);
+    } catch (e: any) {
+      if (e.code === '23505') return reply.status(409).send({ error: 'already a member' });
+      throw e;
+    }
+    return reply.status(201).send({ ok: true, username, role });
+  });
+
+  // Members: remove
+  app.delete('/api/repos/:owner/:repo/members/:username', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo, username } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+
+    const res = await query(`SELECT r.id, r.owner_id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const { id: repoId, owner_id } = res.rows[0];
+    if (!(await isAdmin(repoId, user.id))) return reply.status(403).send({ error: 'forbidden' });
+
+    const target = await query(`SELECT id FROM users WHERE username=$1`, [username]);
+    if (target.rows.length === 0) return reply.status(404).send({ error: 'user not found' });
+    const targetId = target.rows[0].id;
+    if (targetId === owner_id) return reply.status(400).send({ error: 'cannot remove owner' });
+
+    const del = await query(`DELETE FROM repository_members WHERE repo_id=$1 AND user_id=$2`, [repoId, targetId]);
+    if (del.rowCount === 0) return reply.status(404).send({ error: 'not a member' });
+    return reply.send({ ok: true });
+  });
+
+  // Members: update role
+  app.patch('/api/repos/:owner/:repo/members/:username', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo, username } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+
+    const res = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const repoId = res.rows[0].id;
+    if (!(await isAdmin(repoId, user.id))) return reply.status(403).send({ error: 'forbidden' });
+
+    const schema = z.object({ role: z.enum(['read', 'write', 'admin']) });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
+
+    const target = await query(`SELECT id FROM users WHERE username=$1`, [username]);
+    if (target.rows.length === 0) return reply.status(404).send({ error: 'user not found' });
+    const targetId = target.rows[0].id;
+
+    const upd = await query(`UPDATE repository_members SET role=$1 WHERE repo_id=$2 AND user_id=$3 RETURNING role`, [parsed.data.role, repoId, targetId]);
+    if (upd.rows.length === 0) return reply.status(404).send({ error: 'not a member' });
+    return reply.send({ ok: true, role: upd.rows[0].role });
+  });
+
+  // List branches via VCS (requires read)
   app.get('/api/repos/:owner/:repo/branches', async (req, reply) => {
     const { owner, repo } = req.params as any;
-    const repoPath = repoPathFor(owner, repo);
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const { id: repoId, visibility } = r.rows[0];
+    if (!(await canRead(repoId, user?.id ?? null, visibility))) return reply.status(404).send({ error: 'not found' });
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
     const res = await execItehaas(['branch'], { cwd: repoPath });
-    if (res.code !== 0) return reply.status(500).send({ error: res.stderr });
-    // Parse "  main\n* feature\n"
+    if (res.code !== 0) {
+      if (res.stderr.includes('not a repository')) return reply.status(404).send({ error: 'repo not initialized' });
+      return reply.status(500).send({ error: res.stderr });
+    }
     const branches = res.stdout
       .split('\n')
       .map((l) => l.trim())
@@ -173,33 +321,257 @@ export async function repoRoutes(app: FastifyInstance) {
     return reply.send({ branches });
   });
 
-  // Get commit log
+  // Get commit log (requires read)
   app.get('/api/repos/:owner/:repo/log', async (req, reply) => {
     const { owner, repo } = req.params as any;
-    const repoPath = repoPathFor(owner, repo);
-    const res = await execItehaas(['log', '--oneline'], { cwd: repoPath });
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const { id: repoId, visibility } = r.rows[0];
+    if (!(await canRead(repoId, user?.id ?? null, visibility))) return reply.status(404).send({ error: 'not found' });
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    const maxCount = Math.min(Math.max(parseInt((req.query as any)?.max_count ?? '100', 10) || 100, 1), 200);
+    const wantFull = (req.query as any)?.full === '1' || (req.query as any)?.full === 'true';
+    // Default to full hash for web (Phase 7) to enable tree browsing. Keep oneline for backwards compat if ?short=1
+    if ((req.query as any)?.short === '1') {
+      const args = ['log', '--oneline', '--max-count', String(maxCount)];
+      const res = await execItehaas(args, { cwd: repoPath });
+      if (res.code !== 0) {
+        if (res.stderr.includes('no commits yet')) return reply.send({ commits: [] });
+        return reply.status(500).send({ error: res.stderr });
+      }
+      const commits = res.stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => {
+          const [hash, ...msg] = line.split(' ');
+          return { hash, message: msg.join(' ') };
+        });
+      return reply.send({ commits });
+    }
+    // Full hash mode: parse `itehaas log` (no --oneline)
+    const args = ['log', '--max-count', String(maxCount)];
+    const res = await execItehaas(args, { cwd: repoPath });
     if (res.code !== 0) {
-      // No commits yet returns error "no commits yet" — treat as empty
       if (res.stderr.includes('no commits yet')) return reply.send({ commits: [] });
       return reply.status(500).send({ error: res.stderr });
     }
-    const commits = res.stdout
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => {
-        const [hash, ...msg] = line.split(' ');
-        return { hash, message: msg.join(' ') };
-      });
+    // Parse full log: split by "\ncommit "
+    const raw = res.stdout.trim();
+    if (!raw) return reply.send({ commits: [] });
+    const blocks = raw.split('\ncommit ').map((b, i) => (i === 0 ? b : 'commit ' + b));
+    const commits: { hash: string; message: string; author?: string; date?: string }[] = [];
+    for (const block of blocks) {
+      const lines = block.split('\n');
+      const first = lines[0] || '';
+      const m = first.match(/^commit ([0-9a-f]{64})$/);
+      if (!m) continue;
+      const hash = m[1];
+      let author = '';
+      let date = '';
+      let msgLines: string[] = [];
+      let inMsg = false;
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.startsWith('Author:')) author = line.slice(7).trim();
+        else if (line.startsWith('Date:')) date = line.slice(5).trim();
+        else if (line.trim() === '' && !inMsg) {
+          // blank separates header and message
+          if (lines[i + 1]?.startsWith('    ')) inMsg = true;
+        } else if (inMsg) {
+          // message lines are indented 4 spaces
+          msgLines.push(line.replace(/^    /, ''));
+        }
+      }
+      const message = msgLines.join('\n').trim().split('\n')[0] || '';
+      commits.push({ hash, message, author, date });
+      if (commits.length >= maxCount) break;
+    }
     return reply.send({ commits });
   });
 
-  // Get tree / file via VCS (simple)
+  // Get tree / file via VCS (requires read)
   app.get('/api/repos/:owner/:repo/tree/:hash', async (req, reply) => {
     const { owner, repo, hash } = req.params as any;
-    const repoPath = repoPathFor(owner, repo);
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    if (!/^[0-9a-f]{64}$/.test(hash)) return reply.status(400).send({ error: 'invalid hash' });
     const res = await execItehaas(['cat-file', '-p', hash], { cwd: repoPath });
     if (res.code !== 0) return reply.status(404).send({ error: 'not found' });
     return reply.send({ content: res.stdout });
+  });
+
+  // Get file content at branch: GET /api/repos/:owner/:repo/file/*?ref=main
+  app.get('/api/repos/:owner/:repo/file/*', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    const wildcard = (req.params as any)['*'] as string | undefined;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+    return reply.status(501).send({ error: 'not implemented: use tree/:hash with commit traversal in Phase 7' });
+  });
+
+  // Remote operations: fetch & push (delegates to Rust engine via execItehaas)
+  // POST /api/repos/:owner/:repo/fetch { remote?: string }
+  app.post('/api/repos/:owner/:repo/fetch', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const { id: repoId, visibility } = r.rows[0];
+    // fetch requires read (any member), but we require write for server-side fetch to avoid anon abuse
+    if (!(await canRead(repoId, user.id, visibility))) return reply.status(404).send({ error: 'not found' });
+    // also need at least read; if private and not member, already 404. For canWrite vs canRead, allow read.
+
+    const schema = z.object({ remote: z.string().min(1).max(100).regex(/^[a-zA-Z0-9._-]+$/).optional().default('origin') });
+    const parsed = schema.safeParse(req.body ?? {});
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
+    const { remote } = parsed.data;
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    const res = await execItehaas(['fetch', remote], { cwd: repoPath });
+    if (res.code !== 0) return reply.status(500).send({ error: res.stderr || res.stdout });
+    return reply.send({ ok: true, remote, output: res.stdout.trim() });
+  });
+
+  // POST /api/repos/:owner/:repo/push { remote?: string, branch?: string, force?: boolean }
+  app.post('/api/repos/:owner/:repo/push', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+
+    const r = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const repoId = r.rows[0].id;
+    if (!(await canWrite(repoId, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
+
+    const schema = z.object({
+      remote: z.string().min(1).max(100).regex(/^[a-zA-Z0-9._-]+$/).optional().default('origin'),
+      branch: z.string().min(1).max(100).regex(/^[a-zA-Z0-9._/-]+$/).optional(),
+      force: z.boolean().optional().default(false),
+    });
+    const parsed = schema.safeParse(req.body ?? {});
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
+    const { remote, branch, force } = parsed.data;
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    const args = ['push', remote];
+    if (branch) args.push(branch);
+    if (force) args.push('--force');
+    const res = await execItehaas(args, { cwd: repoPath });
+    if (res.code !== 0) {
+      // non-fast-forward maps to 500 with message, but client may want 409
+      if (res.stderr.includes('non-fast-forward')) return reply.status(409).send({ error: res.stderr.trim() });
+      return reply.status(500).send({ error: res.stderr || res.stdout });
+    }
+    return reply.send({ ok: true, remote, output: res.stdout.trim() });
+  });
+
+  // POST /api/repos/:owner/:repo/pull { remote?: string, branch?: string }
+  app.post('/api/repos/:owner/:repo/pull', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+
+    const r = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const repoId = r.rows[0].id;
+    if (!(await canWrite(repoId, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
+
+    const schema = z.object({
+      remote: z.string().min(1).max(100).regex(/^[a-zA-Z0-9._-]+$/).optional().default('origin'),
+      branch: z.string().min(1).max(100).regex(/^[a-zA-Z0-9._/-]+$/).optional(),
+    });
+    const parsed = schema.safeParse(req.body ?? {});
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
+    const { remote, branch } = parsed.data;
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    const args = ['pull', remote];
+    if (branch) args.push(branch);
+    const res = await execItehaas(args, { cwd: repoPath });
+    if (res.code !== 0) return reply.status(500).send({ error: res.stderr || res.stdout });
+    return reply.send({ ok: true, remote, output: res.stdout.trim() });
+  });
+
+  // Remote management: list/add/remove remotes via VCS config
+  app.get('/api/repos/:owner/:repo/remotes', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    const res = await execItehaas(['remote', '-v'], { cwd: repoPath });
+    if (res.code !== 0) return reply.status(500).send({ error: res.stderr });
+    // Parse lines like "origin file:///tmp/x (fetch)"
+    const remotes: { name: string; url: string }[] = [];
+    for (const line of res.stdout.split('\n')) {
+      const m = line.trim().match(/^(\S+)\s+(\S+)\s+\(fetch\)$/);
+      if (m) remotes.push({ name: m[1], url: m[2] });
+    }
+    return reply.send({ remotes });
+  });
+
+  app.post('/api/repos/:owner/:repo/remotes', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const r = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await isAdmin(r.rows[0].id, user.id))) return reply.status(403).send({ error: 'forbidden' });
+
+    const schema = z.object({ name: z.string().min(1).max(100).regex(/^[a-zA-Z0-9._-]+$/), url: z.string().min(1).max(500) });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
+    const { name, url } = parsed.data;
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    const res = await execItehaas(['remote', 'add', name, url], { cwd: repoPath });
+    if (res.code !== 0) {
+      if (res.stderr.includes('already exists')) return reply.status(409).send({ error: res.stderr.trim() });
+      return reply.status(500).send({ error: res.stderr });
+    }
+    return reply.status(201).send({ ok: true, name, url });
+  });
+
+  app.delete('/api/repos/:owner/:repo/remotes/:name', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo, name } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const r = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await isAdmin(r.rows[0].id, user.id))) return reply.status(403).send({ error: 'forbidden' });
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    const res = await execItehaas(['remote', 'remove', name], { cwd: repoPath });
+    if (res.code !== 0) return reply.status(500).send({ error: res.stderr });
+    return reply.send({ ok: true });
   });
 }

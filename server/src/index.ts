@@ -4,6 +4,10 @@ import fastifyCors from '@fastify/cors';
 import { config } from './config';
 import { authRoutes } from './routes/auth';
 import { repoRoutes } from './routes/repos';
+import { issueRoutes } from './routes/issues';
+import { pullRoutes } from './routes/pulls';
+import { starRoutes } from './routes/stars';
+import { ciRoutes } from './routes/ci';
 
 async function buildApp() {
   const app = Fastify({
@@ -20,6 +24,10 @@ async function buildApp() {
 
   await app.register(authRoutes);
   await app.register(repoRoutes);
+  await app.register(issueRoutes);
+  await app.register(pullRoutes);
+  await app.register(starRoutes);
+  await app.register(ciRoutes);
 
   // Global error handler
   app.setErrorHandler((err, _req, reply) => {

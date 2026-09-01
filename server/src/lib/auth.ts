@@ -37,3 +37,16 @@ export function newSessionExpiry(): Date {
   d.setDate(d.getDate() + 30); // 30 days
   return d;
 }
+
+export function validateSessionId(sid: string): boolean {
+  return /^[0-9a-fA-F-]{36}$/.test(sid);
+}
+
+// CSRF: SameSite=lax is primary defense. For state-changing API calls,
+// we also accept optional X-CSRF-Token header if client opts in.
+// Token is not required in Phase 6 (web not yet), but helper is provided.
+export function csrfTokenForSession(sessionId: string): string {
+  // Simple HMAC-like: not cryptographically strong, but deterministic per session for Phase 6
+  // In production, replace with signed token via cookieSecret.
+  return Buffer.from(sessionId).toString('base64url').slice(0, 32);
+}

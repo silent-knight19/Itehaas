@@ -195,6 +195,19 @@ enum Commands {
         /// Branch to pull (default current branch)
         branch: Option<String>,
     },
+    /// Verify object integrity (fsck)
+    Fsck,
+    /// Garbage collect unreachable objects
+    Gc {
+        /// Prune unreachable objects (delete)
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Create packfile from loose objects
+    Pack,
+    /// Count loose objects
+    #[command(name = "count-objects")]
+    CountObjects,
 }
 
 #[derive(Subcommand)]
@@ -411,6 +424,22 @@ fn main() -> Result<()> {
         Commands::Pull { remote, branch } => {
             let repo = find_repo_or_cwd()?;
             cmd_pull(&repo, remote, branch)?;
+        }
+        Commands::Fsck => {
+            let repo = find_repo_or_cwd()?;
+            cmd_fsck(&repo)?;
+        }
+        Commands::Gc { prune } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_gc(&repo, prune)?;
+        }
+        Commands::Pack => {
+            let repo = find_repo_or_cwd()?;
+            cmd_pack(&repo)?;
+        }
+        Commands::CountObjects => {
+            let repo = find_repo_or_cwd()?;
+            cmd_count_objects(&repo)?;
         }
     }
     Ok(())
@@ -1514,6 +1543,54 @@ fn cmd_pull(repo: &Path, remote_opt: Option<String>, branch_opt: Option<String>)
         println!("Fix conflicts and commit.");
     } else {
         println!("Merge made: {} objects, {} staged", res.staged.len(), res.conflicts.len());
+    }
+    Ok(())
+}
+
+fn cmd_fsck(repo: &Path) -> Result<()> {
+    let report = itehaas_lib::fsck::fsck(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    println!("fsck: checked {} objects", report.total);
+    if report.corrupted.is_empty() && report.missing_refs.is_empty() {
+        println!("ok: no corruption");
+    } else {
+        for c in &report.corrupted {
+            println!("corrupt: {}", c);
+        }
+        for m in &report.missing_refs {
+            println!("missing ref: {}", m);
+        }
+        anyhow::bail!("fsck found {} corrupted, {} missing refs", report.corrupted.len(), report.missing_refs.len());
+    }
+    if report.unreachable > 0 {
+        println!("unreachable: {} objects (run `itehaas gc --prune`)", report.unreachable);
+    }
+    Ok(())
+}
+
+fn cmd_gc(repo: &Path, prune: bool) -> Result<()> {
+    let unreachable = itehaas_lib::gc::gc(repo, prune).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if prune {
+        println!("gc: pruned {} unreachable objects", unreachable);
+    } else {
+        println!("gc: found {} unreachable objects (use --prune to delete)", unreachable);
+    }
+    Ok(())
+}
+
+fn cmd_pack(repo: &Path) -> Result<()> {
+    let (path, count, orig, packed) = itehaas_lib::pack::create_pack(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    println!("pack: created {} with {} objects ({} -> {} bytes, {:.1}% )", path.display(), count, orig, packed, (packed as f64 / orig as f64 * 100.0));
+    let verified = itehaas_lib::pack::verify_pack(repo, &path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    println!("pack: verified {} entries", verified);
+    Ok(())
+}
+
+fn cmd_count_objects(repo: &Path) -> Result<()> {
+    let count = itehaas_lib::fsck::count_objects(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let packs = itehaas_lib::pack::list_packs(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    println!("count: {} loose objects, {} packs", count, packs.len());
+    for p in packs {
+        println!("  pack: {}", p.display());
     }
     Ok(())
 }

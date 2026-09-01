@@ -2,11 +2,12 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { query } from '../db';
 import { hashPassword, verifyPassword, validateUsername, validatePassword, validateEmail, sessionCookieName, newSessionExpiry } from '../lib/auth';
-import { v4 as uuid } from 'uuid';
+import { cleanupExpiredSessions } from '../middleware/auth';
 
 export async function authRoutes(app: FastifyInstance) {
   // Register
   app.post('/api/auth/register', async (req, reply) => {
+    await cleanupExpiredSessions();
     const schema = z.object({
       username: z.string().min(3).max(32),
       email: z.string().email(),
@@ -63,6 +64,7 @@ export async function authRoutes(app: FastifyInstance) {
 
   // Login
   app.post('/api/auth/login', async (req, reply) => {
+    await cleanupExpiredSessions();
     const schema = z.object({
       username: z.string(),
       password: z.string(),

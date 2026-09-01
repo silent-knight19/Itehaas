@@ -1,7 +1,9 @@
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 
+// Load from server/.env when running via tsx (src), and from project root when running compiled
 dotenv.config({ path: path.join(__dirname, '../.env') });
+dotenv.config({ path: path.join(__dirname, '../../.env') });
 dotenv.config();
 
 export const config = {

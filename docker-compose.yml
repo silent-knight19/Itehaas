@@ -1,20 +1,63 @@
-# Minimal — Phase 1 uses no services; Postgres added Phase 6
-# Run: docker compose up -d db
-# Bare-metal alternative: brew install postgresql@16 && brew services start postgresql@16
+# Phase 10: Full stack — Postgres + Fastify + Next.js
+# Bare-metal: brew postgresql@16 + cargo run + pnpm dev
 
-# services:
-#   db:
-#     image: postgres:16-alpine
-#     environment:
-#       POSTGRES_DB: itehaas
-#       POSTGRES_USER: itehaas
-#       POSTGRES_PASSWORD: itehaas
-#     ports:
-#       - "5432:5432"
-#     volumes:
-#       - pgdata:/var/lib/postgresql/data
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: itehaas
+      POSTGRES_USER: itehaas
+      POSTGRES_PASSWORD: itehaas
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U itehaas -d itehaas"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
-# volumes:
-#   pgdata:
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      DATABASE_URL: postgres://itehaas:itehaas@db:5432/itehaas
+      REPOS_ROOT: /data/repos
+      ITEHAAS_BIN: /usr/local/bin/itehaas
+      COOKIE_SECRET: change-me-in-production
+      NODE_ENV: production
+    volumes:
+      - ./data/repos:/data/repos
+      - ./target/debug/itehaas:/usr/local/bin/itehaas:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["node", "dist/index.js"]
 
-# No services active in Phase 0/1
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:3001
+    depends_on:
+      - server
+
+  # CI Runner (Phase 9) — optional, Docker-isolated
+  # runner:
+  #   build: ./runner
+  #   environment:
+  #     DATABASE_URL: postgres://itehaas:itehaas@db:5432/itehaas
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   depends_on:
+  #     - db
+
+volumes:
+  pgdata:
