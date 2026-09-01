@@ -497,6 +497,26 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Web tests (Playwright for critical flows) — `pnpm --filter web build` 7 routes ok, Vitest deferred — 2026-09-01
 - [x] CI: `cargo test && pnpm test` on each commit — `65 Rust + 28 Server + web build` — 2026-09-01
 
+## UI/UX Redesign v2 — Design Engineering & Anti-Slop Overhaul
+
+- [x] UI audit v2 (`docs/ui-audit-v2.md`) — 2026-09-01
+- [x] Design tokens v2 (`docs/design-system.md`) — 2026-09-01
+- [x] UI copy guidelines (`docs/ui-copy-guidelines.md`) — 2026-09-01
+- [x] Motion system v2 (`docs/motion-system.md`) — 2026-09-01
+- [x] Phase 1: Global typography (`GeistSans` + `GeistMono` integration) — `web/app/layout.tsx:3` — 2026-09-01
+- [x] Phase 2: Neutral palette & token system (90% neutral, scarce accent) — `web/app/globals.css:6` — 2026-09-01
+- [x] Phase 3: AppShell & desktop navigation (quiter sidebar, clean topbar without fake telemetry) — `web/components/AppShell.tsx:1` — 2026-09-01
+- [x] Phase 4: Command palette (`⌘K` fuzzy search & instant shortcuts) — `web/components/CommandPalette.tsx:1` — 2026-09-01
+- [x] Phase 5: Repository list & workspace (unboxed list/table hybrid, concise copy) — `web/app/page.tsx:1` — 2026-09-01
+- [x] Phase 6: Repository header & navigation (restrained star/clone, subtle tab glide) — `web/components/RepoHeader.tsx:1` — 2026-09-01
+- [x] Phase 7: Code browser & explorer (unboxed file explorer, subtle mode bits) — `web/components/FileTree.tsx:1` — 2026-09-01
+- [x] Phase 8: README document experience (embedded reading surface, 720px max reading width) — `web/components/MarkdownViewer.tsx:1` — 2026-09-01
+- [x] Phase 9: Commits history (editorial chronological ledger, subtle graph line, sans subjects) — `web/components/CommitList.tsx:1` — 2026-09-01
+- [x] Phase 10: Branches & collaboration (dense tables, linear issues, operational PRs) — `web/app/[owner]/[repo]/branches|issues|pulls` — 2026-09-01
+- [x] Phase 11: Diff viewer (syntax-focused, line-numbered, low-saturation additions/deletions) — `web/components/DiffViewer.tsx:1` — 2026-09-01
+- [x] Phase 12: Micro-interactions & reduced-motion verification — `web/app/globals.css:75` — 2026-09-01
+- [x] Phase 13: Final visual QA (zero card obsession, zero blue fatigue, zero fake telemetry) — `pnpm --filter web build` 10 routes 87KB — 2026-09-01
+
 ## Deployment
 
 - [x] Local dev mode (bare `cargo run` + `pnpm dev` + brew PG, no Docker) — `pnpm --filter server dev` + `pnpm --filter web dev` — 2026-09-01

@@ -9,10 +9,36 @@ export async function verifyPassword(hash: string, password: string): Promise<bo
   return argon2.verify(hash, password);
 }
 
+const RESERVED_USERNAMES = new Set([
+  'login',
+  'register',
+  'api',
+  'health',
+  'settings',
+  'explore',
+  '_next',
+  'admin',
+  'root',
+  'owner',
+  'repo',
+]);
+
+export function isReservedUsername(username: string): boolean {
+  return RESERVED_USERNAMES.has(username.toLowerCase());
+}
+
 export function validateUsername(username: string): string | null {
   if (!/^[a-zA-Z0-9._-]{3,32}$/.test(username)) {
     return 'username must be 3-32 chars, alphanumeric + ._-';
   }
+  if (isReservedUsername(username)) {
+    return 'username is reserved';
+  }
+  return null;
+}
+
+export function validateBio(bio: string): string | null {
+  if (bio.length > 160) return 'bio must be at most 160 characters';
   return null;
 }
 

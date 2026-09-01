@@ -48,7 +48,7 @@ export async function authRoutes(app: FastifyInstance) {
         expires,
       });
 
-      return reply.status(201).send({ user: { id: user.id, username: user.username, email: user.email } });
+      return reply.status(201).send({ user: { id: user.id, username: user.username, email: user.email, created_at: user.created_at } });
     } catch (e: any) {
       if (e.code === '23505') {
         // unique violation
@@ -73,7 +73,7 @@ export async function authRoutes(app: FastifyInstance) {
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { username, password } = parsed.data;
 
-    const res = await query(`SELECT id, username, email, password_hash FROM users WHERE username = $1 OR email = $1`, [username]);
+    const res = await query(`SELECT id, username, email, password_hash, created_at FROM users WHERE username = $1 OR email = $1`, [username]);
     if (res.rows.length === 0) return reply.status(401).send({ error: 'invalid credentials' });
     const user = res.rows[0];
     const ok = await verifyPassword(user.password_hash, password);
@@ -91,7 +91,7 @@ export async function authRoutes(app: FastifyInstance) {
       expires,
     });
 
-    return reply.send({ user: { id: user.id, username: user.username, email: user.email } });
+    return reply.send({ user: { id: user.id, username: user.username, email: user.email, created_at: user.created_at } });
   });
 
   // Logout
@@ -110,10 +110,15 @@ export async function authRoutes(app: FastifyInstance) {
     if (!sessionId) return reply.status(401).send({ error: 'not authenticated' });
 
     const res = await query(
-      `SELECT u.id, u.username, u.email FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = $1 AND s.expires_at > now()`,
+      `SELECT u.id, u.username, u.email, u.created_at FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = $1 AND s.expires_at > now()`,
       [sessionId]
     );
-    if (res.rows.length === 0) return reply.status(401).send({ error: 'session expired' });
-    return reply.send({ user: res.rows[0] });
+    if (res.rows.length === 0) {
+      reply.clearCookie(sessionCookieName(), { path: '/' });
+      return reply.status(401).send({ error: 'not authenticated' });
+    }
+
+    const user = res.rows[0];
+    return reply.send({ user: { id: user.id, username: user.username, email: user.email, created_at: user.created_at } });
   });
 }

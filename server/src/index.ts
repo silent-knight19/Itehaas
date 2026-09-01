@@ -8,6 +8,7 @@ import { issueRoutes } from './routes/issues';
 import { pullRoutes } from './routes/pulls';
 import { starRoutes } from './routes/stars';
 import { ciRoutes } from './routes/ci';
+import { userRoutes } from './routes/users';
 
 async function buildApp() {
   const app = Fastify({
@@ -28,6 +29,7 @@ async function buildApp() {
   await app.register(pullRoutes);
   await app.register(starRoutes);
   await app.register(ciRoutes);
+  await app.register(userRoutes);
 
   // Global error handler
   app.setErrorHandler((err, _req, reply) => {

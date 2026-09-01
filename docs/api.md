@@ -122,9 +122,37 @@ Requires `canRead`. Runs `execItehaas(['log','--oneline','--max-count',String(ma
 
 ### GET /api/repos/:owner/:repo/tree/:hash
 
-Requires `canRead`. Validates `hash ^[0-9a-f]{64}$`, runs `execItehaas(['cat-file','-p',hash],{cwd})` (`server/src/routes/repos.ts:368`).
+Requires `canRead`. Validates `hash ^[0-9a-f]{64}$`, runs `execItehaas(['cat-file','-p',hash],{cwd})` (`server/src/routes/repos.ts:398`).
 
 `200 { content: string }`, `400 invalid hash`, `404 not found`.
+
+### GET /api/repos/:owner/:repo/refs — Advertise Refs for HTTP Clone (v1)
+
+Requires `canRead` (private → 404 mask). Strict http base validation (`http(s)://host/api/repos/<owner>/<repo>`), `canRead` check, then `execItehaas(['branch'])` + `HEAD` + `config` hasher.
+
+`200 { refs: [{name: "refs/heads/main", hash: "64hex"}, ...], head: "refs/heads/main", hasher: "sha256" }` (`server/src/routes/repos.ts:303`).
+Sorted by `name`, regex validated `refs/heads/<branch>` + branch name `^[a-zA-Z0-9._\/-]+$`. Anonymous private → `404 not found`.
+
+```bash
+curl http://localhost:3001/api/repos/alice/app/refs
+curl -H "Authorization: Bearer <session>" http://localhost:3001/api/repos/alice/private/refs
+```
+
+### GET /api/repos/:owner/:repo/objects/:hash — Raw Object Bytes for HTTP Clone (v1)
+
+Requires `canRead` (private → 404 mask). Validates `hash ^[0-9a-f]{64}$`, `repoPathFor` traversal guard.
+
+Streams `application/octet-stream` zlib bytes from `data/repos/<owner>/<repo>/.itehaas/objects/ab/cdef...` (fanout `2/62` for SHA-256), `fs.createReadStream` (not buffered, no 1MiB cap). Checks `size <= 64 MiB` else `413`, `Cache-Control: public, max-age=31536000, immutable`, `X-Content-Type-Options: nosniff`, `X-Object-Hash: <hash>` (`server/src/routes/repos.ts:347`).
+
+Auth: `Cookie: itehaas_session=<uuid>` or `Authorization: Bearer <uuid>` (checked in `server/src/middleware/auth.ts:13` — UUID `^[0-9a-fA-F-]{36}$`, expiry `sessions.expires_at > now()`).
+
+`200 octet-stream`, `400 invalid hash`, `404 Object not found` / `not found` (masked), `413 Object too large`.
+
+```bash
+curl http://localhost:3001/api/repos/alice/app/objects/<64hex> --output obj.bin
+curl -H "Cookie: itehaas_session=..." http://localhost:3001/api/repos/alice/private/objects/<64hex>
+curl -H "Authorization: Bearer ..." http://localhost:3001/api/repos/alice/private/objects/<64hex>
+```
 
 ---
 
@@ -150,9 +178,10 @@ Requires admin. Body `{ role }`, `UPDATE repository_members SET role=$1` (`serve
 
 ---
 
-## Remotes & Sync (`server/src/routes/repos.ts:400`)
+## Remotes & Sync (`server/src/routes/repos.ts:500`)
 
-Delegates to `itehaas` filesystem transport (`vcs/src/remote.rs:10`). HTTP remotes not supported (`http→Other`).
+- Filesystem transport: delegates to `itehaas` (`vcs/src/remote.rs:19` `resolve_remote_path`, `transfer_objects` via `fs::copy`, `canRead` for fetch, `canWrite` for push/pull).
+- HTTP transport (clone-only v1): Rust `ureq 2.9 json+tls` (`vcs/Cargo.toml`) → `vcs/src/remote/http.rs` `fetch_refs_http` + `fetch_object_http` + `download_recursive_http`. CLI `itehaas clone http(s)://host/api/repos/<owner>/<repo>` validates strict base (`http(s)://host/api/repos/<owner>/<repo>`), rejects `..`, query tokens, null bytes, and non-`sha256` hasher. Credential via `ITEHAAS_TOKEN`/`ITEHAAS_SESSION` env (sent as `Authorization: Bearer` + `Cookie: itehaas_session`), TLS verified, re-hashes `zlib(header\0body)` after download, depth `>2048` or objects `>100k` → abort, `64 MiB` limit, atomic `tempfile→persist`, cleanup partial dest on failure. See `vcs/src/main.rs:cmd_clone_http` + `vcs/src/remote/http.rs:102`.
 
 ### GET /api/repos/:owner/:repo/remotes — List
 

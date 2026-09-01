@@ -5,18 +5,28 @@ export interface AuthUser {
   id: string;
   username: string;
   email?: string;
+  bio?: string;
+  avatar_url?: string | null;
+  created_at?: string;
 }
 
 /**
  * Extract session user if present, else null. Validates expiry.
  */
 export async function getSessionUser(req: any): Promise<AuthUser | null> {
-  const sessionId = (req.cookies as any)?.[sessionCookieName()];
+  let sessionId: string | undefined = (req.cookies as any)?.[sessionCookieName()];
+  // Fallback to Authorization: Bearer <sessionId> for CLI HTTP clone (hack-proof: strict UUID check)
+  if (!sessionId) {
+    const auth = (req.headers as any)?.authorization as string | undefined;
+    if (auth && auth.startsWith('Bearer ')) {
+      sessionId = auth.slice(7).trim();
+    }
+  }
   if (!sessionId) return null;
   // Basic UUID format guard to avoid DB hit on garbage
   if (!/^[0-9a-fA-F-]{36}$/.test(sessionId)) return null;
   const res = await query(
-    `SELECT u.id, u.username, u.email FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = $1 AND s.expires_at > now()`,
+    `SELECT u.id, u.username, u.email, u.created_at FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = $1 AND s.expires_at > now()`,
     [sessionId]
   );
   if (res.rows.length === 0) return null;

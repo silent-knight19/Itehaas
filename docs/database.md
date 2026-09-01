@@ -77,6 +77,20 @@ Validated in API `zod` + `validateUsername` (`server/src/lib/auth.ts:12`).
 | name | TEXT PK |
 | applied_at | TIMESTAMPTZ DEFAULT now() |
 
+### users — profile extension (`004_profile.sql`)
+
+| col | type | constraint |
+|-----|------|------------|
+| bio | TEXT DEFAULT '' | CHECK `char_length(bio) <= 160` |
+| avatar_url | TEXT DEFAULT NULL | nullable, future upload |
+
+### Indexes — profile (`004_profile.sql`)
+
+- `idx_repositories_owner_updated(owner_id, updated_at DESC)` — owned repos sort
+- `idx_activity_user_created(user_id, created_at DESC)` — per-user activity feed
+- `idx_stars_user_created(user_id, created_at DESC)` — starred list
+- `idx_repositories_stars_count(repo_id)` — stars aggregation
+
 ### Triggers (`001_init.sql:46`)
 
 ```sql

@@ -1,4 +1,6 @@
-# Itehaas — Git-inspired VCS + Code Hosting Platform
+<p align="center">
+  <img src="web/public/itehaas-full.png" alt="Itehaas Logo" width="360" />
+</p>
 
 <p align="center">
   <strong>Build a Git + GitHub from scratch — understand every layer.</strong><br/>

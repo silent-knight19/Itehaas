@@ -88,6 +88,10 @@ cobertura.xml
 # Docker
 .docker/
 
-# Misc
+# Misc & Local Testing
 .cache/
 .parcel-cache
+testing/
+Testing/
+.Testing
+data/repos/

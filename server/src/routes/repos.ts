@@ -63,34 +63,50 @@ export async function repoRoutes(app: FastifyInstance) {
     return reply.status(201).send({ repo: { ...repo, owner: user.username } });
   });
 
-  // List repos (public + user's) with pagination
+  // List repos (user's repos by default when logged in or with mine=true, public with all=true, or search)
   app.get('/api/repos', async (req, reply) => {
     const user = await getSessionUser(req as any);
     const userId = user?.id ?? null;
+    const queryParams = req.query as any;
 
-    const qLimit = Math.min(Math.max(parseInt((req.query as any)?.limit ?? '100', 10) || 100, 1), 100);
-    const qOffset = Math.max(parseInt((req.query as any)?.offset ?? '0', 10) || 0, 0);
+    const isMine = queryParams?.mine === 'true';
+    const isAll = queryParams?.all === 'true';
+    const search = queryParams?.search ? String(queryParams.search).trim() : null;
 
-    const baseWhere = userId
-      ? `WHERE r.visibility = 'public' OR r.owner_id = $1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id = r.id AND m.user_id = $1)`
-      : `WHERE r.visibility = 'public'`;
+    const qLimit = Math.min(Math.max(parseInt(queryParams?.limit ?? '100', 10) || 100, 1), 100);
+    const qOffset = Math.max(parseInt(queryParams?.offset ?? '0', 10) || 0, 0);
 
-    const sql = `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.created_at, r.updated_at, u.username as owner
-         FROM repositories r JOIN users u ON r.owner_id = u.id
-         ${baseWhere}
-         ORDER BY r.updated_at DESC LIMIT $${userId ? 2 : 1} OFFSET $${userId ? 3 : 2}`;
+    let whereClause = '';
+    const sqlParams: any[] = [];
 
-    const params = userId ? [userId, String(qLimit), String(qOffset)] : [String(qLimit), String(qOffset)];
-    // pg expects params for LIMIT/OFFSET as text but we use int via parse, simpler to inline
+    if (isMine) {
+      if (!userId) {
+        return reply.send({ repos: [] });
+      }
+      sqlParams.push(userId);
+      whereClause = `WHERE (r.owner_id = $1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id = r.id AND m.user_id = $1))`;
+    } else if (search) {
+      if (userId) {
+        sqlParams.push(userId, `%${search}%`);
+        whereClause = `WHERE (r.visibility = 'public' OR r.owner_id = $1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id = r.id AND m.user_id = $1)) AND (r.name ILIKE $2 OR r.description ILIKE $2 OR u.username ILIKE $2)`;
+      } else {
+        sqlParams.push(`%${search}%`);
+        whereClause = `WHERE r.visibility = 'public' AND (r.name ILIKE $1 OR r.description ILIKE $1 OR u.username ILIKE $1)`;
+      }
+    } else if (isAll || !userId) {
+      whereClause = `WHERE r.visibility = 'public'`;
+    } else {
+      // Default when logged in without query flags -> user's own repos (GitHub model)
+      sqlParams.push(userId);
+      whereClause = `WHERE (r.owner_id = $1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id = r.id AND m.user_id = $1))`;
+    }
+
     const res = await query(
-      userId
-        ? `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.created_at, r.updated_at, u.username as owner
-           FROM repositories r JOIN users u ON r.owner_id = u.id
-           WHERE r.visibility = 'public' OR r.owner_id = $1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id = r.id AND m.user_id = $1)
-           ORDER BY r.updated_at DESC LIMIT ${qLimit} OFFSET ${qOffset}`
-        : `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.created_at, r.updated_at, u.username as owner
-           FROM repositories r JOIN users u ON r.owner_id = u.id WHERE r.visibility = 'public' ORDER BY r.updated_at DESC LIMIT ${qLimit} OFFSET ${qOffset}`,
-      userId ? [userId] : []
+      `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.created_at, r.updated_at, u.username as owner
+       FROM repositories r JOIN users u ON r.owner_id = u.id
+       ${whereClause}
+       ORDER BY r.updated_at DESC LIMIT ${qLimit} OFFSET ${qOffset}`,
+      sqlParams
     );
     return reply.send({ repos: res.rows });
   });
@@ -294,6 +310,107 @@ export async function repoRoutes(app: FastifyInstance) {
     const upd = await query(`UPDATE repository_members SET role=$1 WHERE repo_id=$2 AND user_id=$3 RETURNING role`, [parsed.data.role, repoId, targetId]);
     if (upd.rows.length === 0) return reply.status(404).send({ error: 'not a member' });
     return reply.send({ ok: true, role: upd.rows[0].role });
+  });
+
+  // Advertise refs for HTTP clone (requires read, masks private as 404)
+  // GET /api/repos/:owner/:repo/refs -> { refs: [{name, hash}], head, hasher }
+  app.get('/api/repos/:owner/:repo/refs', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility, r.default_branch FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const { id: repoId, visibility, default_branch } = r.rows[0];
+    if (!(await canRead(repoId, user?.id ?? null, visibility))) return reply.status(404).send({ error: 'not found' });
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+
+    // Read hasher
+    let hasher = 'sha256';
+    try {
+      const cfg = fs.readFileSync(path.join(repoPath, '.itehaas', 'config'), 'utf8');
+      const m = cfg.match(/hasher\s*=\s*(\w+)/);
+      if (m) hasher = m[1];
+    } catch {}
+
+    // Determine HEAD
+    let head = `refs/heads/${default_branch || 'main'}`;
+    try {
+      const headContent = fs.readFileSync(path.join(repoPath, '.itehaas', 'HEAD'), 'utf8').trim();
+      if (headContent.startsWith('ref: ')) head = headContent.slice(5).trim();
+      else if (/^[0-9a-f]{64}$/.test(headContent)) head = headContent;
+    } catch {}
+
+    // List refs/heads
+    const res = await execItehaas(['branch'], { cwd: repoPath });
+    if (res.code !== 0) {
+      if (res.stderr.includes('not a repository')) return reply.status(404).send({ error: 'repo not initialized' });
+      return reply.status(500).send({ error: res.stderr });
+    }
+    const branchNames: string[] = res.stdout
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((l) => l.replace(/^\*\s*/, '').trim());
+
+    const refs: { name: string; hash: string }[] = [];
+    for (const b of branchNames) {
+      if (!/^[a-zA-Z0-9._\/-]+$/.test(b)) continue;
+      const refPath = path.join(repoPath, '.itehaas', 'refs', 'heads', ...b.split('/'));
+      try {
+        const hash = fs.readFileSync(refPath, 'utf8').trim();
+        if (/^[0-9a-f]{64}$/.test(hash)) {
+          refs.push({ name: `refs/heads/${b}`, hash });
+        }
+      } catch {}
+    }
+    refs.sort((a, b) => a.name.localeCompare(b.name));
+    return reply.send({ refs, head, hasher });
+  });
+
+  // Stream raw object bytes for HTTP clone (requires read, immutable, cacheable)
+  // GET /api/repos/:owner/:repo/objects/:hash
+  app.get('/api/repos/:owner/:repo/objects/:hash', async (req, reply) => {
+    const { owner, repo, hash } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    if (!/^[0-9a-f]{64}$/.test(hash)) return reply.status(400).send({ error: 'invalid object hash' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+
+    // Validate repo path already via repoPathFor; no further SSRF
+    const prefix = hash.slice(0, 2);
+    const suffix = hash.slice(2);
+    const objectPath = path.join(repoPath, '.itehaas', 'objects', prefix, suffix);
+
+    // Ensure resolved object path stays within repo (defense in depth)
+    const resolvedRoot = path.resolve(repoPath);
+    const resolvedObj = path.resolve(objectPath);
+    if (!resolvedObj.startsWith(resolvedRoot + path.sep)) {
+      return reply.status(400).send({ error: 'invalid hash' });
+    }
+
+    try {
+      const stat = await fs.promises.stat(objectPath);
+      if (!stat.isFile()) return reply.status(404).send({ error: 'Object not found' });
+      if (stat.size > 64 * 1024 * 1024) return reply.status(413).send({ error: 'Object too large' });
+      reply.header('Content-Type', 'application/octet-stream');
+      reply.header('Content-Length', String(stat.size));
+      reply.header('Cache-Control', 'public, max-age=31536000, immutable');
+      reply.header('X-Content-Type-Options', 'nosniff');
+      reply.header('X-Object-Hash', hash);
+      // Stream without buffering whole file
+      const stream = fs.createReadStream(objectPath);
+      return reply.send(stream as any);
+    } catch (e: any) {
+      if (e.code === 'ENOENT') return reply.status(404).send({ error: 'Object not found' });
+      return reply.status(500).send({ error: 'Internal error' });
+    }
   });
 
   // List branches via VCS (requires read)

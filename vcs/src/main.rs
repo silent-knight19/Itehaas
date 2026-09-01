@@ -1308,7 +1308,15 @@ fn cmd_remote(repo: &Path, command: Option<RemoteCommands>, verbose: bool) -> Re
     Ok(())
 }
 
+fn redact_url(url: &str) -> String {
+    // Redact query string for display (tokens must not leak)
+    url.split('?').next().unwrap_or(url).to_string()
+}
+
 fn cmd_clone(url: &str, dest: Option<PathBuf>) -> Result<()> {
+    if itehaas_lib::remote::is_http_url(url) {
+        return cmd_clone_http(url, dest);
+    }
     let cwd = std::env::current_dir()?;
     // Resolve remote path
     let remote_path = {
@@ -1320,10 +1328,10 @@ fn cmd_clone(url: &str, dest: Option<PathBuf>) -> Result<()> {
         } else {
             ap
         };
-        cand.canonicalize().map_err(|_| anyhow::anyhow!("remote '{}' not found", url))?
+        cand.canonicalize().map_err(|_| anyhow::anyhow!("remote '{}' not found", redact_url(url)))?
     };
     if !remote_path.join(".itehaas").exists() {
-        anyhow::bail!("remote '{}' is not a repository", url);
+        anyhow::bail!("remote '{}' is not a repository", redact_url(url));
     }
     let dest_path = if let Some(p) = dest {
         if p.is_absolute() {
@@ -1395,7 +1403,126 @@ fn cmd_clone(url: &str, dest: Option<PathBuf>) -> Result<()> {
             head_branch_name
         );
     } else {
-        println!("Cloned {} to {} (empty, {} objects)", url, dest_path.display(), transferred);
+        println!("Cloned {} to {} (empty, {} objects)", redact_url(url), dest_path.display(), transferred);
+    }
+    Ok(())
+}
+
+fn cmd_clone_http(url: &str, dest: Option<PathBuf>) -> Result<()> {
+    use std::collections::HashSet;
+
+    let cwd = std::env::current_dir()?;
+    let base = itehaas_lib::remote::http::validate_http_base(url)?;
+    // Derive dest path
+    let dest_path = if let Some(p) = dest {
+        if p.is_absolute() { p } else { cwd.join(p) }
+    } else {
+        // Derive from base: last segment after last '/' (owner/repo -> repo)
+        let last = base.rsplit('/').next().ok_or_else(|| anyhow::anyhow!("invalid http url"))?;
+        let name = last.trim_end_matches(".itehaas");
+        let n = if name.is_empty() { "repo".to_string() } else { name.to_string() };
+        // Validate derived name
+        if n.contains('/') || n.contains('\0') || n.len() > 100 {
+            cwd.join("repo")
+        } else {
+            cwd.join(n)
+        }
+    };
+    if dest_path.exists() {
+        anyhow::bail!("destination '{}' already exists", dest_path.display());
+    }
+    fs::create_dir_all(&dest_path)?;
+
+    // Inner helper to ensure cleanup on failure (hack-proof: don't leave partial clone)
+    let inner: Result<()> = (|| {
+        // Fetch refs advertisement
+        let http_refs = itehaas_lib::remote::http::fetch_refs_http(&base)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        // Parse hasher
+        let algo = HashAlgo::from_str(&http_refs.hasher).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // Init new repo with that algo
+        let new_repo = itehaas_lib::init(&dest_path, algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // Always add remote (redacted url for print)
+        itehaas_lib::config::add_remote(&new_repo, "origin", url).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        if http_refs.refs.is_empty() {
+            println!("Cloned empty repository from {} to {}", redact_url(&base), dest_path.display());
+            return Ok(());
+        }
+
+        let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut transferred_est = 0usize;
+
+        // Download each head's reachable DAG
+        for (ref_name, hash_hex) in &http_refs.refs {
+            let hash = Hash::from_hex(algo, hash_hex).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            // Validate hash already, but double-check
+            itehaas_lib::remote::http::download_recursive_http(&base, &new_repo, &hash, &mut visited, 0)
+                .map_err(|e| anyhow::anyhow!("fetching {} ({}): {}", ref_name, &hash_hex[..7], e))?;
+            // Write remote-tracking ref
+            let remote_ref = ref_name.replace("refs/heads/", "refs/remotes/origin/");
+            itehaas_lib::refs::write_ref(&new_repo, &remote_ref, &hash)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            transferred_est = visited.len();
+        }
+
+        // Determine HEAD branch
+        let head_branch = if http_refs.head.starts_with("refs/heads/") {
+            http_refs.head.clone()
+        } else if http_refs.head.starts_with("ref: ") {
+            http_refs.head["ref: ".len()..].trim().to_string()
+        } else {
+            "refs/heads/main".to_string()
+        };
+        let head_branch_name = head_branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or("main")
+            .to_string();
+
+        // Find hash for HEAD (fallback to first ref)
+        let head_hash_hex_opt = http_refs
+            .refs
+            .iter()
+            .find(|(n, _)| n == &head_branch)
+            .map(|(_, h)| h.clone())
+            .or_else(|| http_refs.refs.first().map(|(_, h)| h.clone()));
+
+        if let Some(h_hex) = head_hash_hex_opt {
+            let h = Hash::from_hex(algo, &h_hex).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            // Ensure local branch exists
+            itehaas_lib::refs::write_ref(&new_repo, &head_branch, &h)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            itehaas_lib::refs::write_head_ref(&new_repo, &head_branch)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            // Verify object present before checkout
+            let _ = itehaas_lib::object::store::read_object(&new_repo, &h, hasher.as_ref())
+                .map_err(|e| anyhow::anyhow!("head object missing after fetch: {}", e))?;
+            itehaas_lib::checkout::checkout_branch_forced(&new_repo, &head_branch_name)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            println!(
+                "Cloned {} to {} ({} objects, branch {})",
+                redact_url(&base),
+                dest_path.display(),
+                transferred_est,
+                head_branch_name
+            );
+        } else {
+            println!(
+                "Cloned {} to {} ({} objects, no HEAD)",
+                redact_url(&base),
+                dest_path.display(),
+                transferred_est
+            );
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = inner {
+        // Cleanup partial clone to avoid blocking retry and leaking incomplete state
+        let _ = fs::remove_dir_all(&dest_path);
+        return Err(e);
     }
     Ok(())
 }

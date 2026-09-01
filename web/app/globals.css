@@ -2,19 +2,186 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  --bg: 255 255 255;
-  --fg: 17 24 39;
+@layer base {
+  :root {
+    /* 90% Neutral Palette (Deep Graphite / Charcoal) */
+    --bg-canvas: #090a0f;          /* Main application backdrop */
+    --bg-sidebar: #0d0f14;         /* Left navigation chrome */
+    --bg-surface: #12151c;         /* List surfaces, tables, code containers */
+    --bg-surface-hover: #171b24;   /* Interactive item hover */
+    --bg-surface-active: #1d222e;  /* Selected row / active toggle */
+    --bg-overlay: #151821;         /* Command palette, dialogs, popovers */
+    --bg-subtle: #0b0d12;          /* Inset code blocks, terminal streams */
+
+    /* Typography & Foreground Hierarchy */
+    --fg-primary: #ededed;         /* High-contrast headings, active text */
+    --fg-secondary: #a1a1a1;       /* Body copy, descriptions, table cells */
+    --fg-muted: #666666;           /* Metadata, timestamps, non-active icons */
+    --fg-subtle: #444444;          /* Line numbers, disabled hints */
+    --fg-on-accent: #ffffff;       /* Text on primary filled actions */
+
+    /* Hairline Borders & Dividers */
+    --border-subtle: #1c202a;      /* Table row dividers, internal section rules */
+    --border-default: #282d3b;     /* Input borders, card framing */
+    --border-emphasis: #3d4456;    /* Hovered borders, active inputs */
+
+    /* Brand Accent: Itehaas Electric Steel (Scarce, Rare) */
+    --accent: #3b82f6;             /* Single primary action per screen, active tab */
+    --accent-hover: #2563eb;       /* Hovered primary action */
+    --accent-subtle: rgba(59, 130, 246, 0.08); /* Selection tint */
+    --accent-border: rgba(59, 130, 246, 0.25); /* Focus ring */
+
+    /* Semantic Status Tokens (Precise, Subdued) */
+    --success: #10b981;
+    --success-subtle: rgba(16, 185, 129, 0.08);
+    --success-border: rgba(16, 185, 129, 0.2);
+
+    --warning: #f59e0b;
+    --warning-subtle: rgba(245, 158, 11, 0.08);
+    --warning-border: rgba(245, 158, 11, 0.2);
+
+    --danger: #ef4444;
+    --danger-subtle: rgba(239, 68, 68, 0.08);
+    --danger-border: rgba(239, 68, 68, 0.2);
+
+    --merged: #8b5cf6;
+    --merged-subtle: rgba(139, 92, 246, 0.08);
+    --merged-border: rgba(139, 92, 246, 0.2);
+
+    /* Motion Tokens */
+    --duration-micro: 100ms;
+    --duration-fast: 150ms;
+    --duration-normal: 200ms;
+    --duration-modal: 220ms;
+    --ease-snappy: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  body {
+    background-color: var(--bg-canvas);
+    color: var(--fg-secondary);
+    font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    letter-spacing: -0.01em;
+  }
+
+  /* Sleek Technical Scrollbar */
+  ::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--border-default);
+    border-radius: 2px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--border-emphasis);
+  }
+
+  /* Accessible Focus Ring */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
 }
 
-body {
-  color: rgb(var(--fg));
-  background: rgb(var(--bg));
+/* Reduced Motion Override */
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
-.prose pre {
-  @apply bg-gray-900 text-gray-100 p-4 rounded-lg overflow-auto text-sm;
+/* Editorial Document Markdown Typography */
+.markdown-body {
+  color: var(--fg-secondary);
+  font-size: 0.8125rem;
+  line-height: 1.65;
+  max-width: 720px;
 }
-.prose code {
-  @apply bg-gray-100 px-1 py-0.5 rounded text-sm;
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  color: var(--fg-primary);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-top: 1.5em;
+  margin-bottom: 0.5em;
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: 0.25em;
+}
+.markdown-body h1 { font-size: 1.25rem; }
+.markdown-body h2 { font-size: 1.05rem; }
+.markdown-body h3 { font-size: 0.9rem; }
+.markdown-body p {
+  margin-top: 0.5em;
+  margin-bottom: 0.75em;
+}
+.markdown-body ul, .markdown-body ol {
+  padding-left: 1.4em;
+  margin-top: 0.5em;
+  margin-bottom: 0.75em;
+}
+.markdown-body ul { list-style-type: disc; }
+.markdown-body ol { list-style-type: decimal; }
+.markdown-body li { margin-top: 0.2em; margin-bottom: 0.2em; }
+.markdown-body pre {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  margin: 1em 0;
+}
+.markdown-body code:not(pre code) {
+  background: var(--bg-surface-active);
+  color: var(--fg-primary);
+  border: 1px solid var(--border-subtle);
+  padding: 0.1em 0.35em;
+  border-radius: 2px;
+  font-size: 0.8em;
+  font-family: var(--font-geist-mono), monospace;
+}
+.markdown-body blockquote {
+  border-left: 2px solid var(--accent);
+  padding-left: 0.85rem;
+  margin: 1em 0;
+  color: var(--fg-muted);
+  font-style: normal;
+}
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1em 0;
+  font-size: 0.75rem;
+}
+.markdown-body th, .markdown-body td {
+  border: 1px solid var(--border-subtle);
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+}
+.markdown-body th {
+  background: var(--bg-surface);
+  color: var(--fg-primary);
+  font-weight: 500;
+}
+.markdown-body tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.01);
+}
+.markdown-body a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.markdown-body a:hover {
+  color: var(--accent-hover);
 }

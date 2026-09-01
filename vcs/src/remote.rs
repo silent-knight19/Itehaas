@@ -6,12 +6,24 @@ use crate::error::{ItehaasError, Result};
 use crate::hash::Hash;
 use crate::object::store;
 
+pub mod http;
+
+/// Whether URL is HTTP(S) — used to branch to http transport.
+pub fn is_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+/// Normalize a URL by trimming trailing slashes.
+pub fn normalize_http_url(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
 /// Resolve remote URL (filesystem path) to repo root PathBuf
 pub fn resolve_remote_path(repo: &Path, url: &str) -> Result<PathBuf> {
-    // For now, only filesystem paths. If url starts with http://, error.
-    if url.starts_with("http://") || url.starts_with("https://") {
+    // HTTP remotes are handled by remote::http module; this helper only resolves FS.
+    if is_http_url(url) {
         return Err(ItehaasError::Other(format!(
-            "http remote not yet supported: {}",
+            "http remote not yet supported via filesystem resolver (use http transport): {}",
             url
         )));
     }
