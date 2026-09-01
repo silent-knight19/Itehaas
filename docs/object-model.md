@@ -36,7 +36,7 @@ body = raw file bytes (no transformation, no newline fixup)
 type = "blob"
 ```
 
-Empty file: `body = ""`, header `"blob 0"`, so `hash_input = "blob 0\0"`, `ObjectID = SHA256("blob 0\0") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+Empty file: `body = ""`, header `"blob 0"`, so `hash_input = "blob 0\0"`, `ObjectID = SHA256("blob 0\0") = 473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813` (note `e3b0...` is `SHA256("")`, not the blob hash).
 
 ### 3.2 Tree
 
