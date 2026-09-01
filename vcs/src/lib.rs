@@ -1,7 +1,11 @@
 pub mod config;
 pub mod error;
 pub mod hash;
+pub mod index;
 pub mod object;
+pub mod refs;
+pub mod status;
+pub mod tree_builder;
 
 use std::fs;
 use std::path::{Path, PathBuf};

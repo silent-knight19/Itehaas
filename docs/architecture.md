@@ -22,7 +22,7 @@ Modular monolith. Monorepo: `vcs/` (Rust), `server/` (Fastify/TS), `web/` (Next.
 
 ## Component Responsibilities
 
-- **VCS (Rust)**: hashing (trait, SHA-256), framing, object store, refs, index, diff/merge, remotes. See `object-model.md`, `storage.md`.
+- **VCS (Rust)**: hashing (trait, SHA-256), framing, object store, refs/HEAD (`refs.rs`), index/staging (`index.rs`), tree building (`tree_builder.rs`), status/log, diff/merge, remotes. See `object-model.md`, `storage.md`. Phase 2 implements `add`/`commit`/`status`/`log` with `Working Tree → Index → Objects` flow, CLI `itehaas` (`vcs/src/main.rs:1`).
 - **Server (Fastify)**: auth (Argon2, httpOnly cookies, CSRF), repo/metadata CRUD, permission checks, spawn wrapper `server/src/lib/vcs.ts`.
 - **Web (Next.js)**: dashboard, repo browser (reconstructs trees via VCS), commits/branches/issues/PRs.
 - **Deploy**: NVMe for hot, HDD for backups; Tailscale for remote (replaceable with Headscale).

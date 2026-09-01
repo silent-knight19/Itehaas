@@ -6,9 +6,9 @@
 
 ```
 .itehaas/
-├── HEAD              # "ref: refs/heads/main\n" (symbolic) or "<hash_hex>\n" (detached) — Phase 1 symbolic only
-├── config            # INI: [core] hasher = sha256, repositoryformatversion = 1
-├── index             # empty file, reserved for Phase 2 (staging area)
+├── HEAD              # "ref: refs/heads/main\n" (symbolic) or "<hash_hex>\n" (detached)
+├── config            # INI: [core] hasher = sha256, [user] name/email, repositoryformatversion = 1
+├── index             # JSON staging area: {version:1, entries:{path:{path,hash,mode}}}
 ├── objects/
 │   ├── ab/
 │   │   └── cdef...   # first 2 hex chars = dir, rest = filename (SHA-256: 2+62)
@@ -71,6 +71,19 @@ This tiering is policy, not code invariant — enforced via deployment docs, not
 - Readers handle concurrent writer via existence check after `rename`.
 - Phase 1: `Tokio` not needed; sync `std::fs` throughout.
 
-## 7. Future (Phase 10)
+## 7. Index (Staging Area) — Phase 2
 
-- `pack/` + delta, `fsck` full scan, `gc` reachability from `refs/*` + `HEAD`, streaming for large blobs, mmap for hot reads. Not in Phase 1.
+- File `.itehaas/index` is JSON (pretty-printed, `serde_json`), versioned (`version:1`), `BTreeMap` sorted by path. Each entry: `{path: "<unix>/path", hash: "<hex>", mode: 33188}` (mode `0o100644` regular, `0o100755` executable).
+- Load: if missing or empty → empty index. Save atomic via tempfile+rename. Sorted iteration ensures deterministic `tree_builder` input.
+- `file_mode()` on Unix uses `permissions().mode() & 0o111`, otherwise `0o100644`.
+- `should_ignore()` skips `.itehaas` and `.git` at any depth.
+- Workflow: `Working Tree → add → Index → commit → Objects`. `add <file>` hashes blob, writes object, updates index; `add .` stages all including deletions (removes missing from index); `add <dir>` recurses via `walkdir`.
+- `status` compares three maps: `HEAD tree` (flattened via `tree_builder::flatten_tree_root`), `index`, `working tree` (walk + hash). Reports `staged` (index vs HEAD), `not_staged` (wt vs index, hash+mode), `untracked` (wt not in index nor HEAD).
+- `tree_builder::build_tree_from_index` groups index entries by directory, recursively builds `Tree` objects (sorted, `mode 040000` for dirs), writes each tree, returns root hash. Empty index → empty tree `6ef19b...` (`tree 0\0`).
+- `commit` builds tree from index, checks `nothing to commit` (no staged and tree == HEAD unless initial), creates `Commit` with parent `HEAD` (or none), author/committer from `config [user]` or `Author <author@example.com>`, timestamp `SystemTime` + `+0000`, writes commit, updates `refs/heads/<branch>` (from `HEAD` symbolic) or detached `HEAD`.
+- `refs`: `HEAD` symbolic `ref: refs/heads/main` or detached hash or unborn; `read_head`/`write_head`/`read_ref`/`write_ref`/`resolve_head` all atomic.
+- `log` walks first-parent chain from `HEAD`, prints `commit hash`, `Author`, `Date`, message, supports `--oneline` and `--max-count`.
+
+## 8. Future (Phase 10)
+
+- `pack/` + delta, `fsck` full scan, `gc` reachability from `refs/*` + `HEAD`, streaming for large blobs, mmap for hot reads. Not in Phase 1-2.

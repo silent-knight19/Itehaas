@@ -151,14 +151,14 @@ fn parse_commit(body: Vec<u8>) -> Result<Object> {
     if idx >= lines.len() || !lines[idx].starts_with("tree ") {
         return Err(ItehaasError::InvalidObject("commit: missing tree".into()));
     }
-    let tree_hex = &lines[idx][5..];
-    tree = Some(Hash::from_hex(HashAlgo::Sha256, tree_hex.trim())?);
+    let tree_hex = lines[idx].strip_prefix("tree ").unwrap().trim();
+    tree = Some(Hash::from_hex(HashAlgo::Sha256, tree_hex)?);
     idx += 1;
 
     // parents
     while idx < lines.len() && lines[idx].starts_with("parent ") {
-        let h = &lines[idx][7..];
-        parents.push(Hash::from_hex(HashAlgo::Sha256, h.trim())?);
+        let h = lines[idx].strip_prefix("parent ").unwrap().trim();
+        parents.push(Hash::from_hex(HashAlgo::Sha256, h)?);
         idx += 1;
     }
 
@@ -166,14 +166,14 @@ fn parse_commit(body: Vec<u8>) -> Result<Object> {
     if idx >= lines.len() || !lines[idx].starts_with("author ") {
         return Err(ItehaasError::InvalidObject("commit: missing author".into()));
     }
-    author = Some(parse_signature(&lines[idx][7..])?);
+    author = Some(parse_signature(lines[idx].strip_prefix("author ").unwrap())?);
     idx += 1;
 
     // committer
     if idx >= lines.len() || !lines[idx].starts_with("committer ") {
         return Err(ItehaasError::InvalidObject("commit: missing committer".into()));
     }
-    committer = Some(parse_signature(&lines[idx][7..])?);
+    committer = Some(parse_signature(lines[idx].strip_prefix("committer ").unwrap())?);
     idx += 1;
 
     // blank line
@@ -208,13 +208,13 @@ fn parse_tag(body: Vec<u8>) -> Result<Object> {
     if idx >= lines.len() || !lines[idx].starts_with("object ") {
         return Err(ItehaasError::InvalidObject("tag: missing object".into()));
     }
-    let object_hex = &lines[idx][7..];
-    let object = Hash::from_hex(HashAlgo::Sha256, object_hex.trim())?;
+    let object_hex = lines[idx].strip_prefix("object ").unwrap().trim();
+    let object = Hash::from_hex(HashAlgo::Sha256, object_hex)?;
     idx += 1;
     if idx >= lines.len() || !lines[idx].starts_with("type ") {
         return Err(ItehaasError::InvalidObject("tag: missing type".into()));
     }
-    let object_type = lines[idx][5..].trim().to_string();
+    let object_type = lines[idx].strip_prefix("type ").unwrap().trim().to_string();
     if !["blob", "tree", "commit", "tag"].contains(&object_type.as_str()) {
         return Err(ItehaasError::InvalidObject(format!(
             "tag: invalid type {object_type}"
@@ -224,12 +224,12 @@ fn parse_tag(body: Vec<u8>) -> Result<Object> {
     if idx >= lines.len() || !lines[idx].starts_with("tag ") {
         return Err(ItehaasError::InvalidObject("tag: missing tag".into()));
     }
-    let name = lines[idx][4..].trim().to_string();
+    let name = lines[idx].strip_prefix("tag ").unwrap().trim().to_string();
     idx += 1;
     if idx >= lines.len() || !lines[idx].starts_with("tagger ") {
         return Err(ItehaasError::InvalidObject("tag: missing tagger".into()));
     }
-    let tagger = parse_signature(&lines[idx][7..])?;
+    let tagger = parse_signature(lines[idx].strip_prefix("tagger ").unwrap())?;
     idx += 1;
     if idx >= lines.len() || !lines[idx].is_empty() {
         return Err(ItehaasError::InvalidObject(

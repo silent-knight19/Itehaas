@@ -15,26 +15,26 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ## Current Status
 
-**Current Phase:** Phase 1 — VCS Object Model & Store (Complete)
-**Current Task:** Phase 1 commit
-**Overall Progress:** 45 / ~140 tasks
+**Current Phase:** Phase 2 — Index, Staging & Basic Workflow (Complete)
+**Current Task:** Phase 2 commit
+**Overall Progress:** 68 / ~140 tasks
 **Status:** ✅ Complete
 
 ### Last Completed
 
-- Phase 0 complete (scaffold + docs, 47f7c8c)
-- Phase 1 object model: hash abstraction (SHA-256), blob/tree/commit/tag canonical, store (fanout/zlib/atomic), init, CLI (init/hash-object/cat-file/verify)
-- 21 integration tests passing (store_tests.rs) — empty blob vector, round-trips, dedup, sorted-dedup, corrupt, algo mismatch, init
-- Manual CLI verification: `itehaas init → printf 'hello' | hash-object -w → cat-file -p → verify → python3 zlib` (hash 8aec4e..., empty blob 473a0f...)
-- Docs synced: object-model.md empty blob hash corrected, invariants confirmed
+- Phase 1 complete (21 tests, CLI verified, empty blob 473a..., tree raw 32B)
+- Phase 2 implemented: Index (JSON BTreeMap, atomic), refs/HEAD (symbolic/unborn/detached), tree_builder (index → hierarchical trees), add (file/dir/., deletions, mode), commit (tree from index, parent, author, refs update), status (staged/not_staged/untracked with mode), log (walk first-parent, oneline)
+- 13 new integration tests (phase2_tests.rs) + 21 existing = 34 passing; manual workflow verified (init→add→commit→modify→add→commit→log, nested dirs, deletions, executable mode, mode change, binary, add from subdir)
+- Fixed commit parsing bug (committer prefix 10 not 7, now strip_prefix) and status mode comparison (hash+mode)
+- Manual CLI: `itehaas init → printf 'hello' > hello.txt → add → commit → modify → status → add . → commit → log --oneline` all green, 7 commits on /tmp/i2, empty-tree commit 6ef19b... verified
 
 ### Currently Working On
 
-- Phase 1 commit
+- Phase 2 commit + docs
 
 ### Next
 
-- Phase 2 — Index, Staging & Basic Workflow (add/commit/status/log) — Working Tree → Index → Repository
+- Phase 3 — Branches & HEAD (branch, checkout, DAG)
 
 ## Phase Status Table
 
@@ -42,6 +42,7 @@ Core principles: Understand first, implement second. Correctness → Understandi
 |-------|-------------|--------|
 | 0 | Environment & Architecture | ✅ Complete |
 | 1 | Object Model & Store | ✅ Complete |
+| 2 | Index, Staging & Workflow | ✅ Complete |
 | 2 | Index, Staging & Workflow | ⬜ Not Started |
 | 3 | Branches & HEAD | ⬜ Not Started |
 | 4 | Diff & Merge | ⬜ Not Started |
@@ -256,24 +257,24 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 
 ### Scope
 
-- [ ] Index/staging area (real concept: `.itehaas/index`)
-- [ ] `itehaas add <file>` / `add .`
-- [ ] `itehaas status` (compares HEAD tree vs index vs working tree)
-- [ ] `itehaas commit -m "message"` (creates tree from index, creates commit)
-- [ ] `itehaas log` (history walk)
-- [ ] Working Tree → Index → Repository flow implemented
+- [x] Index/staging area (real concept: `.itehaas/index` — `vcs/src/index.rs:1`, JSON BTreeMap, atomic) — 2026-09-01
+- [x] `itehaas add <file>` / `add .` — `vcs/src/main.rs:220`, handles file/dir/., deletions, mode, ignore .itehaas — 2026-09-01
+- [x] `itehaas status` (compares HEAD tree vs index vs working tree) — `vcs/src/status.rs:40`, staged/not_staged/untracked — 2026-09-01
+- [x] `itehaas commit -m "message"` (creates tree from index, creates commit) — `vcs/src/main.rs:375`, tree_builder, parent, author, refs — 2026-09-01
+- [x] `itehaas log` (history walk) — `vcs/src/main.rs:500`, first-parent, oneline/max-count — 2026-09-01
+- [x] Working Tree → Index → Repository flow implemented — verified via manual workflow — 2026-09-01
 
 ### Dependencies
 
-- Depends on: Phase 1 object model, tree/commit serialization
+- Depends on: Phase 1 object model, tree/commit serialization — met
 
 ### Definition of Done — Phase 2
 
-- [ ] Can create repo, add files, commit, view status/log
-- [ ] Index correctly tracks staged vs unstaged vs untracked
-- [ ] Second commit parents correctly link to first
-- [ ] Tests cover add/commit/status/log, failure cases
-- [ ] Documentation updated
+- [x] Can create repo, add files, commit, view status/log — manual: `/tmp/i2` 7 commits, `/tmp/i3` executable, `/tmp/i4` delete
+- [x] Index correctly tracks staged vs unstaged vs untracked — `phase2_tests.rs:30` + manual status tri-state
+- [x] Second commit parents correctly link to first — `phase2_tests.rs:70`, log walk
+- [x] Tests cover add/commit/status/log, failure cases — 13 tests + CLI edge (nothing to commit, invalid hash, corrupt)
+- [x] Documentation updated — `docs/storage.md` index section, `docs/object-model.md` unchanged, `PLAN.md` updated
 
 ## Phase 3 — Branches & HEAD
 
