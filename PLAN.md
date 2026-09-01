@@ -15,25 +15,25 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ## Current Status
 
-**Current Phase:** Phase 3 — Branches & HEAD (Complete)
-**Current Task:** Phase 3 commit
-**Overall Progress:** 82 / ~140 tasks
+**Current Phase:** Phase 4 — Diff & Merge (Complete)
+**Current Task:** Phase 4 commit
+**Overall Progress:** 98 / ~140 tasks
 **Status:** ✅ Complete
 
 ### Last Completed
 
-- Phase 2 complete (Index, tree_builder, add/commit/status/log, 34 tests, mode fix)
-- Phase 3 implemented: refs branch helpers (list/create/delete/validate), checkout (working tree + index sync, dirty check, force, detached), CLI branch/checkout/switch, DAG independent histories
-- 10 new integration tests (phase3_tests.rs) + 34 existing = 44 passing; manual verified (branch create/list/delete, checkout switch/detached/-b with start point, hierarchical branch, dirty check, force, nested dirs, DAG, switch alias, invalid name)
-- Fixed tree/commit/tag parsing to strip_prefix (robust) and status to compare hash+mode
+- Phase 3 complete (refs, checkout, DAG, 44 tests)
+- Phase 4 implemented: diff (wt vs index, index vs HEAD, HEAD vs branch, unified via similar), merge (common ancestor BFS, is_ancestor, fast-forward, already-up-to-date, 3-way with O/A/B eq logic, conflict markers <<<<<<<, binary handling, MERGE_HEAD)
+- 11 new integration tests (phase4_tests.rs) + 44 existing = 55 passing; manual verified (fast-forward, 3-way no-conflict different files, conflict with markers and resolve, diff --staged and target, already-up-to-date, project success workflow init→branch→checkout→modify→merge)
+- Fixed commit to handle MERGE_HEAD second parent and cleanup, status now shows not_staged for conflicted (keeps current in index)
 
 ### Currently Working On
 
-- Phase 3 commit + docs
+- Phase 4 commit + docs
 
 ### Next
 
-- Phase 4 — Diff & Merge (diff, three-way merge, conflicts)
+- Phase 5 — Remote Repositories (remote, clone, fetch, push, pull)
 
 ## Phase Status Table
 
@@ -43,7 +43,7 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 1 | Object Model & Store | ✅ Complete |
 | 2 | Index, Staging & Workflow | ✅ Complete |
 | 3 | Branches & HEAD | ✅ Complete |
-| 4 | Diff & Merge | ⬜ Not Started |
+| 4 | Diff & Merge | ✅ Complete |
 | 5 | Remotes | ⬜ Not Started |
 | 6 | Server & API | ⬜ Not Started |
 | 7 | Web Platform | ⬜ Not Started |
@@ -300,30 +300,30 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 
 ### Scope
 
-- [ ] `itehaas diff` (working tree vs index vs commit)
-- [ ] Common ancestor detection
-- [ ] Fast-forward merge
-- [ ] Three-way merge
-- [ ] Merge commits (multiple parents)
-- [ ] Conflict detection + markers (`<<<<<<<`, `=======`, `>>>>>>>`)
-- [ ] Conflict resolution
-- [ ] `itehaas merge <branch>`
+- [x] `itehaas diff` (working tree vs index vs commit) — `vcs/src/diff.rs:1`, wt vs index, --staged index vs HEAD, HEAD vs branch via similar unified — 2026-09-01
+- [x] Common ancestor detection — `vcs/src/merge.rs:30`, BFS ancestors + is_ancestor — 2026-09-01
+- [x] Fast-forward merge — `vcs/src/merge.rs:260`, is_ancestor check, update ref + working tree/index — 2026-09-01
+- [x] Three-way merge — `vcs/src/merge.rs:400`, O/A/B eq logic for added/deleted/modified — 2026-09-01
+- [x] Merge commits (multiple parents) — `vcs/src/merge.rs:500`, 2 parents, merge via `merge` or `commit` with MERGE_HEAD — 2026-09-01
+- [x] Conflict detection + markers (`<<<<<<<`, `=======`, `>>>>>>>`) — `vcs/src/merge.rs:180`, binary handling, MERGE_HEAD — 2026-09-01
+- [x] Conflict resolution — manual: fix file → `add` → `commit` (cleans MERGE_HEAD) — verified — 2026-09-01
+- [x] `itehaas merge <branch>` — `vcs/src/main.rs:800`, already_up_to_date, fast-forward, 3-way — 2026-09-01
 
 ### Dependencies
 
-- Depends on: Phase 3 DAG, commit ancestry, tree comparison
+- Depends on: Phase 3 DAG, commit ancestry, tree comparison — met
 
 ### Definition of Done — Phase 4
 
-- [ ] Two-way diff works
-- [ ] Common ancestor found correctly
-- [ ] Fast-forward merge works
-- [ ] Three-way merge creates merge commit
-- [ ] Conflict detection works
-- [ ] Conflict markers generated correctly
-- [ ] Conflict resolution can be completed
-- [ ] Integration tests for normal and conflicting merges
-- [ ] Documentation updated
+- [x] Two-way diff works — `phase4_tests.rs:20`, diff wt vs index vs HEAD, added/deleted/modified
+- [x] Common ancestor found correctly — `phase4_tests.rs:30`, BFS, diverged histories
+- [x] Fast-forward merge works — `phase4_tests.rs:40`, /tmp/ff3 verified
+- [x] Three-way merge creates merge commit — `phase4_tests.rs:50`, 2 parents, different files
+- [x] Conflict detection works — `phase4_tests.rs:60`, both modified conflict.txt
+- [x] Conflict markers generated correctly — manual `<<<<<<< HEAD ... ======= ... >>>>>>> feature` verified, diff shows markers
+- [x] Conflict resolution can be completed — manual resolve → add → commit with 2 parents, MERGE_HEAD cleaned
+- [x] Integration tests for normal and conflicting merges — 11 tests + CLI success workflow (init→branch→checkout→modify→merge)
+- [x] Documentation updated — `docs/branching-and-merging.md` merge section, `docs/architecture.md`, `PLAN.md`
 
 ## Phase 5 — Remote Repositories
 
@@ -559,3 +559,6 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - 2026-09-01: PLAN.md created. Architecture approved with 7 refinements (binary `itehaas`, hash algo invariant, SHA-256 only Phase 1, no bincode, no PG tuning, no gRPC, NVMe/HDD tiering). Phase 0 in progress.
 - 2026-09-01: Phase 0 complete — scaffold + docs committed (47f7c8c).
 - 2026-09-01: Phase 1 object model implemented + 21 tests passing + manual CLI verified (init/hash-object/cat-file/verify + python zlib).
+- 2026-09-01: Phase 2 complete — Index, staging, add/commit/status/log, 13 tests, 34 total.
+- 2026-09-01: Phase 3 complete — branches & checkout, DAG, 10 tests, 44 total.
+- 2026-09-01: Phase 4 complete — diff & merge, 11 tests, 55 total, fast-forward, 3-way, conflicts, project success workflow verified.

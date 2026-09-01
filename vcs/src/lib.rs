@@ -1,8 +1,10 @@
 pub mod checkout;
 pub mod config;
+pub mod diff;
 pub mod error;
 pub mod hash;
 pub mod index;
+pub mod merge;
 pub mod object;
 pub mod refs;
 pub mod status;

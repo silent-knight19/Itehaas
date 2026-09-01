@@ -1,6 +1,6 @@
-# Itehaas — Branching and Merging (Phase 3)
+# Itehaas — Branching and Merging (Phase 3 & 4)
 
-> Branches are pointers to commits; checkout moves HEAD and working tree.
+> Branches are pointers to commits; checkout moves HEAD and working tree; merge reconciles histories.
 
 ## References
 
@@ -37,6 +37,41 @@ Index after checkout matches target tree, not previous. Nested `dir/sub/file.txt
 
 History is DAG: commits have 0..N parents. `log` walks first-parent chain from `HEAD`; `branch` histories share base but diverge. `status` shows `On branch <name>` or `HEAD detached`. `log` per branch shows independent histories (tested in `phase3_tests.rs:80` with `base → feature` vs `base → main`).
 
+## Diff — Phase 4
+
+`vcs/src/diff.rs:1` — `diff_maps` (old vs new BTreeMap), `is_binary`, `unified_diff` via `similar` crate, `get_blob_content`:
+
+- `diff_working_vs_index` (unstaged): wt map (walkdir hash) vs index.
+- `diff_index_vs_head` (staged, `--staged`/`--cached`): index vs HEAD tree.
+- `diff_head_vs_commit` (target branch): HEAD vs target commit tree.
+- CLI `itehaas diff` (wt vs index), `itehaas diff --staged`, `itehaas diff <branch>` — prints `added/deleted/modified` + unified `diff --itehaas a/... b/...` with `---`/`+++` and `@@`, binary files as `Binary files differ`.
+
+## Merge — Phase 4
+
+`vcs/src/merge.rs:1` — implements Git-like three-way merge:
+
+- **Common ancestor**: `find_common_ancestor` BFS ancestors of `a` + BFS from `b` until intersection; `is_ancestor` BFS.
+- **Fast-forward**: if `current` is ancestor of `feature`, update `refs/heads/<current>` to `feature` hash and checkout working tree/index (like `checkout`); fails if dirty unless `-f`.
+- **Already up-to-date**: if `feature` is ancestor of `current`, print `Already up to date.`
+- **Three-way**: `O` (ancestor), `A` (current), `B` (feature) flattened maps. Union of paths. For each path, `merge_file` logic:
+
+```
+if A==B => take A
+else if A==O => take B
+else if B==O => take A
+else conflict
+```
+
+`eq` is `None==None` or `Some(hash==hash && mode==mode)`. Added/deleted handled as `None`.
+
+- **Non-conflicted**: staged (add to new `Index`, write file, delete if `None`), then if `conflicts.is_empty()` build tree via `tree_builder`, create merge commit with `parents=[current, feature]`, message `Merge branch 'feature' into <current>`, update current branch ref.
+
+- **Conflict**: `merge_file` generates `<<<<<<< HEAD\n<current>\n=======\n<feature>\n>>>>>>> <feature>` (or binary marker), writes to working tree, keeps `current` version in index (so `status` shows `not_staged modified`), collects `conflicts`, writes `.itehaas/MERGE_HEAD`/`MERGE_MSG`/`MERGE_BRANCH`, does not create commit. User must resolve (`edit` → `add` → `commit`). `commit` detects `MERGE_HEAD` and creates 2-parent commit, cleans `MERGE_*`.
+
+- **Status/dirty**: merge requires clean `staged`/`not_staged` (untracked allowed) like checkout.
+
+Tested in `phase4_tests.rs:1` — `fast_forward`, `already_up_to_date`, `3-way no conflict` (different files), `conflict` (both modified), `merge_file` logic, `diff` variants, `is_ancestor`/`common_ancestor`. Manual verified: fast-forward, 3-way, conflict with markers, diff --staged, diff target, resolve.
+
 ## Future
 
-Phase 4 will add diff, three-way merge, fast-forward detection, conflict markers using common ancestors.
+Phase 5 will add remotes (`remote`, `clone`, `fetch`, `push`, `pull`) with own HTTP protocol.

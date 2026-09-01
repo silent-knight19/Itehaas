@@ -139,6 +139,25 @@ enum Commands {
         #[arg(short = 'f', long)]
         force: bool,
     },
+    /// Show changes between commits, index, and working tree
+    Diff {
+        /// Show staged changes (index vs HEAD)
+        #[arg(long, group = "diff_mode")]
+        staged: bool,
+        /// Alias for --staged
+        #[arg(long, group = "diff_mode")]
+        cached: bool,
+        /// Target branch/commit to diff against HEAD
+        target: Option<String>,
+    },
+    /// Merge a branch into current branch
+    Merge {
+        /// Branch to merge into current
+        branch: String,
+        /// Merge message (default auto)
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+    },
 }
 
 fn find_repo_or_cwd() -> Result<PathBuf> {
@@ -303,6 +322,18 @@ fn main() -> Result<()> {
             } else {
                 cmd_checkout(&repo, branch, None, force)?;
             }
+        }
+        Commands::Diff {
+            staged,
+            cached,
+            target,
+        } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_diff(&repo, staged || cached, target)?;
+        }
+        Commands::Merge { branch, message } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_merge(&repo, branch, message)?;
         }
     }
     Ok(())
@@ -475,8 +506,27 @@ fn cmd_commit(
         }
     }
 
-    // Get parent(s) — reuse parent_opt from earlier
-    let parents = if let Some(p) = parent_opt { vec![p] } else { vec![] };
+    // Get parent(s) — handle merge (second parent from MERGE_HEAD)
+    let merge_head_path = repo.join(".itehaas").join("MERGE_HEAD");
+    let merge_parent = if merge_head_path.exists() {
+        let content = fs::read_to_string(&merge_head_path)?.trim().to_string();
+        if content.is_empty() {
+            None
+        } else {
+            let algo2 = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let h = Hash::from_hex(algo2, &content).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            Some(h)
+        }
+    } else {
+        None
+    };
+    let mut parents = if let Some(p) = parent_opt { vec![p] } else { vec![] };
+    if let Some(mh) = merge_parent.clone() {
+        // Avoid duplicate if merge_head is same as parent
+        if !parents.iter().any(|p| p.hex() == mh.hex()) {
+            parents.push(mh);
+        }
+    }
 
     // Get author/committer
     let (cfg_name, cfg_email) = config::read_user(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
@@ -524,6 +574,13 @@ fn cmd_commit(
     }
 
     println!(" {} files staged, tree {}", index.len(), tree_hash.hex()[..7].to_string());
+    // Cleanup merge state if present
+    if merge_parent.is_some() {
+        let _ = fs::remove_file(repo.join(".itehaas").join("MERGE_HEAD"));
+        let _ = fs::remove_file(repo.join(".itehaas").join("MERGE_MSG"));
+        let _ = fs::remove_file(repo.join(".itehaas").join("MERGE_BRANCH"));
+        println!("Merge commit created with {} parents", parents.len());
+    }
     Ok(())
 }
 
@@ -955,6 +1012,163 @@ fn checkout_with_force(
     } else if let Some(branch) = branch {
         let ref_name = format!("refs/heads/{}", branch);
         itehaas_lib::refs::write_head_ref(repo, &ref_name).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    }
+    Ok(())
+}
+
+fn cmd_diff(repo: &Path, staged: bool, target: Option<String>) -> Result<()> {
+    let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    if staged {
+        let diffs = itehaas_lib::diff::diff_index_vs_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if diffs.is_empty() {
+            return Ok(());
+        }
+        for d in diffs {
+            println!("{} {}", d.status_str(), d.path);
+            let old_content = if let Some(h) = d.old_hash {
+                itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).ok()
+            } else {
+                None
+            };
+            let new_content = if let Some(h) = d.new_hash {
+                itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).ok()
+            } else {
+                None
+            };
+            match (old_content, new_content) {
+                (Some(old), Some(new)) => {
+                    print!("{}", itehaas_lib::diff::unified_diff(&old, &new, &d.path));
+                }
+                (None, Some(new)) => {
+                    print!("{}", itehaas_lib::diff::unified_diff(b"", &new, &d.path));
+                }
+                (Some(old), None) => {
+                    print!("{}", itehaas_lib::diff::unified_diff(&old, b"", &d.path));
+                }
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(tgt) = target {
+        // Diff HEAD vs target
+        let target_hash = itehaas_lib::refs::resolve_rev(repo, &tgt)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("target '{}' not found", tgt))?;
+        let diffs = itehaas_lib::diff::diff_head_vs_commit(repo, &target_hash)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if diffs.is_empty() {
+            return Ok(());
+        }
+        for d in diffs {
+            println!("{} {}", d.status_str(), d.path);
+            let old_content = if let Some(h) = d.old_hash {
+                itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).ok()
+            } else {
+                None
+            };
+            let new_content = if let Some(h) = d.new_hash {
+                itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).ok()
+            } else {
+                None
+            };
+            match (old_content, new_content) {
+                (Some(old), Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(&old, &new, &d.path)),
+                (None, Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(b"", &new, &d.path)),
+                (Some(old), None) => print!("{}", itehaas_lib::diff::unified_diff(&old, b"", &d.path)),
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+
+    // Default: working tree vs index
+    let diffs = itehaas_lib::diff::diff_working_vs_index(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if diffs.is_empty() {
+        return Ok(());
+    }
+    for d in diffs {
+        println!("{} {}", d.status_str(), d.path);
+        // For working vs index, need to get working file content directly
+        let old_content = if let Some(h) = d.old_hash {
+            itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).ok()
+        } else {
+            None
+        };
+        let new_content = if d.new_hash.is_some() {
+            // Read from working tree file
+            let p = repo.join(&d.path);
+            fs::read(&p).ok()
+        } else {
+            None
+        };
+        match (old_content, new_content) {
+            (Some(old), Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(&old, &new, &d.path)),
+            (None, Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(b"", &new, &d.path)),
+            (Some(old), None) => print!("{}", itehaas_lib::diff::unified_diff(&old, b"", &d.path)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn cmd_merge(repo: &Path, branch: String, message: Option<String>) -> Result<()> {
+    // Check current branch
+    let current_branch = itehaas_lib::refs::current_branch(repo)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("cannot merge in detached HEAD state"))?;
+    if current_branch == branch {
+        anyhow::bail!("cannot merge branch '{}' into itself", branch);
+    }
+    // Check MERGE_HEAD exists (already merging)
+    if repo.join(".itehaas").join("MERGE_HEAD").exists() {
+        anyhow::bail!("already in a merge (MERGE_HEAD exists), commit or abort first");
+    }
+    let current_hash = itehaas_lib::refs::resolve_head(repo)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("HEAD has no commit"))?;
+    let feature_hash = itehaas_lib::refs::read_ref(repo, &format!("refs/heads/{}", branch))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", branch))?;
+
+    let result = itehaas_lib::merge::merge(repo, &branch, &feature_hash, &current_branch, &current_hash)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    if result.already_up_to_date {
+        println!("Already up to date.");
+        return Ok(());
+    }
+    if result.fast_forward {
+        println!("Fast-forward merge: {} -> {}", current_branch, branch);
+        println!("Updated {} to {}", current_branch, &feature_hash.hex()[..7]);
+        return Ok(());
+    }
+    if !result.conflicts.is_empty() {
+        println!("Auto-merging failed with conflicts:");
+        for c in &result.conflicts {
+            println!("  CONFLICT (content): Merge conflict in {}", c);
+        }
+        println!("Automatic merge failed; fix conflicts and then commit the result.");
+        // Write merge message if provided, otherwise keep default
+        if let Some(msg) = message {
+            fs::write(repo.join(".itehaas").join("MERGE_MSG"), msg)?;
+        }
+        return Ok(());
+    }
+    // No conflicts, merge commit already created inside merge()
+    let new_head = itehaas_lib::refs::resolve_head(repo)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .unwrap();
+    println!(
+        "Merge made by the 'ort' strategy. {}",
+        new_head.hex()[..7].to_string()
+    );
+    if let Some(msg) = message {
+        println!("(custom message ignored for auto-merge, using default)");
+        let _ = msg;
     }
     Ok(())
 }

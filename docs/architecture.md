@@ -22,7 +22,7 @@ Modular monolith. Monorepo: `vcs/` (Rust), `server/` (Fastify/TS), `web/` (Next.
 
 ## Component Responsibilities
 
-- **VCS (Rust)**: hashing (trait, SHA-256), framing, object store, refs/HEAD (`refs.rs`), index/staging (`index.rs`), tree building (`tree_builder.rs`), checkout (`checkout.rs`), status/log, diff/merge, remotes. See `object-model.md`, `storage.md`. Phase 2 implements `add`/`commit`/`status`/`log` with `Working Tree → Index → Objects` flow; Phase 3 adds `branch`/`checkout`/`switch` (symbolic/detached HEAD, DAG histories, hierarchical branches), CLI `itehaas` (`vcs/src/main.rs:1`).
+- **VCS (Rust)**: hashing (trait, SHA-256), framing, object store, refs/HEAD (`refs.rs`), index/staging (`index.rs`), tree building (`tree_builder.rs`), checkout (`checkout.rs`), diff (`diff.rs` via `similar`), merge (`merge.rs` common ancestor, 3-way, fast-forward, conflicts), status/log, remotes. See `object-model.md`, `storage.md`. Phase 2 implements `add`/`commit`/`status`/`log` with `Working Tree → Index → Objects` flow; Phase 3 adds `branch`/`checkout`/`switch` (symbolic/detached HEAD, DAG, hierarchical); Phase 4 adds `diff` (wt vs index, --staged, HEAD vs branch, unified) and `merge` (fast-forward, up-to-date, 3-way O/A/B, markers, MERGE_HEAD, binary), CLI `itehaas` (`vcs/src/main.rs:1`).
 - **Server (Fastify)**: auth (Argon2, httpOnly cookies, CSRF), repo/metadata CRUD, permission checks, spawn wrapper `server/src/lib/vcs.ts`.
 - **Web (Next.js)**: dashboard, repo browser (reconstructs trees via VCS), commits/branches/issues/PRs.
 - **Deploy**: NVMe for hot, HDD for backups; Tailscale for remote (replaceable with Headscale).
