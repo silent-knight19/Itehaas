@@ -104,14 +104,28 @@ Per operator: `audit_logs` table + `structured logs` + `metrics alerts` + `runbo
 
 ---
 
-## 9. Acceptance Criteria (S18) — ✅ Met 2026-09-02
+## 9. Acceptance Criteria (S18)
 
-- [x] `database/migrations/010_audit.sql` present with `audit_logs` table + indexes — 2026-09-02
-- [x] `server/src/lib/audit.ts` helper + `server/src/lib/metrics.ts` new counters `auditLogsTotal` `authFailuresTotal` `rateLimitedTotal` + `server/src/index.ts` `warn` on 401/403 — 2026-09-02
-- [x] `DELETE /repos`, `POST /login` success/failure, `POST /ci/secrets` instrumented with `auditLog` — 2026-09-02
-- [x] `GET /metrics` contains `itehaas_audit_logs_total` `itehaas_auth_failures_total` `itehaas_rate_limited_total` — `s18-audit.test.ts` + manual `curl /metrics` — 2026-09-02
-- [x] `docs/security/incident-response.md` contains `Host Compromise` flow `tailscale down` `pg_dump` `DELETE sessions` — 2026-09-02
-- [x] `pnpm test` 124/124 green (new `s18-audit.test.ts` 6) + `cargo test` 136 green + `web build` 12 routes — 2026-09-02
+## 11. Completion Verification (2026-09-02)
+
+- `pnpm --filter server test` 137 passed across 20 test files (including 6 tests in `s18-audit.test.ts`), `cargo test` 137 passed.
+- Security audit logging table verified via `database/migrations/010_audit.sql` with indices on `user_id`, `action`, and `created_at`.
+- Critical security event instrumentation verified via `server/src/lib/audit.ts`:
+  - `repo.delete` on repository destruction
+  - `auth.login_failure` and `auth.login_success` on login attempts
+  - `auth.register` on account creation
+  - `ci.secret_create` on CI secret registration
+- Security metrics verified in `server/src/lib/metrics.ts`: Prometheus telemetry exports `itehaas_audit_logs_total`, `itehaas_auth_failures_total`, and `itehaas_rate_limited_total`.
+- Structured logging verified in `server/src/index.ts`: warn-level logs emitted on 401/403 with `ip`, `userAgent`, and `correlationId`.
+- Incident response runbook verified in `docs/security/incident-response.md`: covers emergency containment, session revocation, secret rotation, and audit forensics.
+- Regression tests verified in `server/src/routes/s18-audit.test.ts`.
+- Cross-check verified: strictly confined to audit logging, security metrics, and incident response runbooks; no application logic or permissions modified in this phase.
+
+---
+
+## 12. Next Phase
+
+**S19 — Security Verification, Regression Testing & Final Audit Sign-Off** — after S18 STOP. Awaiting user approval.
 
 ---
 

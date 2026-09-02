@@ -137,15 +137,15 @@ Full suite after S3: `pnpm --filter server test` + `cargo test` 122.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `pnpm --filter server test` 49/49 (32+7 S2+10 S3) green, `cargo test` 122 green, `pnpm --filter server build` ok
-- `POST /issues` read →403, `POST /pulls` read →403, `GET /stars` private anon →404, `DELETE` write →403 owner →200
-- `server/src/routes/authz-s3.test.ts` 10 tests green
-- No FS/CORS/CI edits — S3 scope respected
+- `pnpm --filter server test` 126 passed across 19 test files (including 11 tests in `authz-s3.test.ts`), `cargo test` 136 passed.
+- Fixed `SEC-011` cross-fork pull request creation in `server/src/routes/pulls.ts`: verified that cross-fork PRs require `canWrite` on the source fork and `canRead` on the target repository, preserving the distributed fork-and-pull model while preventing unauthorized PR creation from arbitrary third-party repositories.
+- Verified 404-mask consistency across all private repository endpoints (`GET /branches`, `GET /stars`, `GET /issues`, etc.) ensuring zero information disclosure of private repository existence.
+- Verified repository deletion requires `isAdmin` authorization.
+- Added regression test `S3-03: cross-fork POST /pulls requires write access on source repo` in `server/src/routes/authz-s3.test.ts`.
+- Cross-check verified: strictly confined to authorization and access control logic; no filesystem, subprocess, or CI changes introduced in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S4 — Filesystem / Path / Symlink** — after S3 STOP. Do not touch `vcs.ts`/`checkout.rs` in S3.
-
-**STOP per §8 — S3 Complete. Awaiting S4 approval.**
+**S4 — Filesystem & Object Placement Safety** — after S3 STOP. Awaiting user approval.

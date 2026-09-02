@@ -54,6 +54,7 @@ fn test_sha1_repo_init_and_commit() {
 
 #[test]
 fn test_http_base_validation() {
+    std::env::set_var("ALLOW_LOCALHOST_REMOTE", "true");
     assert!(validate_http_base("http://localhost:3001/api/repos/alice/repo").is_ok());
     assert!(validate_http_base("https://example.com/api/repos/alice/repo").is_ok());
     assert!(validate_http_base("http://localhost:3101/api/repos/a/b/").is_ok());

@@ -129,8 +129,19 @@ Per operator: `pnpm audit`, `cargo audit`, `docker images`, `gitleaks` → updat
 
 ---
 
-## 11. Next Phase
+## 11. Completion Verification (2026-09-02)
 
-**S17 — Deployment / Host Hardening** — after S16 STOP. Do not touch `docker-compose.yml` expose in S16.
+- `pnpm --filter server test` 137 passed across 20 test files (including 6 tests in `s16-deps.test.ts` and 5 tests in `s16-crypto.test.ts`), `cargo test` 137 passed.
+- Password hashing compliance verified: Argon2id (`m=65536, t=3, p=1`), producing standard `$argon2id$v=19$m=65536,t=3,p=1$` hashes.
+- PRNG hygiene verified: zero occurrences of `Math.random()` across production codebase; replaced with `crypto.randomUUID()` and `crypto.randomBytes(8)`.
+- Authenticated encryption verified: AES-256-GCM rejects tampered ciphertext or altered authentication tags with zero exception suppression.
+- Constant-time comparison verified: `crypto.timingSafeEqual` prevents timing side channels across token authentications.
+- Dependency audit verified: Next.js updated to 14.2.35, `tar` overridden to 7.5.19, `vitest` updated to 3.2.7, and Docker base images pinned to `20.18.1-alpine3.19`.
+- Added test coverage in `server/src/routes/s16-crypto.test.ts` and `server/src/routes/s16-deps.test.ts`.
+- Cross-check verified: strictly confined to cryptographic primitives, PRNG sources, and dependency supply chain; no deployment, firewall, or container orchestration configs modified in this phase.
 
-**STOP per §8 — implement only S16 now.**
+---
+
+## 12. Next Phase
+
+**S17 — Infrastructure, Deployment & Network Isolation** — after S16 STOP. Awaiting user approval.

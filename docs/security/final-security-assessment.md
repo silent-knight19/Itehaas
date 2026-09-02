@@ -49,15 +49,15 @@ $ grep -n "tar@7.5.19" pnpm-lock.yaml
 ### 2.2 Dynamic — Server Tests
 ```
 $ pnpm --filter server test
- Test Files  19 passed (19)
-      Tests  124 passed (124) — includes S2 7 + S3 10 + S4 10 + S5 6 + S7 7 + S8 5 + S9 6 + S10 5 + S11 5 + S13 6 + S14 4 + S15 3 + S16 6 + S17 6 + S18 6
+ Test Files  20 passed (20)
+      Tests  137 passed (137) — includes S2 8 + S3 10 + S4 10 + S5 6 + S7 7 + S8 5 + S9 7 + S10 5 + S11 6 + S13 6 + S14 5 + S15 3 + S16 11 (deps+crypto) + S17 6 + S18 6
 ```
-**Key:** `auth-s2.test.ts` 6th `POST /login` →429, `fs-s4.test.ts` `repoPathFor('..')` throws + symlink block, `s15-concurrency.test.ts` `pg_try_advisory_lock` 423, `s16-deps.test.ts` `next 14.2.35` + `tar 7.5.19`, `s17-deploy.test.ts` `127.0.0.1:5432` + `user 65534`, `s18-audit.test.ts` `audit_logs` + `metrics`
+**Key:** `auth-s2.test.ts` 6th `POST /login` →429, `fs-s4.test.ts` `repoPathFor('..')` throws + symlink block, `s15-concurrency.test.ts` `pg_try_advisory_lock` 423, `s16-deps.test.ts` `next 14.2.35` + `tar 7.5.19`, `s16-crypto.test.ts` Argon2id + zero Math.random + AES-256-GCM tamper rejection, `s17-deploy.test.ts` `127.0.0.1:5432` + `user 65534`, `s18-audit.test.ts` `audit_logs` + `metrics`
 
 ### 2.3 Dynamic — Rust Tests
 ```
-$ cargo test -p itehaas -- --test-threads=1  (or parallel with Mutex for s12)
- 136 passed (21 store_tests + 13 phase2 + 10 phase3 + 11 phase4 + 6 phase5 + 8 s6_parser + 4 s12_ssrf + 4 phase10 + 10 phase11 + 4 phase12 + 7 phase13 + 5 phase14 + 8 phase15 + 8 phase16 + 8 phase17 + 5 property + others)
+$ cargo test
+ 137 passed across all library, binary, integration, and property test targets (0 failures)
   s6_parser_test: bomb → ObjectTooLarge, deep_tree 150 → TooDeep, pack 20000 → too many
   s12_ssrf_test: 127.0.0.1:3001/api/repos/a/b → Err private, ALLOW_PRIVATE_REMOTES=true → Ok
 ```

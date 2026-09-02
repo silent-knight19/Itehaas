@@ -2,6 +2,8 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
+import * as zlib from 'zlib';
 import { query, getClient } from '../db';
 import { repoPathFor, execItehaas } from '../lib/vcs';
 import { getSessionUser, requireAuth } from '../middleware/auth';
@@ -566,17 +568,21 @@ export async function repoRoutes(app: FastifyInstance) {
     return reply.send({ refs, head, hasher });
   });
 
-  // Raw octet-stream parser for push (64 MiB limit)
+  // Raw octet-stream parser for push (64 MiB limit, linear buffer collection)
   app.addContentTypeParser('application/octet-stream', function (request: any, payload: any, done: any) {
-    let data = Buffer.alloc(0);
+    const chunks: Buffer[] = [];
+    let totalLength = 0;
+    const MAX_ALLOWED = 64 * 1024 * 1024 + 1024;
     payload.on('data', (chunk: Buffer) => {
-      data = Buffer.concat([data, chunk]);
-      if (data.length > 64 * 1024 * 1024 + 1024) {
-        // Too large - will be handled as 413 later, but abort early
+      totalLength += chunk.length;
+      if (totalLength > MAX_ALLOWED) {
+        // Too large - abort stream immediately
         (payload as any).destroy(new Error('Payload too large'));
+        return;
       }
+      chunks.push(chunk);
     });
-    payload.on('end', () => done(null, data));
+    payload.on('end', () => done(null, Buffer.concat(chunks, totalLength)));
     payload.on('error', (err: any) => done(err, undefined));
   });
 
@@ -689,14 +695,24 @@ export async function repoRoutes(app: FastifyInstance) {
       }
     } catch {}
 
+    // S4/SEC-021: Verify object integrity before placement into permanent CAS path
+    try {
+      const canonical = zlib.inflateSync(body, { maxOutputLength: 64 * 1024 * 1024 + 1024 });
+      const algo = hash.length === 40 ? 'sha1' : 'sha256';
+      const computedHash = crypto.createHash(algo).update(canonical).digest('hex');
+      if (computedHash !== hash) {
+        return reply.status(400).send({ error: 'Corrupt object: hash mismatch' });
+      }
+    } catch (e: any) {
+      return reply.status(400).send({ error: `Corrupt object: ${e.message || 'invalid zlib stream'}` });
+    }
+
     // Atomic write via temp file
     const dir = path.dirname(objectPath);
     await fs.promises.mkdir(dir, { recursive: true });
-    const tmp = path.join(dir, `.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const tmp = path.join(dir, `.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`);
     try {
       await fs.promises.writeFile(tmp, body);
-      // Verify via itehaas verify (reads and re-hashes)
-      // Write to final path atomically
       try {
         await fs.promises.rename(tmp, objectPath);
       } catch (e: any) {
@@ -706,13 +722,6 @@ export async function repoRoutes(app: FastifyInstance) {
           return reply.send({ ok: true, hash, dedup: true });
         }
         throw e;
-      }
-      // Verify
-      const ver = await execItehaas(['verify', hash], { cwd: repoPath });
-      if (ver.code !== 0) {
-        // Corrupt: remove file
-        try { await fs.promises.unlink(objectPath); } catch {}
-        return reply.status(400).send({ error: 'Corrupt object: hash mismatch' });
       }
       return reply.status(201).send({ ok: true, hash });
     } catch (e: any) {

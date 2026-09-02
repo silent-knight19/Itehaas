@@ -267,4 +267,40 @@ describe('S2 Authentication Hardening', () => {
     spy.mockRestore();
     await app.close();
   });
+
+  it('SEC-005: trustProxy ensures separate client IPs do not collide on rate limits', async () => {
+    mockQuery.mockImplementation(async (text: string) => {
+      if (text.includes('FROM users WHERE username')) return { rows: [] };
+      return { rows: [], rowCount: 0 };
+    });
+    const app = await buildApp();
+    // Client A sends 5 requests from IP 198.51.100.1
+    for (let i = 0; i < 5; i++) {
+      const resA = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        headers: { 'x-forwarded-for': '198.51.100.1' },
+        payload: { username: `userA${i}`, password: 'wrongpassword' },
+      });
+      expect(resA.statusCode).toBe(401);
+    }
+    // 6th request from Client A should be rate limited (429)
+    const resA6 = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'x-forwarded-for': '198.51.100.1' },
+      payload: { username: 'userA_extra', password: 'wrongpassword' },
+    });
+    expect(resA6.statusCode).toBe(429);
+
+    // Client B from IP 198.51.100.2 should NOT be rate limited
+    const resB = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'x-forwarded-for': '198.51.100.2' },
+      payload: { username: 'userB', password: 'wrongpassword' },
+    });
+    expect(resB.statusCode).toBe(401);
+    await app.close();
+  });
 });

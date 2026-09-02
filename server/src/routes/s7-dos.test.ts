@@ -191,4 +191,13 @@ describe('S7 Resource Exhaustion / DoS', () => {
     expect(content).toContain('visited.len() > 10000');
     expect(content).toContain('all_entries.len() > 10000');
   });
+
+  it('SEC-014 linear chunk collection in octet-stream parser code check', async () => {
+    const fs = await import('fs');
+    const content = fs.readFileSync('src/routes/repos.ts', 'utf8');
+    // Ensure Buffer.concat on every chunk was eliminated and replaced with chunk array push
+    expect(content).toContain('chunks.push(chunk)');
+    expect(content).toContain('Buffer.concat(chunks, totalLength)');
+    expect(content).not.toMatch(/data\s*=\s*Buffer\.concat\(\[data,\s*chunk\]\)/);
+  });
 });

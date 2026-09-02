@@ -99,9 +99,13 @@ pub fn verify_pack(repo: &Path, pack_path: &Path) -> Result<usize> {
         let mut hex_buf = [0u8; 64];
         f.read_exact(&mut hex_buf)?;
         let hex = String::from_utf8_lossy(&hex_buf).to_string();
-        let mut len_buf = [0u8;4];
+        let mut len_buf = [0u8; 4];
         f.read_exact(&mut len_buf)?;
         let len = u32::from_be_bytes(len_buf) as usize;
+        // S6/SEC-015: bound declared length before allocation to prevent heap exhaustion
+        if len > 64 * 1024 * 1024 {
+            return Err(crate::error::ItehaasError::InvalidObject(format!("pack entry declared too large: {}", len)));
+        }
         let mut data = vec![0u8; len];
         f.read_exact(&mut data)?;
         // Verify: data should be zlib bytes that when decompressed and hashed matches hex

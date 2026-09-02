@@ -156,3 +156,23 @@ fn test_pack_bomb_count_limit() {
     assert!(res.is_err());
     assert!(format!("{:?}", res.unwrap_err()).contains("too many"));
 }
+
+#[test]
+fn test_pack_entry_declared_length_limit() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo5");
+    fs::create_dir_all(&repo).unwrap();
+    init(&repo, HashAlgo::Sha256).unwrap();
+    let pack_dir = repo.join(".itehaas/objects/pack");
+    fs::create_dir_all(&pack_dir).unwrap();
+    let pack_path = pack_dir.join("pack-len-bomb.pack");
+    let mut f = fs::File::create(&pack_path).unwrap();
+    f.write_all(b"ITEHAAS PACK v1\n").unwrap();
+    f.write_all(&(1u32.to_be_bytes())).unwrap(); // count = 1
+    f.write_all(&[b'0'; 64]).unwrap(); // 64 hex bytes
+    f.write_all(&(0xFFFFFFFFu32.to_be_bytes())).unwrap(); // declared len = 4GB
+    let res = itehaas_lib::pack::verify_pack(&repo, &pack_path);
+    assert!(res.is_err());
+    let err = format!("{:?}", res.unwrap_err());
+    assert!(err.contains("too large"));
+}

@@ -10,8 +10,11 @@ fn env_lock() -> &'static Mutex<()> {
 fn test_private_ip_blocked() {
     let _guard = env_lock().lock().unwrap();
     std::env::remove_var("ALLOW_PRIVATE_REMOTES");
+    std::env::remove_var("ALLOW_LOCALHOST_REMOTE");
     // Should be blocked unless ALLOW_PRIVATE_REMOTES=true
     let cases = vec![
+        "http://localhost/api/repos/a/b",
+        "http://localhost:3001/api/repos/a/b",
         "http://127.0.0.1/api/repos/a/b",
         "http://127.0.0.1:3001/api/repos/a/b",
         "http://10.0.0.1/api/repos/a/b",

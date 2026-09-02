@@ -119,15 +119,15 @@ Full suite after S12: `cargo test` + `pnpm test` + `web build`.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `cargo test --test s12_ssrf_test` 4/4 green: `127.0.0.1` `10.0.0.1` `192.168` `172.16` `169.254` `::1` `fc00::` `fe80::` `0.0.0.0` → `Err private`, `8.8.8.8` `example.com` → `Ok`, `localhost` allowed, `ALLOW_PRIVATE_REMOTES=true` → `Ok`
-- `cargo test --tests` 136 (132+4) green, `pnpm --filter server test` 93/93 green, `pnpm --filter web build` 12 routes green
-- `vcs/src/remote/http.rs:30` `redirects(0)` + `host` private check via `is_private_host` + `to_socket_addrs` + `ALLOW_PRIVATE_REMOTES`
-- No FS/CORS edits — S12 scope respected
+- `cargo test` 137 passed across all targets (including 4 tests in `s12_ssrf_test.rs`), `pnpm --filter server test` 131 passed across 19 test files.
+- Remediated `SEC-016` loopback SSRF bypass in `vcs/src/remote/http.rs`: eliminated the unvetted `localhost` exception in `is_private_host()`. `localhost` and `localhost:<port>` are now strictly blocked by default as loopback addresses unless explicitly allowed via `ALLOW_PRIVATE_REMOTES` or `ALLOW_LOCALHOST_REMOTE` environment variables.
+- Verified comprehensive IP blocklist in `vcs/src/remote/http.rs`: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16` (cloud metadata), `0.0.0.0`, `::1`, `fc00::/7`, `fe80::/10`.
+- Verified HTTP client security: `ureq::AgentBuilder` configures `.redirects(0)`, `timeout_connect(10s)`, `timeout_read(30s)`, and `timeout_write(30s)`.
+- Added test coverage in `vcs/tests/s12_ssrf_test.rs`: verified `http://localhost/api/repos/a/b` and `http://localhost:3001/api/repos/a/b` are strictly blocked when `ALLOW_PRIVATE_REMOTES` is not set.
+- Cross-check verified: strictly confined to outbound HTTP requests, remote URL validation, and IP filtering; no CI runner or container execution configs modified in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S13 — CI / Container Security** — after S12 STOP. Do not touch `executeInRunner` `sh` in S12 (S13).
-
-**STOP per §8 — S12 Complete. Awaiting S13 approval.**
+**S13 — CI Runner Sandboxing & Execution Security** — after S12 STOP. Awaiting user approval.

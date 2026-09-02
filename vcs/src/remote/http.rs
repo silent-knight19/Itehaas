@@ -36,12 +36,13 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
-// S12: check if host is private/link-local/loopback (unless ALLOW_PRIVATE_REMOTES=true)
 fn is_private_host(host: &str) -> bool {
-    // Allow localhost explicitly for tests and local dev (resolves to 127.0.0.1 but should be allowed)
+    // S12/SEC-016: Localhost is a loopback host. Block by default unless explicitly allowed for testing.
     let lower = host.to_ascii_lowercase();
     if lower == "localhost" || lower.starts_with("localhost:") {
-        return false;
+        let allow = std::env::var("ALLOW_PRIVATE_REMOTES").map(|v| v == "true" || v == "1").unwrap_or(false)
+            || std::env::var("ALLOW_LOCALHOST_REMOTE").map(|v| v == "true" || v == "1").unwrap_or(false);
+        return !allow;
     }
     // Strip port if present (but careful with IPv6)
     let h = if host.starts_with('[') {

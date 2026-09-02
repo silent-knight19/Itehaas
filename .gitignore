@@ -57,10 +57,23 @@ $RECYCLE.BIN/
 # Env & Secrets
 .env
 .env.*
+.env*.local
+*.local
 !.env.example
 *.pem
 *.key
 *.cert
+*.crt
+*.pfx
+*.p12
+*.p8
+*.pkcs12
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
+known_hosts
+authorized_keys
 secrets/
 credentials.json
 serviceAccount.json
@@ -76,6 +89,9 @@ result-*
 *.temp
 *.bak
 *.backup
+*.pid
+*.pid.lock
+*.seed
 
 # Testing & Coverage
 lcov.info
@@ -84,6 +100,9 @@ coverage.xml
 *.profdata
 tarpaulin-report.html
 cobertura.xml
+test-results/
+playwright-report/
+blob-report/
 
 # Docker
 .docker/
@@ -94,12 +113,18 @@ cobertura.xml
 testing/
 Testing/
 .Testing
+.agents/
+.fleet/
 # Itehaas data (repos are sensitive, never push)
 data/repos/*
 !data/repos/.gitkeep
 pgdata/
 *.sqlite
+*.sqlite3
 *.db
 *.dump
+*.sql.gz
+*.sql.bak
+dump.rdb
 .forensics/
 .opencode/

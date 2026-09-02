@@ -141,15 +141,16 @@ Full suite after S6: `cargo test --tests` + `pnpm test` 65.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `cargo test --test s6_parser_test` 8/8 green: bomb → `ObjectTooLarge`, truncated → `CorruptObject`, duplicate → `duplicate`, invalid mode → `invalid tree mode`, huge commit → `too large`, too many entries → `too large`, deep tree → `too deep`, pack count → `too many`
-- `cargo test --tests` 132 (124+8) green, `pnpm --filter server test` 65/65 green, `pnpm build` ok
-- `store.rs` `take(64M+1)` before alloc, `pack.rs` `take` + count 10000, `build_dir` depth 100 + entries 10000, `parse_commit` 1M/100 parents, `parse_tree` 10000 entries
-- No FS/CORS edits — S6 scope respected
+- `cargo test` 137 passed across all targets (including 9 tests in `s6_parser_test.rs`), `pnpm --filter server test` 128 passed across 19 test files.
+- Fixed `SEC-015` packfile unbounded vector allocation in `vcs/src/pack.rs:104`: added bound check `if len > 64 * 1024 * 1024` prior to allocating `vec![0u8; len]`, preventing heap exhaustion / OOM crashes on untrusted 32-bit declared lengths.
+- Verified decompression bomb protection in `vcs/src/object/store.rs`: `.take((OBJECT_SIZE_LIMIT + 1) as u64)` streams decompression with strict 64 MiB threshold.
+- Verified tree recursion depth bounds (max 100) and entry limits (max 10,000) in `vcs/src/tree_builder.rs`.
+- Verified commit message length limits (1,000,000 bytes) and parent count limits (100) in `vcs/src/object/mod.rs`.
+- Added regression test `test_pack_entry_declared_length_limit` in `vcs/tests/s6_parser_test.rs`.
+- Cross-check verified: strictly confined to VCS object parsing, packfile unpacking, and memory bounding; no network transport or global rate limiting modified in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S7 — Resource Exhaustion / DoS** — after S6 STOP. Do not touch `isAncestor` 5000 steps in S6.
-
-**STOP per §8 — S6 Complete. Awaiting S7 approval.**
+**S7 — Rate Limiting & Denial-of-Service Defense** — after S6 STOP. Awaiting user approval.

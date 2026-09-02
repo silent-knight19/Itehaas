@@ -133,4 +133,16 @@ describe('S14 Rate Limiting', () => {
     expect(res61.statusCode).toBe(429);
     await app.close();
   });
+
+  it('S14: 429 response includes Retry-After header', async () => {
+    const app = await buildApp();
+    for (let i = 0; i < 100; i++) {
+      await app.inject({ method: 'GET', url: '/health' });
+    }
+    const res101 = await app.inject({ method: 'GET', url: '/health' });
+    expect(res101.statusCode).toBe(429);
+    expect(res101.headers['retry-after']).toBeDefined();
+    expect(Number(res101.headers['retry-after'])).toBeGreaterThan(0);
+    await app.close();
+  });
 });

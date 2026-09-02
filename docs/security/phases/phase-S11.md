@@ -125,16 +125,15 @@ Full suite after S11: `pnpm test` + `cargo test` + `web build`.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `pnpm --filter server test` 93/93 (32+7+10+10+6+7+5+6+5+5) green, `cargo test` 132 green, `pnpm --filter web build` 12 routes `54.2kB` ok
-- `GET /health` has `content-security-policy: default-src 'self'`, `x-frame-options: DENY`, `strict-transport-security`, `x-content-type-options: nosniff`, `referrer-policy: no-referrer`
-- `POST /api/repos` with `cookie: itehaas_session=...; csrf_token=...` but no `x-csrf-token` →403, with `x-csrf-token: HMAC(sessionId)` →201, `POST /api/auth/login` sets `csrf_token` `httpOnly:false`
-- `Origin: https://evil.com` in dev `origin:true` → `aca-origin: https://evil.com` (dev), prod would be allowlist `https://itehaas.tailnet.ts.net` via `ALLOWED_ORIGIN`
-- No FS/SSRF edits — S11 scope respected
+- `pnpm --filter server test` 131 passed across 19 test files (including 6 tests in `s11-cors.test.ts`), `cargo test` 137 passed.
+- Fixed `SEC-004` CSRF validation in `server/src/middleware/csrf.ts`: enforced strict fail-closed CSRF validation in production mode (`config.isProd`), requiring `x-csrf-token` header matching the session HMAC using constant-time comparison (`crypto.timingSafeEqual`).
+- Verified Helmet security headers in `server/src/index.ts`: Content-Security-Policy (`default-src 'self'`), Strict-Transport-Security (`max-age=63072000; includeSubDomains; preload`), X-Frame-Options (`DENY`), X-Content-Type-Options (`nosniff`), Referrer-Policy (`no-referrer`).
+- Verified CORS allowlist scoping in `server/src/index.ts`: production restricts origins to approved domains (`ALLOWED_ORIGIN` / `tailnet.ts.net`), blocking unauthorized cross-origin credentialed reads.
+- Added regression test `SEC-004: In production mode, CSRF fails closed if token missing` in `server/src/routes/s11-cors.test.ts`.
+- Cross-check verified: strictly confined to transport security, CORS, CSRF, and HTTP headers; no SSRF network filters or container configs modified in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S12 — SSRF / Outbound** — after S11 STOP. Do not touch `remote/http.rs` private IP in S11.
-
-**STOP per §8 — S11 Complete. Awaiting S12 approval.**
+**S12 — SSRF & Remote URL Fetching Defense** — after S11 STOP. Awaiting user approval.

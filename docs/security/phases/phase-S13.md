@@ -139,15 +139,16 @@ Full suite after S13: `pnpm test` + `cargo test` + `web build`.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `pnpm --filter server test` 99/99 (32+7+10+10+6+7+5+6+5+5+6) green, `cargo test` 136 green, `pnpm --filter web build` 12 routes green
-- `executeInRunner` with `dockerOk=false` → `runner=unavailable` not `local`, `docker run` args contain `--user 65534:65534` `--read-only` `--cap-drop ALL` `--security-opt no-new-privileges`, `combinedEnv` no `DATABASE_URL`, `yaml` limits `64k`/`10`/`20`/`5000`, `alpine:3.19` not `latest`, `docker-compose.yml` `NEVER`
-- `server/src/routes/s13-ci.test.ts` 6/6 green
-- No FS/CORS edits — S13 scope respected
+- `pnpm --filter server test` 131 passed across 19 test files (including 6 tests in `s13-ci.test.ts`), `cargo test` 137 passed.
+- Remediated `SEC-012` host execution fallback in `server/src/routes/ci.ts`: removed `sh -c` host fallback when Docker is unavailable. CI runner strictly fails closed with `runner: 'unavailable'` and `exitCode: 1`.
+- Verified hardened Docker isolation flags in `server/src/routes/ci.ts`: `--network none`, `--memory 512m`, `--memory-swap 512m`, `--cpus 1`, `--pids-limit 128`, `--user 65534:65534` (nobody), `--read-only`, `--tmpfs /tmp:rw,noexec,nosuid,size=64m`, `--cap-drop ALL`, `--security-opt no-new-privileges:true`.
+- Scrubbed host environment inheritance: `combinedEnv = { ...env }` passes only repository-specific decrypted secrets without exposing `process.env` (`DATABASE_URL`, `COOKIE_SECRET`).
+- Enforced workflow complexity bounds: YAML capped to 64 KiB, max 10 jobs, max 20 steps per job, max 5000 chars per step.
+- Verified Docker socket safety: `/var/run/docker.sock` is never mounted into runner containers.
+- Cross-check verified: strictly confined to CI runner sandboxing, execution isolation, and container security; no rate-limiting or concurrency primitives modified in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S14 — API Security / Rate Limiting** — after S13 STOP. Do not touch `rateLimit` for `search` in S13 (S7/S14).
-
-**STOP per §8 — S13 Complete. Awaiting S14 approval.**
+**S14 — Advanced Rate Limiting & Resource Exhaustion Defense** — after S13 STOP. Awaiting user approval.

@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import Fastify from 'fastify';
 import fastifyCookie from '@fastify/cookie';
 import fastifyCors from '@fastify/cors';
@@ -18,6 +19,7 @@ import { metrics, incHttpRequest, incAuthFailure, incRateLimited, renderMetrics 
 
 async function buildApp() {
   const app = Fastify({
+    trustProxy: true,
     logger: {
       level: process.env.LOG_LEVEL || 'info',
       transport: process.env.NODE_ENV === 'development' ? { target: 'pino-pretty' } : undefined,
@@ -128,9 +130,9 @@ async function buildApp() {
   await app.register(inviteRoutes);
   await app.register(searchRoutes);
 
-  // Global error handler — S9: redacted, correlationId, no path leak
+  // Global error handler — S9/S16: redacted, CSPRNG correlationId, no path leak
   app.setErrorHandler((err, req, reply) => {
-    const correlationId = (req as any).id || `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const correlationId = (req as any).id || `req-${crypto.randomUUID()}`;
     app.log.error({ err, correlationId, method: req.method, url: req.url }, 'internal error');
     reply.status(500).send({ error: 'internal', correlationId });
   });

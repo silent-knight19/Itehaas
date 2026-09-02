@@ -201,4 +201,74 @@ describe('S4 Filesystem / Path Traversal & Symlink', () => {
     // Cleanup
     try { fs.unlinkSync(link); fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
   });
+
+  it('SEC-021: POST /objects/:hash rejects corrupted or hash-mismatched objects before CAS placement', async () => {
+    const zlib = await import('zlib');
+    const crypto = await import('crypto');
+    const fs = await import('fs');
+    const path = await import('path');
+    const os = await import('os');
+
+    const testRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'itehaas-sec021-'));
+    fs.mkdirSync(path.join(testRepoDir, '.itehaas', 'objects'), { recursive: true });
+
+    // Mock session and repo lookup
+    mockQuery.mockImplementation(async (text: string) => {
+      if (text.includes('FROM sessions s JOIN users u')) return { rows: [{ id: 'u1', username: 'alice' }] };
+      if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r1', visibility: 'public' }] };
+      if (text.includes('SELECT owner_id FROM repositories')) return { rows: [{ owner_id: 'u1' }] };
+      if (text.includes('SELECT role FROM repository_members')) return { rows: [{ role: 'write' }] };
+      return { rows: [], rowCount: 0 };
+    });
+
+    const { repoPathFor } = await import('../lib/vcs');
+    const originalRepoPathFor = repoPathFor;
+    // Temporarily point repoPathFor to our testRepoDir
+    const vcsModule: any = await import('../lib/vcs');
+    vcsModule.repoPathFor = () => testRepoDir;
+
+    const app = await buildApp();
+
+    // Create valid zlib data for "hello world"
+    const validCanonical = Buffer.from('blob 11\0hello world');
+    const compressed = zlib.deflateSync(validCanonical);
+    const expectedHash = crypto.createHash('sha256').update(validCanonical).digest('hex');
+    const wrongHash = 'a'.repeat(64); // Mismatched hash
+
+    // 1. Upload with mismatched hash
+    const resMismatch = await app.inject({
+      method: 'POST',
+      url: `/api/repos/alice/repo/objects/${wrongHash}`,
+      headers: {
+        cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        'content-type': 'application/octet-stream',
+      },
+      payload: compressed,
+    });
+    expect(resMismatch.statusCode).toBe(400);
+    expect(resMismatch.json().error).toMatch(/Corrupt object/);
+
+    // Verify no file was written to wrongHash fanout path
+    const wrongPath = path.join(testRepoDir, '.itehaas', 'objects', wrongHash.slice(0, 2), wrongHash.slice(2));
+    expect(fs.existsSync(wrongPath)).toBe(false);
+
+    // 2. Upload with matching hash succeeds
+    const resSuccess = await app.inject({
+      method: 'POST',
+      url: `/api/repos/alice/repo/objects/${expectedHash}`,
+      headers: {
+        cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        'content-type': 'application/octet-stream',
+      },
+      payload: compressed,
+    });
+    expect(resSuccess.statusCode).toBe(201);
+    const expectedPath = path.join(testRepoDir, '.itehaas', 'objects', expectedHash.slice(0, 2), expectedHash.slice(2));
+    expect(fs.existsSync(expectedPath)).toBe(true);
+
+    // Restore and cleanup
+    vcsModule.repoPathFor = originalRepoPathFor;
+    await app.close();
+    try { fs.rmSync(testRepoDir, { recursive: true, force: true }); } catch {}
+  });
 });

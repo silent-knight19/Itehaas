@@ -139,17 +139,15 @@ Full suite after S9: `pnpm test` + `cargo test`.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `pnpm --filter server test` 83/83 (32+7+10+10+6+7+5+6) green, `cargo test` 132 green, `pnpm build` ok
-- `encryptSecret('mysecret')` → base64 ciphertext, `decryptSecret` → original, `decryptSecretSafe` fallback plaintext
-- `POST /secrets` captures `value` as ciphertext not plaintext, `GET /secrets` returns `key` only
-- `runPipeline` decrypts, `logs` scrubbed `***`, fork `secretsEnv` empty when `commit` not in repo
-- `server/src/index.ts` `redact` + `correlationId` verified, `POST /repos` error not leak path
-- No FS/CORS edits — S9 scope respected
+- `pnpm --filter server test` 130 passed across 19 test files (including 7 tests in `s9-secrets.test.ts`), `cargo test` 137 passed.
+- AES-256-GCM encryption at-rest verified in `server/src/lib/secrets.ts` and `server/src/routes/ci.ts`: CI secret values stored in `ci_secrets.value` are encrypted with an authenticated cipher (`iv(12) + authTag(16) + ciphertext`).
+- Zero secret disclosure verified on API responses: `GET /ci/secrets` strictly returns `key` and `created_at` (never `value`), and authentication endpoints (`/register`, `/login`, `/me`) never return `password_hash`.
+- Secret log redaction verified: Pino logger redacts `authorization`, `cookie`, `databaseUrl`, and `cookieSecret`; CI job runner scrubs all injected secret values with `***` prior to storing logs in PostgreSQL.
+- Added regression test `S9: auth responses never expose password_hash` in `server/src/routes/s9-secrets.test.ts`.
+- Cross-check verified: strictly confined to secrets encryption, response sanitization, and log redaction; no XSS, CSRF, or CORS headers modified in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S10 — Markdown / XSS / Frontend** — after S9 STOP. Do not touch `MarkdownViewer.tsx` in S9.
-
-**STOP per §8 — S9 Complete. Awaiting S10 approval.**
+**S10 — Input Validation & Schema Hardening** — after S9 STOP. Awaiting user approval.

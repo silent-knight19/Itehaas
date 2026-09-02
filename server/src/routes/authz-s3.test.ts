@@ -249,6 +249,40 @@ describe('S3 Authorization Matrix', () => {
     await app.close();
   });
 
+  it('S3-03: cross-fork POST /pulls requires write access on source repo', async () => {
+    const forkRepo = { id: 'r-fork', visibility: 'public', owner_id: 'u-charlie', name: 'fork', owner: 'charlie' };
+    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        if (params?.[0] === sessionIdFor(users.bobRead)) return { rows: [users.bobRead] };
+        return { rows: [] };
+      }
+      if (text.includes('FROM repositories r JOIN users u') && text.includes('WHERE u.username=$1 AND r.name=$2')) {
+        if (params?.[0] === repoPublic.owner && params?.[1] === repoPublic.name) return { rows: [repoPublic] };
+        if (params?.[0] === forkRepo.owner && params?.[1] === forkRepo.name) return { rows: [forkRepo] };
+        return { rows: [] };
+      }
+      if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) {
+        if (params?.[0] === repoPublic.id) return { rows: [{ owner_id: repoPublic.owner_id }] };
+        if (params?.[0] === forkRepo.id) return { rows: [{ owner_id: forkRepo.owner_id }] };
+        return { rows: [] };
+      }
+      if (text.includes('SELECT role FROM repository_members')) {
+        return { rows: [] }; // bob has no write on charlie's fork
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/repos/${repoPublic.owner}/${repoPublic.name}/pulls`,
+      headers: { cookie: `itehaas_session=${sessionIdFor(users.bobRead)}` },
+      payload: { title: 'pr from fork', source_branch: 'feature', target_branch: 'main', source_repo: 'charlie/fork' },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toMatch(/write required on source repo/);
+    await app.close();
+  });
+
   it('S3-04: GET /stars private anon → 404 (not leak)', async () => {
     setupMockForAuthZ({ user: null, repo: repoPrivate, role: null });
     const app = await buildApp();

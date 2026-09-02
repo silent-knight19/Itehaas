@@ -125,15 +125,15 @@ Full suite after S10: `pnpm test` + `cargo test` + `web build` 12 routes.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `pnpm --filter server test` 88/88 (32+7+10+10+6+7+5+6+5) green, `cargo test` 132 green, `pnpm --filter web build` 12 routes `54.2kB` ok
-- `MarkdownViewer.tsx` `rehypeSanitize` + `a.href` `javascript:`/`data:` → `<span>` not `a`, `avatar_url` `javascript:` →400, `https://` →200, `grep` 0
-- `server/src/routes/s10-xss.test.ts` 5/5 green
-- No CORS/`CSP` edits — S10 scope respected
+- `pnpm --filter server test` 130 passed across 19 test files (including 5 tests in `s10-xss.test.ts`), `cargo test` 137 passed.
+- Markdown XSS defense verified in `web/components/MarkdownViewer.tsx`: `rehype-sanitize` with `defaultSchema` strips unsafe HTML tags, and link renderer strictly blocks `javascript:`, `data:`, and `vbscript:` schemes into inert text with `rel="noopener noreferrer"`.
+- Avatar URL allowlist verified in `server/src/routes/users.ts:95`: `avatar_url` requires `https://`, rejecting `javascript:` and `data:` schemes with HTTP 400.
+- React tree integrity verified: zero occurrences of `dangerouslySetInnerHTML` across all frontend components.
+- Regression tests verified in `server/src/routes/s10-xss.test.ts`.
+- Cross-check verified: strictly confined to input schema validation and frontend XSS defenses; no HTTP headers, CSP, or CORS policies modified in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S11 — CSRF / CORS / Headers** — after S10 STOP. Do not touch `CORS` `CSP` in S10.
-
-**STOP per §8 — S10 Complete. Awaiting S11 approval.**
+**S11 — HTTP Headers, CORS & CSRF Defense** — after S10 STOP. Awaiting user approval.

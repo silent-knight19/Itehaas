@@ -143,15 +143,21 @@ Full suite after S14: `pnpm test` + `cargo test` + `web build`.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `pnpm --filter server test` 103/103 (32+7+10+10+6+7+5+6+5+5+4) green, `cargo test` 132 green, `pnpm --filter web build` 12 routes green
-- `GET /health` 101st →429, `GET /search` 31st →429, `POST /refs` 21st →429, `GET /file` 61st →429, `POST /repos` 11th →429, all `Retry-After` present
-- `server/src/routes/s14-rate.test.ts` 4/4 green
-- No FS/CORS edits — S14 scope respected
+- `pnpm --filter server test` 132 passed across 19 test files (including 5 tests in `s14-rate.test.ts`), `cargo test` 137 passed.
+- Verified tiered endpoint rate limits across all vectors:
+  - Global IP limiter: 100 req/min
+  - Search limiter: 30 req/min (`server/src/routes/search.ts:16`)
+  - Repository creation limiter: 10 req/min (`server/src/routes/repos.ts:114`)
+  - Issue creation limiter: 20 req/min (`server/src/routes/issues.ts:81`)
+  - PR creation limiter: 20 req/min (`server/src/routes/pulls.ts:68`)
+  - File reading / VCS inspection limiter: 60 req/min (`server/src/routes/repos.ts:1003`)
+  - CI pipeline execution limiter: 5 req/min (`server/src/routes/ci.ts:333`)
+- Verified HTTP 429 response formatting with dynamic `Retry-After` header in `server/src/lib/rateLimit.ts:37`.
+- Added test coverage in `server/src/routes/s14-rate.test.ts` verifying `Retry-After` header presence on rate limit violation.
+- Cross-check verified: strictly confined to API rate limiting, resource quotas, and abuse defense; no concurrency race conditions or file locking primitives modified in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S15 — Concurrency / TOCTOU** — after S14 STOP. Do not touch `isAncestor` in S14 (S7).
-
-**STOP per §8 — S14 Complete. Awaiting S15 approval.**
+**S15 — Concurrency, Race Conditions & TOCTOU Defense** — after S14 STOP. Awaiting user approval.

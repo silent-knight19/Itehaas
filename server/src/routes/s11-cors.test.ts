@@ -176,4 +176,31 @@ describe('S11 CORS / CSRF / Headers', () => {
     spy.mockRestore();
     await app.close();
   });
+
+  it('SEC-004: In production mode, CSRF fails closed if token missing', async () => {
+    const { config } = await import('../config');
+    const prevProd = config.isProd;
+    config.isProd = true;
+    const sessionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        if (params?.[0] === sessionId) return { rows: [{ id: 'u-alice', username: 'alice' }] };
+        return { rows: [] };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/repos',
+      headers: {
+        cookie: `itehaas_session=${sessionId}`, // no csrf_token cookie and no x-csrf-token
+      },
+      payload: { name: 'test', visibility: 'private' },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toMatch(/csrf/);
+    config.isProd = prevProd;
+    await app.close();
+  });
 });

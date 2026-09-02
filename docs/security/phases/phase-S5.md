@@ -132,15 +132,17 @@ Full suite after S5: `pnpm --filter server test` + `cargo test` 124.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `pnpm --filter server test` 65/65 (32+7+10+10+6) green, `cargo test` 124 green, `pnpm build` ok
-- `getAllowedEnv()` no `DATABASE_URL`/`COOKIE_SECRET`, `execItehaas({cwd:'/etc'})` → `path traversal`, `checkout --evil` → `invalid arg flag`, semaphore 10 concurrent → max 3
-- `server/src/lib/vcs-s5.test.ts` 6 tests green
-- No FS/CORS edits — S5 scope respected
+- `pnpm --filter server test` 128 passed across 19 test files (including 7 tests in `vcs-s5.test.ts`), `cargo test` 136 passed.
+- `getAllowedEnv()` verified: child processes strictly receive `PATH, LANG, HOME, USER, TMPDIR, SHELL`. `DATABASE_URL` and `COOKIE_SECRET` are never inherited.
+- `getValidatedBin()` verified: rejects world-writable binaries, validates containment, and verifies file existence.
+- Argument safety verified: arguments with null bytes (`\0`), newlines (`\n`, `\r`), and disallowed CLI flags are rejected before spawn with proper semaphore release.
+- Subprocess concurrency verified: `vcsSemaphore` bounds active subprocess invocations to 3.
+- Stream bounds verified: 1 MiB cap enforced on stdout/stderr, with 30s SIGTERM/SIGKILL escalation timeout.
+- Added regression tests for argument sanitization (null bytes, newlines, flags) in `server/src/lib/vcs-s5.test.ts`.
+- Cross-check verified: strictly confined to process invocation and subprocess containment; no parser limits or network transports modified in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S6 — VCS Object / Parser Security** — after S5 STOP. Do not touch `object/store.rs` bomb in S5.
-
-**STOP per §8 — S5 Complete. Awaiting S6 approval.**
+**S6 — VCS Parser & Object Bomb Hardening** — after S5 STOP. Awaiting user approval.

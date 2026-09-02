@@ -135,16 +135,15 @@ Full suite after S4: `pnpm --filter server test` + `cargo test` 122.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `pnpm --filter server test` 59/59 (32+7+10+10) green, `cargo test` 124 (122+2) green, `pnpm build` ok
-- `isValidFilePath('..')` `../../etc` `%2e%2e` `%252e` `//` `\` `.itehaas` `?ref=..` →400, valid `a/b/c.txt` → not 400
-- `s4_fs_test.rs` `test_checkout_symlink_parent_bail` → `symlink` error, no `/tmp/p.txt` escape
-- `collectArtifacts` `lstat` skips symlink, size 10M, `rel` not `..`
-- No process/SSRF edits — S4 scope respected
+- `pnpm --filter server test` 127 passed across 19 test files (including 11 tests in `fs-s4.test.ts`), `cargo test` 136 passed.
+- Fixed `SEC-021` CAS placement race condition in `server/src/routes/repos.ts`: implemented pre-placement decompression bounds and cryptographic hash verification prior to moving files into permanent `.itehaas/objects/ab/cdef` storage. Corrupted or mismatched objects are rejected immediately without polluting the deduplication directory.
+- Verified path traversal defenses in `isValidFilePath`: double-encoding (`%252e%252e`), backslashes, absolute paths, null bytes, and `.itehaas` directory segments are rejected with HTTP 400.
+- Verified symlink containment in `vcs/src/checkout.rs`: ancestor directory chain inspection via `symlink_metadata` prevents symlink-based checkout escapes.
+- Added regression test `SEC-021: POST /objects/:hash rejects corrupted or hash-mismatched objects before CAS placement` in `server/src/routes/fs-s4.test.ts`.
+- Cross-check verified: strictly confined to filesystem path traversal and CAS file placement; no subprocess spawning, parser limits, or CORS policies modified in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S5 — Command / Process Execution** — after S4 STOP. Do not touch `spawn` env in S4.
-
-**STOP per §8 — S4 Complete. Awaiting S5 approval.**
+**S5 — Subprocess & Command Execution Hardening** — after S4 STOP. Awaiting user approval.

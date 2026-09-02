@@ -71,7 +71,6 @@ export async function pullRoutes(app: FastifyInstance) {
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid' });
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
-    if (!(await canWrite(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
     const schema = z.object({
       title: z.string().min(1).max(200),
       body: z.string().max(5000).optional().default(''),
@@ -85,7 +84,15 @@ export async function pullRoutes(app: FastifyInstance) {
     const { title, body, source_branch, target_branch, source_repo, draft } = parsed.data as any;
     const isCrossFork = !!source_repo;
     const isDraft = !!draft;
-    if (!isCrossFork && source_branch === target_branch) return reply.status(400).send({ error: 'source and target must differ' });
+
+    if (!(await canRead(meta.id, user.id, meta.visibility))) {
+      return reply.status(404).send({ error: 'not found' });
+    }
+
+    if (!isCrossFork) {
+      if (!(await canWrite(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
+      if (source_branch === target_branch) return reply.status(400).send({ error: 'source and target must differ' });
+    }
 
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
@@ -97,6 +104,7 @@ export async function pullRoutes(app: FastifyInstance) {
       const srcMeta = await getRepoMeta(srcOwner, srcRepo);
       if (!srcMeta) return reply.status(404).send({ error: 'source repo not found' });
       if (!(await canRead(srcMeta.id, user.id, srcMeta.visibility))) return reply.status(404).send({ error: 'source repo not found' });
+      if (!(await canWrite(srcMeta.id, user.id))) return reply.status(403).send({ error: 'forbidden: write required on source repo' });
       sourceRepoId = srcMeta.id;
       let srcPath: string;
       try { srcPath = repoPathFor(srcOwner, srcRepo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }

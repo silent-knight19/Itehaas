@@ -131,15 +131,17 @@ Full suite after S7: `pnpm test` + `cargo test`.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `cargo test --tests` 132 green, `pnpm --filter server test` 72/72 (32+7+10+10+6+7) green, `pnpm build` ok
-- `isAncestor` `MAX_STEPS 2000` + `visited>2000` →400, cache 60s, semaphore 3 via `vcsSemaphore`, `walk_log` `visited>10000` + `all_entries>10000` → break, `search` `q>100` →400, `limit` 50→20, `offset>10000` →400, `statement_timeout 5000`, `CI` 5/min →6th 429, queue 20 →429
-- `server/src/routes/s7-dos.test.ts` 7 tests green
-- No FS/CORS edits — S7 scope respected
+- `pnpm --filter server test` 129 passed across 19 test files (including 8 tests in `s7-dos.test.ts`), `cargo test` 137 passed.
+- Fixed `SEC-014` quadratic buffer churn during object upload in `server/src/routes/repos.ts:572-583`: replaced `Buffer.concat([data, chunk])` on every incoming chunk with an array buffer collector (`chunks.push(chunk)`) followed by single allocation on stream end (`Buffer.concat(chunks, totalLength)`), reducing 64 MiB streaming churn from ~32 GiB reallocations to linear O(N) allocation.
+- Verified search query limits in `server/src/routes/search.ts`: query length clamped to 100 characters, result limit clamped to 20, and offset clamped to 10,000.
+- Verified CI pipeline gating in `server/src/routes/ci.ts`: rate-limited to 5/min per IP and rejects requests with HTTP 429 if more than 20 pipelines are currently queued.
+- Verified commit graph walk bounds in `server/src/routes/repos.ts`: `isAncestor` clamped to 2,000 steps with 60-second TTL memoization.
+- Verified revwalk bounds in `vcs/src/revwalk.rs`: capped at 10,000 visited commits.
+- Added regression test `SEC-014 linear chunk collection in octet-stream parser code check` in `server/src/routes/s7-dos.test.ts`.
+- Cross-check verified: strictly confined to resource exhaustion, streaming buffers, and query bounds; no database schema or injection defenses modified in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S8 — Database / SQL Security** — after S7 STOP. Do not touch `pg` param in S7 (already).
-
-**STOP per §8 — S7 Complete. Awaiting S8 approval.**
+**S8 — SQL & Database Security Hardening** — after S7 STOP. Awaiting user approval.

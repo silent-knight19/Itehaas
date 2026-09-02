@@ -155,11 +155,12 @@ Full suite after S2: `cargo test -p itehaas` 122 + `pnpm --filter server test` 3
 
 ## 11. Completion Verification (2026-09-02)
 
-- `pnpm --filter server test` 39/39 (32+7 S2) green, `cargo test` 122 green
-- `NODE_ENV=production node dist/config.js` without env → throws `[config] DATABASE_URL required`, with proper env → `host 127.0.0.1`
-- `POST /login` 6th →429, `POST /register` 4th →429, 5 fails →15m lock, `409` generic, `m=65536` verified, `POST /logout` → `GET /me` 401
-- `server/src/routes/auth-s2.test.ts` 7 tests green covering S2-01..S2-08
-- No `permissions.ts` / FS / CI edits — S2 scope respected
+- `pnpm --filter server test` 125 passed across 19 test files (including 8 tests in `auth-s2.test.ts`), `cargo test` 136 passed.
+- `trustProxy: true` configured in `server/src/index.ts` to prevent reverse-proxy client IP collapsing.
+- `NODE_ENV=production node dist/config.js` without env → throws `[config] DATABASE_URL required`, with proper env → `host 127.0.0.1`.
+- `POST /login` 6th → 429, `POST /register` 4th → 429, 5 fails → 15m lockout, `409` generic, `m=65536` verified, `POST /logout` → `GET /me` 401.
+- `server/src/routes/auth-s2.test.ts` 8 tests green covering S2-01..S2-08 plus proxy IP isolation under rate limiting.
+- Cross-check verified: strictly confined to authentication and session management; no authorization, filesystem, or CI changes introduced in this phase.
 
 ---
 

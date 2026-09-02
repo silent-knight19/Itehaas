@@ -160,4 +160,34 @@ describe('S9 Secret Management', () => {
     const enc = encryptSecret('newsecret');
     expect(decryptSecretSafe(enc)).toBe('newsecret');
   });
+
+  it('S9: auth responses never expose password_hash', async () => {
+    mockQuery.mockImplementation(async (text: string) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return {
+          rows: [
+            {
+              id: 'u-alice',
+              username: 'alice',
+              email: 'alice@example.com',
+              created_at: new Date().toISOString(),
+              password_hash: '$argon2id$v=19$m=65536,t=3,p=4$dummyhash',
+            },
+          ],
+        };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/auth/me',
+      headers: { cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().user).toHaveProperty('username', 'alice');
+    expect(res.json().user).not.toHaveProperty('password_hash');
+    expect(JSON.stringify(res.json())).not.toContain('argon2id');
+    await app.close();
+  });
 });

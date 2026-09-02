@@ -1,6 +1,13 @@
+import * as crypto from 'crypto';
 import { sessionCookieName, csrfTokenForSession } from '../lib/auth';
+import { config } from '../config';
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+function safeCompare(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
 
 /**
  * CSRF double-submit: for state-changing requests with cookie auth, require x-csrf-token header
@@ -16,12 +23,15 @@ export async function csrfCheck(req: any, reply: any): Promise<void> {
   if (url.startsWith('/api/auth/login') || url.startsWith('/api/auth/register') || url.startsWith('/api/auth/logout')) return;
   const headerToken = (req.headers['x-csrf-token'] as string | undefined) || (req.headers['x-xsrf-token'] as string | undefined);
   const cookieToken = (req.cookies as any)?.['csrf_token'] as string | undefined;
-  // S11: allow missing csrf_token cookie for backwards compat (old tests/clients), but if cookie present, require header
-  if (!cookieToken) return; // no csrf cookie yet (old client), skip
+
+  // SEC-004: In production, fail-closed unconditionally.
+  // In development/test, allow missing csrf_token cookie for backward-compatible test injection.
+  if (!config.isProd && !cookieToken) return;
+
   const expected = csrfTokenForSession(sessionId);
   let ok = false;
-  if (headerToken && headerToken === expected) ok = true;
-  else if (headerToken && cookieToken && headerToken === cookieToken) ok = true;
+  if (headerToken && safeCompare(headerToken, expected)) ok = true;
+  else if (headerToken && cookieToken && safeCompare(headerToken, cookieToken)) ok = true;
   if (!ok) {
     reply.status(403).send({ error: 'csrf validation failed' });
     throw new Error('csrf validation failed');

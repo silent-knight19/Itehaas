@@ -88,4 +88,23 @@ describe('S5 Process Execution Security', () => {
     expect(isAllowedFlag('--prune')).toBe(true);
     expect(isAllowedFlag('--evil-flag')).toBe(false);
   });
+
+  it('S5-04 arg sanitization rejects null bytes and newlines', async () => {
+    const { execItehaas } = await import('./vcs');
+    const { config } = await import('../config');
+    const { vcsSemaphore } = await import('./semaphore');
+    const validCwd = path.join(path.resolve(config.reposRoot), 'testuser', 'testrepo_san');
+    fs.mkdirSync(validCwd, { recursive: true });
+
+    await expect(execItehaas(['checkout', 'branch\0evil'], { cwd: validCwd })).rejects.toThrow(/null byte/);
+    expect(vcsSemaphore.getCount()).toBe(0);
+
+    await expect(execItehaas(['checkout', 'branch\nnewline'], { cwd: validCwd })).rejects.toThrow(/newline/);
+    expect(vcsSemaphore.getCount()).toBe(0);
+
+    await expect(execItehaas(['checkout', 'branch\rcarriage'], { cwd: validCwd })).rejects.toThrow(/newline/);
+    expect(vcsSemaphore.getCount()).toBe(0);
+
+    try { fs.rmSync(validCwd, { recursive: true, force: true }); } catch {}
+  });
 });

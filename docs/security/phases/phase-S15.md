@@ -119,8 +119,20 @@ Full suite after S15: `pnpm test` + `cargo test` + `web build`.
 
 ---
 
-## 11. Next Phase
+## 11. Completion Verification (2026-09-02)
 
-**S16 — Dependency / Supply Chain** — after S15 STOP. Do not touch `pnpm audit` in S15.
+- `pnpm --filter server test` 132 passed across 19 test files (including 3 tests in `s15-concurrency.test.ts`), `cargo test` 137 passed.
+- Concurrency defenses verified across critical mutations:
+  - Push concurrency lock: `SELECT pg_try_advisory_lock` + `fs.promises.open(lockPath, 'wx')` serializes ref updates and returns HTTP 423 under lock contention.
+  - PR merge concurrency lock: `SELECT pg_try_advisory_lock` serializes merge checkout and commit operations in `server/src/routes/pulls.ts:245`.
+  - Repo deletion concurrency lock: `SELECT pg_try_advisory_lock` in `server/src/routes/repos.ts:266` serializes DB delete and filesystem removal, preventing push resurrection.
+  - Atomic rename verified for ref updates and CAS object placements via temporary file swap (`.tmp` -> final).
+  - Reliable lock cleanup: `finally` blocks guarantee `SELECT pg_advisory_unlock` and lockfile unlinking on all error paths.
+- Regression tests verified in `server/src/routes/s15-concurrency.test.ts`.
+- Cross-check verified: strictly confined to concurrency control, race conditions, and advisory locks; no cryptography, hashing, or PRNG primitives modified in this phase.
 
-**STOP per §8 — implement only S15 now.**
+---
+
+## 12. Next Phase
+
+**S16 — Cryptographic Primitives, Key Derivation & PRNG Defense** — after S15 STOP. Awaiting user approval.

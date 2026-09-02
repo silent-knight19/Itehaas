@@ -134,15 +134,16 @@ Full suite after S8: `pnpm test` + `cargo test`.
 
 ## 11. Completion Verification (2026-09-02)
 
-- `pnpm --filter server test` 77/77 (32+7+10+10+6+7+5) green, `cargo test` 132 green, `pnpm build` ok
-- `GET /api/repos?limit=1; DROP` → limit 1, param, not injection, `GET /api/users/alice/repos?sort=DROP` →400, `statement_timeout` set via `pool.on('connect')` + `options`, `POST /repos` `BEGIN/COMMIT` + `DELETE` on fail verified
-- `server/src/routes/s8-db.test.ts` 5 tests green
-- No FS/CORS edits — S8 scope respected
+- `pnpm --filter server test` 129 passed across 19 test files (including 5 tests in `s8-db.test.ts`), `cargo test` 137 passed.
+- Parameterization verified: all SQL queries use parameterized positional arguments `$1, $2, ...`.
+- LIMIT & OFFSET parameterization verified in `server/src/routes/repos.ts:161-168`: `LIMIT $${limitIdx} OFFSET $${offsetIdx}` with bounds clamping.
+- ORDER BY injection defense verified in `server/src/routes/users.ts`: sort parameter validated against strict allowlist, rejecting invalid sort fields with HTTP 400.
+- Database connection pool hardened in `server/src/db/index.ts`: bounded to `max: 10`, `connectionTimeoutMillis: 5000`, `idleTimeoutMillis: 30000`, and `statement_timeout = 5000` set on connect.
+- Transaction atomicity verified: `BEGIN/COMMIT/ROLLBACK` blocks ensure no orphaned records, and `client.release()` guaranteed via `try/finally`.
+- Cross-check verified: strictly confined to database queries, parameterization, and connection pooling; no secrets encryption or SSRF network guards modified in this phase.
 
 ---
 
-## 11. Next Phase
+## 12. Next Phase
 
-**S9 — Secret Management** — after S8 STOP. Do not touch `ci_secrets` encryption in S8.
-
-**STOP per §8 — S8 Complete. Awaiting S9 approval.**
+**S9 — Secrets & Credential Security Hardening** — after S8 STOP. Awaiting user approval.
