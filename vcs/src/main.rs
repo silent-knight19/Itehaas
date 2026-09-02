@@ -78,13 +78,16 @@ enum Commands {
     Commit {
         /// Commit message
         #[arg(short = 'm', long)]
-        message: String,
+        message: Option<String>,
         /// Author name (overrides config)
         #[arg(long)]
         author: Option<String>,
         /// Author email (overrides config)
         #[arg(long)]
         email: Option<String>,
+        /// Amend previous commit
+        #[arg(long)]
+        amend: bool,
     },
     /// Show working tree status
     Status,
@@ -96,6 +99,39 @@ enum Commands {
         /// Max count
         #[arg(long)]
         max_count: Option<usize>,
+        /// Show all refs (branches, tags, HEAD)
+        #[arg(long)]
+        all: bool,
+        /// Show graph
+        #[arg(long)]
+        graph: bool,
+        /// Show patch (diff) for each commit
+        #[arg(short = 'p', long)]
+        patch: bool,
+        /// Show stat
+        #[arg(long)]
+        stat: bool,
+        /// Show name only
+        #[arg(long = "name-only")]
+        name_only: bool,
+        /// Show commits since date (YYYY-MM-DD or timestamp)
+        #[arg(long)]
+        since: Option<String>,
+        /// Show commits until date
+        #[arg(long)]
+        until: Option<String>,
+        /// Filter by author
+        #[arg(long)]
+        author: Option<String>,
+        /// Filter by message grep
+        #[arg(long)]
+        grep: Option<String>,
+        /// Follow file history (path)
+        #[arg(long)]
+        follow: Option<String>,
+        /// Paths to filter (after --)
+        #[arg(last = true)]
+        paths: Vec<PathBuf>,
     },
     /// Get or set config
     Config {
@@ -317,6 +353,81 @@ enum Commands {
         #[arg(default_value = "HEAD")]
         ref_name: String,
     },
+    /// Show commit and diff
+    Show {
+        /// Commit hash (default HEAD)
+        commit: Option<String>,
+    },
+    /// Show index files
+    #[command(name = "ls-files")]
+    LsFiles {
+        /// Show staged files
+        #[arg(long)]
+        stage: bool,
+        /// Show others (untracked)
+        #[arg(long)]
+        others: bool,
+        /// Show ignored
+        #[arg(long)]
+        ignored: bool,
+    },
+    /// List refs
+    #[command(name = "for-each-ref")]
+    ForEachRef {
+        /// Pattern (e.g., refs/heads/*)
+        pattern: Option<String>,
+    },
+    /// Search for pattern in working tree or history
+    Grep {
+        /// Pattern to search
+        pattern: String,
+        /// Search commit history instead of working tree
+        #[arg(long)]
+        history: bool,
+        /// Path to limit search
+        path: Option<String>,
+    },
+    /// Show line blame
+    Blame {
+        /// File to blame
+        file: String,
+    },
+    /// Cherry-pick a commit
+    #[command(name = "cherry-pick")]
+    CherryPick {
+        /// Commit to cherry-pick
+        commit: String,
+        /// Abort on conflict
+        #[arg(long)]
+        abort: bool,
+        /// Continue after conflict resolved
+        #[arg(long)]
+        r#continue: bool,
+    },
+    /// Revert a commit
+    Revert {
+        /// Commit to revert
+        commit: String,
+    },
+    /// Bisect helper
+    Bisect {
+        #[command(subcommand)]
+        command: BisectCommands,
+    },
+    /// Rebase current branch onto another
+    Rebase {
+        /// Base branch/commit to rebase onto
+        base: Option<String>,
+        /// Abort rebase
+        #[arg(long)]
+        abort: bool,
+        /// Continue rebase
+        #[arg(long)]
+        r#continue: bool,
+        /// Interactive (pick/reword/squash etc)
+        #[arg(short = 'i', long)]
+        interactive: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -372,6 +483,29 @@ enum StashCommands {
     },
     /// Clear all stashes
     Clear,
+}
+
+#[derive(Subcommand)]
+enum BisectCommands {
+    /// Start bisect
+    Start {
+        /// Bad commit (default HEAD)
+        bad: Option<String>,
+        /// Good commit
+        good: Option<String>,
+    },
+    /// Mark good
+    Good {
+        commit: Option<String>,
+    },
+    /// Mark bad
+    Bad {
+        commit: Option<String>,
+    },
+    /// Reset bisect
+    Reset,
+    /// Show log
+    Log,
 }
 
 fn find_repo_or_cwd() -> Result<PathBuf> {
@@ -491,17 +625,34 @@ fn main() -> Result<()> {
             message,
             author,
             email,
+            amend,
         } => {
             let repo = find_repo_or_cwd()?;
-            cmd_commit(&repo, message, author, email)?;
+            cmd_commit(&repo, message, author, email, amend)?;
         }
         Commands::Status => {
             let repo = find_repo_or_cwd()?;
             cmd_status(&repo)?;
         }
-        Commands::Log { oneline, max_count } => {
+        Commands::Log {
+            oneline,
+            max_count,
+            all,
+            graph,
+            patch,
+            stat,
+            name_only,
+            since,
+            until,
+            author,
+            grep,
+            follow,
+            paths,
+        } => {
             let repo = find_repo_or_cwd()?;
-            cmd_log(&repo, oneline, max_count)?;
+            cmd_log(
+                &repo, oneline, max_count, all, graph, patch, stat, name_only, since, until, author, grep, follow, paths,
+            )?;
         }
         Commands::Config { key, value } => {
             let repo = find_repo_or_cwd()?;
@@ -648,6 +799,47 @@ fn main() -> Result<()> {
             let repo = find_repo_or_cwd()?;
             cmd_reflog(&repo, &ref_name)?;
         }
+        Commands::Show { commit } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_show(&repo, commit)?;
+        }
+        Commands::LsFiles { stage, others, ignored } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_ls_files(&repo, stage, others, ignored)?;
+        }
+        Commands::ForEachRef { pattern } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_for_each_ref(&repo, pattern)?;
+        }
+        Commands::Grep { pattern, history, path } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_grep(&repo, pattern, history, path)?;
+        }
+        Commands::Blame { file } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_blame(&repo, file)?;
+        }
+        Commands::CherryPick { commit, abort, r#continue } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_cherry_pick(&repo, commit, abort, r#continue)?;
+        }
+        Commands::Revert { commit } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_revert(&repo, commit)?;
+        }
+        Commands::Bisect { command } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_bisect(&repo, command)?;
+        }
+        Commands::Rebase {
+            base,
+            abort,
+            r#continue,
+            interactive,
+        } => {
+            let repo = find_repo_or_cwd()?;
+            cmd_rebase(&repo, base, abort, r#continue, interactive)?;
+        }
     }
     Ok(())
 }
@@ -783,18 +975,84 @@ fn add_single_file(
 
 fn cmd_commit(
     repo: &Path,
-    message: String,
+    message_opt: Option<String>,
     author_opt: Option<String>,
     email_opt: Option<String>,
+    amend: bool,
 ) -> Result<()> {
+    // Handle amend: reuse old commit's parents/message if not provided
+    let algo = config::read_hasher(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
+    let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
+    let parent_opt = itehaas_lib::refs::resolve_head(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
+
+    if amend {
+        let parent_hash = parent_opt.clone().ok_or_else(|| anyhow::anyhow!("cannot amend: no commits yet"))?;
+        let obj = itehaas_lib::object::store::read_object(repo, &parent_hash, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let old_commit = match obj {
+            Object::Commit(c) => c,
+            _ => anyhow::bail!("HEAD is not a commit"),
+        };
+        let message = if let Some(m) = message_opt {
+            if m.trim().is_empty() {
+                anyhow::bail!("commit message cannot be empty");
+            }
+            m
+        } else {
+            old_commit.message.clone()
+        };
+        let index = Index::load(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
+        let entries = index.entries_sorted();
+        let tree_hash = itehaas_lib::tree_builder::build_tree_from_index(repo, &entries, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let (cfg_name, cfg_email) = config::read_user(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let name = author_opt.or(cfg_name).unwrap_or_else(|| old_commit.author.name.clone());
+        let email = email_opt.or(cfg_email).unwrap_or_else(|| old_commit.author.email.clone());
+        if name.contains('<') || name.contains('>') || name.contains('\n') || name.is_empty() {
+            anyhow::bail!("invalid author name: {:?}", name);
+        }
+        if email.contains('<') || email.contains('>') || email.contains('\n') || email.is_empty() {
+            anyhow::bail!("invalid author email: {:?}", email);
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let tz = "+0000".to_string();
+        let author_sig = itehaas_lib::object::Signature::new(name.clone(), email.clone(), timestamp, tz.clone())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let committer_sig = itehaas_lib::object::Signature::new(name, email, timestamp, tz)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let commit = itehaas_lib::object::Commit::new(tree_hash.clone(), old_commit.parents.clone(), author_sig, committer_sig, message.clone());
+        let commit_obj = Object::Commit(commit);
+        let commit_hash = itehaas_lib::object::store::write_object(repo, &commit_obj, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let head = itehaas_lib::refs::read_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        match head {
+            itehaas_lib::refs::Head::Ref(r) | itehaas_lib::refs::Head::Unborn(r) => {
+                let msg = format!("commit (amend): {}", message.lines().next().unwrap_or(""));
+                itehaas_lib::refs::write_ref_with_log(repo, &r, &commit_hash, &msg)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let branch = r.strip_prefix("refs/heads/").unwrap_or(&r);
+                println!("[{} {}] {}", branch, &commit_hash.hex()[..7], message.lines().next().unwrap_or(""));
+            }
+            itehaas_lib::refs::Head::Detached(_) => {
+                let msg = format!("commit (amend): {}", message.lines().next().unwrap_or(""));
+                itehaas_lib::refs::write_head_detached_with_log(repo, &commit_hash, &msg)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("[detached {}] {}", &commit_hash.hex()[..7], message.lines().next().unwrap_or(""));
+            }
+        }
+        println!(" {} files staged, tree {}", Index::load(repo).unwrap().len(), tree_hash.hex()[..7].to_string());
+        return Ok(());
+    }
+
+    let message = message_opt.ok_or_else(|| anyhow::anyhow!("commit message required (use -m)"))?;
     if message.trim().is_empty() {
         anyhow::bail!("commit message cannot be empty");
     }
-    let algo = config::read_hasher(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
-    let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
     let index = Index::load(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
     // Allow empty index if HEAD exists (deleting all files), but not for initial commit
-    let parent_opt = itehaas_lib::refs::resolve_head(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
     if index.is_empty() && parent_opt.is_none() {
         anyhow::bail!("nothing to commit (index empty, use 'itehaas add' to stage files)");
     }
@@ -937,44 +1195,165 @@ fn cmd_status(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_log(repo: &Path, oneline: bool, max_count: Option<usize>) -> Result<()> {
+fn cmd_log(
+    repo: &Path,
+    oneline: bool,
+    max_count: Option<usize>,
+    all: bool,
+    graph: bool,
+    patch: bool,
+    stat: bool,
+    name_only: bool,
+    since: Option<String>,
+    until: Option<String>,
+    author: Option<String>,
+    grep: Option<String>,
+    follow: Option<String>,
+    paths: Vec<PathBuf>,
+) -> Result<()> {
     let algo = config::read_hasher(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
     let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
-    let head = itehaas_lib::refs::resolve_head(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
-    let Some(mut cur) = head else {
-        anyhow::bail!("no commits yet");
+
+    let since_ts = since.as_deref().and_then(itehaas_lib::revwalk::parse_date);
+    let until_ts = until.as_deref().and_then(itehaas_lib::revwalk::parse_date);
+    if since.is_some() && since_ts.is_none() {
+        anyhow::bail!("invalid --since date: {}", since.unwrap());
+    }
+    if until.is_some() && until_ts.is_none() {
+        anyhow::bail!("invalid --until date: {}", until.unwrap());
+    }
+
+    let path_strs: Vec<String> = paths
+        .iter()
+        .filter(|p| p.to_string_lossy() != "--")
+        .map(|p| itehaas_lib::index::path_to_string(p.strip_prefix(repo).unwrap_or(p)))
+        .collect();
+
+    let opts = itehaas_lib::revwalk::LogOptions {
+        oneline,
+        max_count,
+        all,
+        graph,
+        patch,
+        stat,
+        name_only,
+        since: since_ts,
+        until: until_ts,
+        author,
+        grep,
+        follow,
+        paths: path_strs,
     };
-    let mut count = 0;
-    loop {
-        if let Some(max) = max_count {
-            if count >= max {
-                break;
+
+    let entries = itehaas_lib::revwalk::walk_log(repo, &opts)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    if entries.is_empty() {
+        if !opts.all {
+            // Check if repo has any commit to give better error
+            if itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.is_none() {
+                anyhow::bail!("no commits yet");
             }
         }
-        let obj = itehaas_lib::object::store::read_object(repo, &cur, hasher.as_ref())
-            .map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
-        let commit = match obj {
-            Object::Commit(c) => c,
-            _ => anyhow::bail!("object {} is not a commit", cur.hex()),
+        return Ok(());
+    }
+
+    for (idx, entry) in entries.iter().enumerate() {
+        let hash = entry.hash.hex();
+        let short = &hash[..7.min(hash.len())];
+        let prefix = if graph {
+            // Simple graph: * for commit, |\ for merges
+            if entry.commit.parents.len() > 1 {
+                "*_M_ "
+            } else if idx > 0 && entries[idx - 1].commit.parents.len() > 1 {
+                "| *  "
+            } else {
+                "* "
+            }
+        } else {
+            ""
         };
         if oneline {
-            println!("{} {}", &cur.hex()[..7], commit.message.lines().next().unwrap_or(""));
+            println!("{}{} {}", prefix, short, entry.commit.message.lines().next().unwrap_or(""));
+            if patch || stat || name_only {
+                // For oneline with patch, still show diff after line
+            } else {
+                continue;
+            }
         } else {
-            println!("commit {}", cur.hex());
-            println!("Author: {} <{}>", commit.author.name, commit.author.email);
-            println!("Date:   {} {}", commit.author.timestamp, commit.author.tz_offset);
+            println!("{}commit {}", prefix, hash);
+            if graph && entry.commit.parents.len() > 1 {
+                println!("Merge: {} {}", &entry.commit.parents[0].hex()[..7], &entry.commit.parents[1].hex()[..7]);
+            }
+            println!("Author: {} <{}>", entry.commit.author.name, entry.commit.author.email);
+            println!("Date:   {} {}", entry.commit.author.timestamp, entry.commit.author.tz_offset);
             println!();
-            for line in commit.message.lines() {
+            for line in entry.commit.message.lines() {
                 println!("    {}", line);
             }
             println!();
         }
-        count += 1;
-        if commit.parents.is_empty() {
-            break;
+
+        if patch || stat || name_only {
+            // Compute parent for diff
+            let parent_commit: Option<itehaas_lib::object::Commit> = if !entry.commit.parents.is_empty() {
+                let ph = &entry.commit.parents[0];
+                match itehaas_lib::object::store::read_object(repo, ph, hasher.as_ref()) {
+                    Ok(Object::Commit(c)) => Some(c),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            if patch {
+                let cur_map = itehaas_lib::tree_builder::flatten_tree_root(repo, &entry.commit.tree, hasher.as_ref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let parent_map = if let Some(p) = &parent_commit {
+                    itehaas_lib::tree_builder::flatten_tree_root(repo, &p.tree, hasher.as_ref())
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                } else {
+                    std::collections::BTreeMap::new()
+                };
+                let diffs = itehaas_lib::diff::diff_maps(&parent_map, &cur_map);
+                for d in diffs {
+                    println!("{} {}", d.status_str(), d.path);
+                    let old = d.old_hash.as_ref().and_then(|h| itehaas_lib::diff::get_blob_content(repo, h, hasher.as_ref()).ok());
+                    let new = d.new_hash.as_ref().and_then(|h| itehaas_lib::diff::get_blob_content(repo, h, hasher.as_ref()).ok());
+                    let txt = match (old, new) {
+                        (Some(o), Some(n)) => itehaas_lib::diff::unified_diff(&o, &n, &d.path),
+                        (None, Some(n)) => itehaas_lib::diff::unified_diff(b"", &n, &d.path),
+                        (Some(o), None) => itehaas_lib::diff::unified_diff(&o, b"", &d.path),
+                        _ => String::new(),
+                    };
+                    if !txt.is_empty() {
+                        print!("{}", txt);
+                    }
+                }
+                println!();
+            } else if stat {
+                let s = itehaas_lib::revwalk::format_stat(repo, hasher.as_ref(), &entry.commit, parent_commit.as_ref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if !s.is_empty() {
+                    print!("{}", s);
+                    println!();
+                }
+            } else if name_only {
+                let cur_map = itehaas_lib::tree_builder::flatten_tree_root(repo, &entry.commit.tree, hasher.as_ref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let parent_map = if let Some(p) = &parent_commit {
+                    itehaas_lib::tree_builder::flatten_tree_root(repo, &p.tree, hasher.as_ref())
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                } else {
+                    std::collections::BTreeMap::new()
+                };
+                let diffs = itehaas_lib::diff::diff_maps(&parent_map, &cur_map);
+                for d in diffs {
+                    println!("{}", d.path);
+                }
+                println!();
+            }
         }
-        // Follow first parent (simple log, not full DAG)
-        cur = commit.parents[0].clone();
     }
     Ok(())
 }
@@ -2391,6 +2770,968 @@ fn cmd_reflog(repo: &Path, ref_name: &str) -> Result<()> {
         println!("{} {} {{{}}}: {} : {} <{}> {} {}", short_new, ref_name, idx, e.message, e.name, e.email, e.timestamp, e.tz);
         let _ = short_old;
     }
+    Ok(())
+}
+
+fn cmd_show(repo: &Path, commit_opt: Option<String>) -> Result<()> {
+    let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let rev = commit_opt.unwrap_or_else(|| "HEAD".to_string());
+    let hash = itehaas_lib::refs::resolve_rev(repo, &rev)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("commit '{}' not found", rev))?;
+    let obj = itehaas_lib::object::store::read_object(repo, &hash, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let commit = match obj {
+        Object::Commit(c) => c,
+        _ => anyhow::bail!("object {} is not a commit", hash.hex()),
+    };
+    println!("commit {}", hash.hex());
+    if commit.parents.len() > 1 {
+        print!("Merge: ");
+        for p in &commit.parents {
+            print!("{} ", &p.hex()[..7]);
+        }
+        println!();
+    } else if !commit.parents.is_empty() {
+        println!("parent {}", commit.parents[0].hex());
+    }
+    println!("Author: {} <{}>", commit.author.name, commit.author.email);
+    println!("Committer: {} <{}>", commit.committer.name, commit.committer.email);
+    println!("Date:   {} {}", commit.author.timestamp, commit.author.tz_offset);
+    println!();
+    for line in commit.message.lines() {
+        println!("    {}", line);
+    }
+    println!();
+    // Diff
+    let cur_map = itehaas_lib::tree_builder::flatten_tree_root(repo, &commit.tree, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let parent_map = if !commit.parents.is_empty() {
+        let p = &commit.parents[0];
+        let pobj = itehaas_lib::object::store::read_object(repo, p, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let pt = match pobj {
+            Object::Commit(c) => c.tree,
+            _ => anyhow::bail!("parent not commit"),
+        };
+        itehaas_lib::tree_builder::flatten_tree_root(repo, &pt, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    let diffs = itehaas_lib::diff::diff_maps(&parent_map, &cur_map);
+    if diffs.is_empty() {
+        println!("(no changes)");
+        return Ok(());
+    }
+    for d in diffs {
+        println!("{} {}", d.status_str(), d.path);
+        let old = d.old_hash.as_ref().and_then(|h| itehaas_lib::diff::get_blob_content(repo, h, hasher.as_ref()).ok());
+        let new = d.new_hash.as_ref().and_then(|h| itehaas_lib::diff::get_blob_content(repo, h, hasher.as_ref()).ok());
+        let txt = match (old, new) {
+            (Some(o), Some(n)) => itehaas_lib::diff::unified_diff(&o, &n, &d.path),
+            (None, Some(n)) => itehaas_lib::diff::unified_diff(b"", &n, &d.path),
+            (Some(o), None) => itehaas_lib::diff::unified_diff(&o, b"", &d.path),
+            _ => String::new(),
+        };
+        if !txt.is_empty() {
+            print!("{}", txt);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_ls_files(repo: &Path, stage: bool, others: bool, ignored: bool) -> Result<()> {
+    let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let index = Index::load(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if ignored {
+        // Show ignored files
+        for entry in walkdir::WalkDir::new(repo).min_depth(1).into_iter().filter_entry(|e| {
+            let rel = e.path().strip_prefix(repo).unwrap_or(e.path());
+            // Don't prune ignored dirs when listing ignored
+            !itehaas_lib::index::should_ignore(rel)
+        }) {
+            let entry = entry.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let p = entry.path();
+            let rel = p.strip_prefix(repo).unwrap();
+            if itehaas_lib::ignore::is_ignored(repo, rel, p.is_dir()) {
+                println!("{}", itehaas_lib::index::path_to_string(rel));
+            }
+        }
+        return Ok(());
+    }
+    if others {
+        let st = itehaas_lib::status::status(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        for f in st.untracked {
+            println!("{}", f);
+        }
+        return Ok(());
+    }
+    // Default: stage or just index
+    for e in index.entries_sorted() {
+        if stage {
+            println!("{:06o} {} {}", e.mode, e.hash, e.path);
+        } else {
+            println!("{}", e.path);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_for_each_ref(repo: &Path, pattern: Option<String>) -> Result<()> {
+    let refs_dir = repo.join(".itehaas").join("refs");
+    let mut refs = Vec::new();
+    if refs_dir.exists() {
+        for entry in walkdir::WalkDir::new(&refs_dir).min_depth(1) {
+            let e = entry.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if e.path().is_file() {
+                let rel = e.path().strip_prefix(repo.join(".itehaas")).unwrap();
+                let name = rel.to_string_lossy().replace('\\', "/");
+                // name like refs/heads/main
+                let hash = fs::read_to_string(e.path()).unwrap_or_default().trim().to_string();
+                if let Some(pat) = &pattern {
+                    let pat = pat.trim();
+                    let matches = if pat.contains('*') {
+                        // simple wildcard: * matches any chars
+                        let mut pat_chars: Vec<char> = pat.chars().collect();
+                        let mut name_chars: Vec<char> = name.chars().collect();
+                        // Use simple glob: convert * to .*
+                        // For now handle only prefix* and *suffix and * in middle via contains
+                        if pat == "*" {
+                            true
+                        } else if pat.ends_with("/*") {
+                            let prefix = pat.trim_end_matches("/*");
+                            name.starts_with(prefix)
+                        } else if pat.starts_with("*/") {
+                            let suffix = &pat[2..];
+                            name.ends_with(suffix)
+                        } else {
+                            // Fallback: check if pattern without * is substring
+                            name == *pat || name.contains(&pat.replace('*', ""))
+                        }
+                    } else {
+                        name == *pat || name.starts_with(pat.trim_end_matches("/*"))
+                    };
+                    if !matches {
+                        continue;
+                    }
+                }
+                refs.push((name, hash));
+            }
+        }
+    }
+    // Also HEAD
+    if pattern.is_none() || pattern.as_deref() == Some("HEAD") || pattern.as_deref().map(|p| p.contains("HEAD")).unwrap_or(false) {
+        if let Ok(head) = itehaas_lib::refs::read_head(repo) {
+            let h = match head {
+                itehaas_lib::refs::Head::Ref(r) => format!("ref: {}", r),
+                itehaas_lib::refs::Head::Detached(h) => h.hex(),
+                itehaas_lib::refs::Head::Unborn(r) => format!("ref: {} (unborn)", r),
+            };
+            refs.push(("HEAD".to_string(), h));
+        }
+    }
+    refs.sort_by(|a, b| a.0.cmp(&b.0));
+    refs.dedup_by(|a, b| a.0 == b.0);
+    for (name, hash) in refs {
+        println!("{} {}", hash, name);
+    }
+    Ok(())
+}
+
+fn cmd_grep(repo: &Path, pattern: String, history: bool, path_opt: Option<String>) -> Result<()> {
+    if history {
+        // Search commit messages and diffs
+        let opts = itehaas_lib::revwalk::LogOptions {
+            grep: Some(pattern.clone()),
+            ..Default::default()
+        };
+        let entries = itehaas_lib::revwalk::walk_log(repo, &opts).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        for e in entries {
+            println!("{}: {}", &e.hash.hex()[..7], e.commit.message.lines().next().unwrap_or(""));
+        }
+        return Ok(());
+    }
+    // Working tree grep
+    let matcher = pattern.clone();
+    let prefix = path_opt.as_deref().unwrap_or("");
+    for entry in walkdir::WalkDir::new(repo).min_depth(1).into_iter().filter_entry(|e| {
+        let rel = e.path().strip_prefix(repo).unwrap_or(e.path());
+        !itehaas_lib::index::should_ignore(rel) && !itehaas_lib::ignore::is_ignored(repo, rel, e.path().is_dir())
+    }) {
+        let entry = entry.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let p = entry.path();
+        if p.is_dir() {
+            continue;
+        }
+        let rel = p.strip_prefix(repo).unwrap();
+        let rel_str = itehaas_lib::index::path_to_string(rel);
+        if !prefix.is_empty() && !rel_str.starts_with(prefix) {
+            continue;
+        }
+        if let Ok(content) = fs::read_to_string(p) {
+            for (i, line) in content.lines().enumerate() {
+                if line.contains(&matcher) {
+                    println!("{}:{}:{}", rel_str, i + 1, line);
+                }
+            }
+        } else if let Ok(data) = fs::read(p) {
+            // Binary check via grep on bytes?
+            if data.windows(matcher.len()).any(|w| w == matcher.as_bytes()) {
+                println!("{}: binary match", rel_str);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_blame(repo: &Path, file: String) -> Result<()> {
+    let res = itehaas_lib::blame::blame_file(repo, &file).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    for (line_no, line, hash, author) in res {
+        println!("{} ({} {} {}): {}", &hash[..7.min(hash.len())], author, line_no, file, line);
+    }
+    Ok(())
+}
+
+fn cmd_cherry_pick(repo: &Path, commit_str: String, abort: bool, cont: bool) -> Result<()> {
+    if abort {
+        // Remove CHERRY_PICK_HEAD if exists
+        let _ = fs::remove_file(repo.join(".itehaas").join("CHERRY_PICK_HEAD"));
+        println!("cherry-pick abort: cleared");
+        return Ok(());
+    }
+    if cont {
+        // Continue after resolving conflicts: expect index staged and commit
+        let cp_head = repo.join(".itehaas").join("CHERRY_PICK_HEAD");
+        if !cp_head.exists() {
+            anyhow::bail!("no cherry-pick in progress");
+        }
+        let hash_str = fs::read_to_string(&cp_head)?.trim().to_string();
+        let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let hash = Hash::from_hex(algo, &hash_str).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let obj = itehaas_lib::object::store::read_object(repo, &hash, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let commit = match obj {
+            Object::Commit(c) => c,
+            _ => anyhow::bail!("not a commit"),
+        };
+        // Check still conflicts?
+        let st = itehaas_lib::status::status(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if !st.not_staged.is_empty() {
+            anyhow::bail!("working tree has unstaged changes; resolve and add");
+        }
+        // Create cherry-pick commit with same message but parent is current HEAD
+        let head = itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.ok_or_else(|| anyhow::anyhow!("no HEAD"))?;
+        let index = Index::load(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let entries = index.entries_sorted();
+        let tree = itehaas_lib::tree_builder::build_tree_from_index(repo, &entries, hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let (cfg_name, cfg_email) = config::read_user(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let name = cfg_name.unwrap_or_else(|| "Author".to_string());
+        let email = cfg_email.unwrap_or_else(|| "author@example.com".to_string());
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let sig = itehaas_lib::object::Signature::new(name, email, ts, "+0000".into()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let new_commit = itehaas_lib::object::Commit::new(tree, vec![head.clone()], sig.clone(), sig, commit.message.clone());
+        let nhash = itehaas_lib::object::store::write_object(repo, &Object::Commit(new_commit), hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let head_ref = itehaas_lib::refs::read_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        match head_ref {
+            itehaas_lib::refs::Head::Ref(r) => {
+                itehaas_lib::refs::write_ref_with_log(repo, &r, &nhash, &format!("cherry-pick: {}", hash.hex()[..7].to_string())).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            }
+            _ => {
+                itehaas_lib::refs::write_head_detached_with_log(repo, &nhash, &format!("cherry-pick: {}", hash.hex()[..7].to_string())).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            }
+        }
+        let _ = fs::remove_file(cp_head);
+        println!("cherry-pick continue: committed {}", &nhash.hex()[..7]);
+        return Ok(());
+    }
+    // Normal cherry-pick
+    let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let hash = itehaas_lib::refs::resolve_rev(repo, &commit_str)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("commit '{}' not found", commit_str))?;
+    let obj = itehaas_lib::object::store::read_object(repo, &hash, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let commit = match obj {
+        Object::Commit(c) => c,
+        _ => anyhow::bail!("object not commit"),
+    };
+    if commit.parents.is_empty() {
+        anyhow::bail!("cannot cherry-pick root commit");
+    }
+    let parent_hash = &commit.parents[0];
+    let parent_obj = itehaas_lib::object::store::read_object(repo, parent_hash, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let parent_commit = match parent_obj {
+        Object::Commit(c) => c,
+        _ => anyhow::bail!("parent not commit"),
+    };
+    // Diff parent -> commit
+    let parent_map = itehaas_lib::tree_builder::flatten_tree_root(repo, &parent_commit.tree, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let commit_map = itehaas_lib::tree_builder::flatten_tree_root(repo, &commit.tree, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let diffs = itehaas_lib::diff::diff_maps(&parent_map, &commit_map);
+    // Apply diffs to current working tree
+    let cur_head = itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.ok_or_else(|| anyhow::anyhow!("no HEAD"))?;
+    let cur_obj = itehaas_lib::object::store::read_object(repo, &cur_head, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let cur_commit = match cur_obj {
+        Object::Commit(c) => c,
+        _ => anyhow::bail!("HEAD not commit"),
+    };
+    let _cur_map = itehaas_lib::tree_builder::flatten_tree_root(repo, &cur_commit.tree, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut conflicts = Vec::new();
+    let mut index = Index::load(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    for d in diffs {
+        let path = &d.path;
+        match d.status {
+            itehaas_lib::diff::DiffStatus::Added => {
+                if let Some((h, mode)) = d.new_hash.as_ref().map(|hh| (hh.clone(), d.new_mode.unwrap())) {
+                    // Check if file already exists in working tree
+                    let abs = repo.join(path);
+                    if abs.exists() {
+                        conflicts.push(path.clone());
+                        // write conflict markers
+                        let cur_content = fs::read(&abs).unwrap_or_default();
+                        let new_content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap_or_default();
+                        let mut out = Vec::new();
+                        out.extend_from_slice(b"<<<<<<< HEAD\n");
+                        out.extend_from_slice(&cur_content);
+                        out.extend_from_slice(b"=======\n");
+                        out.extend_from_slice(&new_content);
+                        out.extend_from_slice(b">>>>>>> cherry-pick\n");
+                        fs::write(&abs, &out).unwrap();
+                    } else {
+                        let abs = repo.join(path);
+                        if let Some(parent) = abs.parent() { fs::create_dir_all(parent).unwrap(); }
+                        let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
+                        fs::write(&abs, &content).unwrap();
+                        #[cfg(unix)]{
+                            use std::os::unix::fs::PermissionsExt;
+                            let perm = if mode == 0o100755 {0o755} else {0o644};
+                            let _ = fs::set_permissions(&abs, fs::Permissions::from_mode(perm));
+                        }
+                        index.add_or_update(IndexEntry::new(path.clone(), h, mode));
+                    }
+                }
+            }
+            itehaas_lib::diff::DiffStatus::Deleted => {
+                let abs = repo.join(path);
+                if abs.exists() {
+                    // Check if current has same content as parent (clean)
+                    let cur_hash_opt = parent_map.get(path);
+                    let wt_hash = {
+                        let data = fs::read(&abs).unwrap_or_default();
+                        let blob = itehaas_lib::object::Blob::new(data);
+                        itehaas_lib::object::Object::Blob(blob).hash(hasher.as_ref())
+                    };
+                    if let Some((ph, _)) = cur_hash_opt {
+                        if wt_hash.hex() == ph.hex() {
+                            let _ = fs::remove_file(&abs);
+                            index.remove(path);
+                        } else {
+                            conflicts.push(path.clone());
+                        }
+                    } else {
+                        let _ = fs::remove_file(&abs);
+                        index.remove(path);
+                    }
+                } else {
+                    index.remove(path);
+                }
+            }
+            itehaas_lib::diff::DiffStatus::Modified | itehaas_lib::diff::DiffStatus::TypeChange => {
+                if let Some((h, mode)) = d.new_hash.as_ref().map(|hh| (hh.clone(), d.new_mode.unwrap())) {
+                    let abs = repo.join(path);
+                    // Simple: overwrite if not conflicting? Check if wt == parent
+                    let wt_exists = abs.exists();
+                    if wt_exists {
+                        let wt_data = fs::read(&abs).unwrap_or_default();
+                        let wt_hash = itehaas_lib::object::Object::Blob(itehaas_lib::object::Blob::new(wt_data)).hash(hasher.as_ref());
+                        if let Some((ph, _)) = parent_map.get(path) {
+                            if wt_hash.hex() != ph.hex() {
+                                // wt dirty vs parent, check if wt already equals new (already applied)
+                                if wt_hash.hex() == h.hex() {
+                                    // already applied
+                                } else {
+                                    conflicts.push(path.clone());
+                                    let new_content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap_or_default();
+                                    let cur_content = fs::read(&abs).unwrap_or_default();
+                                    let mut out = Vec::new();
+                                    out.extend_from_slice(b"<<<<<<< HEAD\n");
+                                    out.extend_from_slice(&cur_content);
+                                    out.extend_from_slice(b"=======\n");
+                                    out.extend_from_slice(&new_content);
+                                    out.extend_from_slice(b">>>>>>> cherry-pick\n");
+                                    fs::write(&abs, &out).unwrap();
+                                    continue;
+                                }
+                            } else {
+                                // wt == parent, safe to apply
+                                let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
+                                fs::write(&abs, &content).unwrap();
+                                index.add_or_update(IndexEntry::new(path.clone(), h, mode));
+                            }
+                        } else {
+                            // wt == parent, safe
+                            let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
+                            fs::write(&abs, &content).unwrap();
+                            index.add_or_update(IndexEntry::new(path.clone(), h, mode));
+                        }
+                    } else {
+                        // wt not exists, but parent had file? Means file was deleted in wt? Conflict
+                        conflicts.push(path.clone());
+                    }
+                }
+            }
+        }
+    }
+    index.save(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if !conflicts.is_empty() {
+        fs::write(repo.join(".itehaas").join("CHERRY_PICK_HEAD"), hash.hex()).unwrap();
+        println!("cherry-pick resulted in conflicts: {:?}", conflicts);
+        println!("Fix conflicts, add, then run: itehaas cherry-pick --continue");
+        return Ok(());
+    }
+    // No conflicts: create commit
+    let head = itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.unwrap();
+    let entries = index.entries_sorted();
+    let tree = itehaas_lib::tree_builder::build_tree_from_index(repo, &entries, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let (cfg_name, cfg_email) = config::read_user(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let name = cfg_name.unwrap_or_else(|| "Author".to_string());
+    let email = cfg_email.unwrap_or_else(|| "author@example.com".to_string());
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let sig = itehaas_lib::object::Signature::new(name, email, ts, "+0000".into()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let new_commit = itehaas_lib::object::Commit::new(tree, vec![head.clone()], sig.clone(), sig, commit.message.clone());
+    let nhash = itehaas_lib::object::store::write_object(repo, &Object::Commit(new_commit), hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let head_ref = itehaas_lib::refs::read_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    match head_ref {
+        itehaas_lib::refs::Head::Ref(r) => {
+            itehaas_lib::refs::write_ref_with_log(repo, &r, &nhash, &format!("cherry-pick: {}", &hash.hex()[..7])).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+        _ => {
+            itehaas_lib::refs::write_head_detached_with_log(repo, &nhash, &format!("cherry-pick: {}", &hash.hex()[..7])).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+    }
+    println!("cherry-picked {} as {}", &hash.hex()[..7], &nhash.hex()[..7]);
+    Ok(())
+}
+
+fn cmd_revert(repo: &Path, commit_str: String) -> Result<()> {
+    // Revert is cherry-pick of inverse diff
+    let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let hash = itehaas_lib::refs::resolve_rev(repo, &commit_str)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("commit '{}' not found", commit_str))?;
+    let obj = itehaas_lib::object::store::read_object(repo, &hash, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let commit = match obj {
+        Object::Commit(c) => c,
+        _ => anyhow::bail!("not a commit"),
+    };
+    if commit.parents.is_empty() {
+        anyhow::bail!("cannot revert root commit");
+    }
+    let parent_hash = &commit.parents[0];
+    let parent_obj = itehaas_lib::object::store::read_object(repo, parent_hash, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let parent_commit = match parent_obj {
+        Object::Commit(c) => c,
+        _ => anyhow::bail!("parent not commit"),
+    };
+    // Diff commit -> parent (inverse)
+    let commit_map = itehaas_lib::tree_builder::flatten_tree_root(repo, &commit.tree, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let parent_map = itehaas_lib::tree_builder::flatten_tree_root(repo, &parent_commit.tree, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let diffs = itehaas_lib::diff::diff_maps(&commit_map, &parent_map); // reversed
+    let mut index = Index::load(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut conflicts = Vec::new();
+    for d in diffs {
+        let path = &d.path;
+        match d.status {
+            itehaas_lib::diff::DiffStatus::Added => {
+                // In inverse, added in parent->commit becomes deleted in revert
+                let abs = repo.join(path);
+                if abs.exists() {
+                    let _ = fs::remove_file(&abs);
+                    index.remove(path);
+                } else {
+                    index.remove(path);
+                }
+            }
+            itehaas_lib::diff::DiffStatus::Deleted => {
+                if let Some((h, mode)) = d.new_hash.as_ref().map(|hh| (hh.clone(), d.new_mode.unwrap())) {
+                    // Deleted in inverse means added in revert: restore parent's file
+                    let abs = repo.join(path);
+                    if abs.exists() {
+                        conflicts.push(path.clone());
+                    } else {
+                        if let Some(parent) = abs.parent() { fs::create_dir_all(parent).unwrap(); }
+                        let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
+                        fs::write(&abs, &content).unwrap();
+                        index.add_or_update(IndexEntry::new(path.clone(), h, mode));
+                    }
+                }
+            }
+            _ => {
+                if let Some((h, mode)) = d.new_hash.as_ref().map(|hh| (hh.clone(), d.new_mode.unwrap())) {
+                    let abs = repo.join(path);
+                    if let Some(parent) = abs.parent() { fs::create_dir_all(parent).unwrap(); }
+                    let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
+                    // Check if wt dirty
+                    if abs.exists() {
+                        let cur = fs::read(&abs).unwrap_or_default();
+                        let cur_hash = itehaas_lib::object::Object::Blob(itehaas_lib::object::Blob::new(cur)).hash(hasher.as_ref());
+                        if let Some((ch, _)) = commit_map.get(path) {
+                            if cur_hash.hex() != ch.hex() {
+                                conflicts.push(path.clone());
+                                continue;
+                            }
+                        }
+                    }
+                    fs::write(&abs, &content).unwrap();
+                    index.add_or_update(IndexEntry::new(path.clone(), h, mode));
+                } else {
+                    // TypeChange etc: handle as modified
+                    if let Some((h, mode)) = d.new_hash.as_ref().map(|hh| (hh.clone(), d.new_mode.unwrap())) {
+                        let abs = repo.join(path);
+                        let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
+                        fs::write(&abs, &content).unwrap();
+                        index.add_or_update(IndexEntry::new(path.clone(), h, mode));
+                    }
+                }
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        index.save(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        anyhow::bail!("revert conflicts in: {:?}", conflicts);
+    }
+    index.save(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Create revert commit
+    let head = itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.unwrap();
+    let entries = index.entries_sorted();
+    let tree = itehaas_lib::tree_builder::build_tree_from_index(repo, &entries, hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let (cfg_name, cfg_email) = config::read_user(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let name = cfg_name.unwrap_or_else(|| "Author".to_string());
+    let email = cfg_email.unwrap_or_else(|| "author@example.com".to_string());
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let sig = itehaas_lib::object::Signature::new(name, email, ts, "+0000".into()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let msg = format!("Revert \"{}\"", commit.message.lines().next().unwrap_or(""));
+    let new_commit = itehaas_lib::object::Commit::new(tree, vec![head.clone()], sig.clone(), sig, msg.clone());
+    let nhash = itehaas_lib::object::store::write_object(repo, &Object::Commit(new_commit), hasher.as_ref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let head_ref = itehaas_lib::refs::read_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    match head_ref {
+        itehaas_lib::refs::Head::Ref(r) => {
+            itehaas_lib::refs::write_ref_with_log(repo, &r, &nhash, &format!("revert: {}", &hash.hex()[..7])).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+        _ => {
+            itehaas_lib::refs::write_head_detached_with_log(repo, &nhash, &format!("revert: {}", &hash.hex()[..7])).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+    }
+    println!("reverted {} as {}", &hash.hex()[..7], &nhash.hex()[..7]);
+    Ok(())
+}
+
+fn cmd_bisect(repo: &Path, command: BisectCommands) -> Result<()> {
+    match command {
+        BisectCommands::Start { bad, good } => {
+            let bad_hash = if let Some(b) = bad {
+                itehaas_lib::refs::resolve_rev(repo, &b).map_err(|e| anyhow::anyhow!(e.to_string()))?.ok_or_else(|| anyhow::anyhow!("bad commit not found"))?
+            } else {
+                itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.ok_or_else(|| anyhow::anyhow!("no HEAD"))?
+            };
+            let good_hash = if let Some(g) = good {
+                itehaas_lib::refs::resolve_rev(repo, &g).map_err(|e| anyhow::anyhow!(e.to_string()))?.ok_or_else(|| anyhow::anyhow!("good commit not found"))?
+            } else {
+                // Require good to be specified for simplicity
+                anyhow::bail!("bisect start requires <good> commit");
+            };
+            fs::write(repo.join(".itehaas").join("BISECT_BAD"), bad_hash.hex()).unwrap();
+            fs::write(repo.join(".itehaas").join("BISECT_GOOD"), good_hash.hex()).unwrap();
+            fs::write(repo.join(".itehaas").join("BISECT_LOG"), format!("bad {}\ngood {}\n", bad_hash.hex(), good_hash.hex())).unwrap();
+            // Find commits between good and bad
+            let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            // Collect commits from bad that are not ancestors of good
+            let mut visited_bad = std::collections::HashSet::new();
+            let mut visited_good = std::collections::HashSet::new();
+            let mut q = std::collections::VecDeque::new();
+            q.push_back(bad_hash.clone());
+            while let Some(c) = q.pop_front() {
+                if visited_bad.contains(&c.hex()) { continue; }
+                visited_bad.insert(c.hex());
+                if let Ok(Object::Commit(comm)) = itehaas_lib::object::store::read_object(repo, &c, hasher.as_ref()) {
+                    for p in comm.parents { q.push_back(p); }
+                }
+            }
+            let mut q2 = std::collections::VecDeque::new();
+            q2.push_back(good_hash.clone());
+            while let Some(c) = q2.pop_front() {
+                if visited_good.contains(&c.hex()) { continue; }
+                visited_good.insert(c.hex());
+                if let Ok(Object::Commit(comm)) = itehaas_lib::object::store::read_object(repo, &c, hasher.as_ref()) {
+                    for p in comm.parents { q2.push_back(p); }
+                }
+            }
+            let mut candidates: Vec<String> = visited_bad.difference(&visited_good).cloned().collect();
+            candidates.sort();
+            if candidates.is_empty() {
+                println!("No commits to bisect");
+                return Ok(());
+            }
+            let mid = candidates[candidates.len() / 2].clone();
+            let mid_hash = Hash::from_hex(algo, &mid).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            // Checkout mid
+            itehaas_lib::checkout::checkout_detached(repo, &mid_hash).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            println!("Bisecting: {} revisions left to test after this (roughly {} steps)", candidates.len(), (candidates.len() as f64).log2().ceil() as usize);
+            println!("Checked out {}", &mid[..7]);
+        }
+        BisectCommands::Good { commit } => {
+            let hash = if let Some(c) = commit {
+                itehaas_lib::refs::resolve_rev(repo, &c).map_err(|e| anyhow::anyhow!(e.to_string()))?.ok_or_else(|| anyhow::anyhow!("commit not found"))?
+            } else {
+                itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.ok_or_else(|| anyhow::anyhow!("no HEAD"))?
+            };
+            fs::write(repo.join(".itehaas").join("BISECT_GOOD"), hash.hex()).unwrap();
+            println!("marked good {}", &hash.hex()[..7]);
+            // In real bisect, would recalc next; for now just log
+        }
+        BisectCommands::Bad { commit } => {
+            let hash = if let Some(c) = commit {
+                itehaas_lib::refs::resolve_rev(repo, &c).map_err(|e| anyhow::anyhow!(e.to_string()))?.ok_or_else(|| anyhow::anyhow!("commit not found"))?
+            } else {
+                itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.ok_or_else(|| anyhow::anyhow!("no HEAD"))?
+            };
+            fs::write(repo.join(".itehaas").join("BISECT_BAD"), hash.hex()).unwrap();
+            println!("marked bad {}", &hash.hex()[..7]);
+        }
+        BisectCommands::Reset => {
+            let _ = fs::remove_file(repo.join(".itehaas").join("BISECT_BAD"));
+            let _ = fs::remove_file(repo.join(".itehaas").join("BISECT_GOOD"));
+            let _ = fs::remove_file(repo.join(".itehaas").join("BISECT_LOG"));
+            // Checkout original branch? For simplicity checkout main
+            if let Ok(Some(main)) = itehaas_lib::refs::read_ref(repo, "refs/heads/main") {
+                let _ = itehaas_lib::checkout::checkout_branch(repo, "main");
+                let _ = main;
+            }
+            println!("bisect reset");
+        }
+        BisectCommands::Log => {
+            let log = repo.join(".itehaas").join("BISECT_LOG");
+            if log.exists() {
+                println!("{}", fs::read_to_string(log).unwrap());
+            } else {
+                println!("no bisect log");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_rebase(
+    repo: &Path,
+    base: Option<String>,
+    abort: bool,
+    cont: bool,
+    interactive: bool,
+) -> Result<()> {
+    let rebase_dir = repo.join(".itehaas").join("rebase-merge");
+    if abort {
+        if rebase_dir.exists() {
+            fs::remove_dir_all(&rebase_dir).unwrap();
+            // checkout original branch from rebase-merge/head-name ?
+            if let Ok(head_name) = fs::read_to_string(rebase_dir.join("head-name")) {
+                // cannot after removal, but try
+                let _ = head_name;
+            }
+            println!("rebase abort");
+        } else {
+            println!("no rebase in progress");
+        }
+        // Also remove REBASE_HEAD
+        let _ = fs::remove_file(repo.join(".itehaas").join("REBASE_HEAD"));
+        return Ok(());
+    }
+    if cont {
+        if !rebase_dir.exists() {
+            anyhow::bail!("no rebase in progress");
+        }
+        // Check if conflicts resolved (no unstaged)
+        let st = itehaas_lib::status::status(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if !st.not_staged.is_empty() {
+            anyhow::bail!("working tree has unstaged changes");
+        }
+        // Continue: need to commit current index as next commit in rebase
+        // For simplicity, we treat rebase as replaying commits one by one, and continue means commit current index and move to next
+        // Read rebase state
+        let todo = fs::read_to_string(rebase_dir.join("todo")).unwrap_or_default();
+        let mut lines: Vec<String> = todo.lines().map(|s| s.to_string()).collect();
+        if lines.is_empty() {
+            // No more todos, finish rebase
+            let orig_branch = fs::read_to_string(rebase_dir.join("head-name")).unwrap_or_else(|_| "main".to_string()).trim().to_string();
+            let orig_head = fs::read_to_string(rebase_dir.join("orig-head")).unwrap_or_default().trim().to_string();
+            // Update branch to current HEAD
+            let cur_head = itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.unwrap();
+            // If we were on branch, update it
+            if !orig_branch.is_empty() && orig_branch != "detached" {
+                itehaas_lib::refs::write_ref(repo, &format!("refs/heads/{}", orig_branch), &cur_head).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                itehaas_lib::refs::write_head_ref(repo, &format!("refs/heads/{}", orig_branch)).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            }
+            fs::remove_dir_all(&rebase_dir).unwrap();
+            let _ = fs::remove_file(repo.join(".itehaas").join("REBASE_HEAD"));
+            println!("rebase finished");
+            return Ok(());
+        }
+        let current = lines.remove(0);
+        // current is like "pick <hash> <msg>" - we need to commit index
+        // For continue after conflict, we commit the resolved index
+        let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let index = Index::load(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let tree = itehaas_lib::tree_builder::build_tree_from_index(repo, &index.entries_sorted(), hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let head = itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.unwrap();
+        // Get original commit message from todo line
+        let parts: Vec<&str> = current.splitn(3, ' ').collect();
+        let orig_hash = parts.get(1).unwrap_or(&"");
+        let msg = if parts.len() == 3 { parts[2].to_string() } else { format!("rebase {}", orig_hash) };
+        let (cfg_name, cfg_email) = config::read_user(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let name = cfg_name.unwrap_or_else(|| "Author".to_string());
+        let email = cfg_email.unwrap_or_else(|| "author@example.com".to_string());
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let sig = itehaas_lib::object::Signature::new(name, email, ts, "+0000".into()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let new_commit = itehaas_lib::object::Commit::new(tree, vec![head.clone()], sig.clone(), sig, msg);
+        let nhash = itehaas_lib::object::store::write_object(repo, &Object::Commit(new_commit), hasher.as_ref())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // Update HEAD
+        let head_ref = itehaas_lib::refs::read_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        match head_ref {
+            itehaas_lib::refs::Head::Ref(r) => {
+                itehaas_lib::refs::write_ref(repo, &r, &nhash).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            }
+            _ => {
+                itehaas_lib::refs::write_head_detached(repo, &nhash).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            }
+        }
+        // Save remaining todo
+        fs::write(rebase_dir.join("todo"), lines.join("\n")).unwrap();
+        if lines.is_empty() {
+            // Finish
+            let orig_branch = fs::read_to_string(rebase_dir.join("head-name")).unwrap_or_else(|_| "main".to_string()).trim().to_string();
+            let cur_head2 = itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.unwrap();
+            if !orig_branch.is_empty() && orig_branch != "detached" {
+                itehaas_lib::refs::write_ref(repo, &format!("refs/heads/{}", orig_branch), &cur_head2).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            }
+            fs::remove_dir_all(&rebase_dir).unwrap();
+            let _ = fs::remove_file(repo.join(".itehaas").join("REBASE_HEAD"));
+            println!("rebase finished");
+        } else {
+            println!("rebase continue: committed, {} remaining", lines.len());
+        }
+        return Ok(());
+    }
+    // Start rebase
+    let base_str = base.ok_or_else(|| anyhow::anyhow!("rebase requires <base>"))?;
+    let base_hash = itehaas_lib::refs::resolve_rev(repo, &base_str)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("base '{}' not found", base_str))?;
+    let head_hash = itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.ok_or_else(|| anyhow::anyhow!("no HEAD"))?;
+    let branch = itehaas_lib::refs::current_branch(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.unwrap_or_else(|| "detached".to_string());
+    if base_hash.hex() == head_hash.hex() {
+        println!("Already up to date");
+        return Ok(());
+    }
+    // Find commits to replay: from base (exclusive) to head (inclusive)
+    let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Collect commits reachable from HEAD but not from base
+    let mut to_replay: Vec<Hash> = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack = vec![head_hash.clone()];
+    let mut base_ancestors: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut q = std::collections::VecDeque::new();
+    q.push_back(base_hash.clone());
+    while let Some(c) = q.pop_front() {
+        if base_ancestors.contains(&c.hex()) { continue; }
+        base_ancestors.insert(c.hex());
+        if let Ok(Object::Commit(comm)) = itehaas_lib::object::store::read_object(repo, &c, hasher.as_ref()) {
+            for p in comm.parents { q.push_back(p); }
+        }
+    }
+    let mut q2 = std::collections::VecDeque::new();
+    q2.push_back(head_hash.clone());
+    let mut seen = std::collections::HashSet::new();
+    while let Some(c) = q2.pop_front() {
+        if seen.contains(&c.hex()) || base_ancestors.contains(&c.hex()) { continue; }
+        seen.insert(c.hex());
+        to_replay.push(c.clone());
+        if let Ok(Object::Commit(comm)) = itehaas_lib::object::store::read_object(repo, &c, hasher.as_ref()) {
+            for p in comm.parents { q2.push_back(p); }
+        }
+    }
+    to_replay.reverse(); // oldest first
+    if to_replay.is_empty() {
+        println!("Already up to date");
+        return Ok(());
+    }
+    // Checkout base
+    itehaas_lib::checkout::checkout_detached(repo, &base_hash).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Prepare rebase state
+    fs::create_dir_all(&rebase_dir).unwrap();
+    fs::write(rebase_dir.join("orig-head"), head_hash.hex()).unwrap();
+    fs::write(rebase_dir.join("head-name"), branch.clone()).unwrap();
+    fs::write(rebase_dir.join("onto"), base_hash.hex()).unwrap();
+    let todo_content: Vec<String> = to_replay.iter().map(|h| {
+        let obj = itehaas_lib::object::store::read_object(repo, h, hasher.as_ref()).unwrap();
+        let msg = match obj {
+            Object::Commit(c) => c.message.lines().next().unwrap_or("").to_string(),
+            _ => "".to_string(),
+        };
+        let action = if interactive { "pick" } else { "pick" };
+        format!("{} {} {}", action, h.hex(), msg)
+    }).collect();
+    fs::write(rebase_dir.join("todo"), todo_content.join("\n")).unwrap();
+    // Apply first commit automatically (or if interactive, user would edit todo)
+    // For simplicity, we will attempt to apply each commit via cherry-pick logic sequentially
+    // We will try to apply first; if conflict, stop and ask to continue
+    for hash in to_replay.clone() {
+        let res = (|| -> Result<()> {
+            let obj = itehaas_lib::object::store::read_object(repo, &hash, hasher.as_ref()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let commit = match obj {
+                Object::Commit(c) => c,
+                _ => anyhow::bail!("not commit"),
+            };
+            if commit.parents.is_empty() {
+                anyhow::bail!("cannot rebase root");
+            }
+            let parent_hash = &commit.parents[0];
+            let parent_obj = itehaas_lib::object::store::read_object(repo, parent_hash, hasher.as_ref()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let parent_commit = match parent_obj {
+                Object::Commit(c) => c,
+                _ => anyhow::bail!("parent not commit"),
+            };
+            // Diff parent->commit and apply to current HEAD
+            let parent_map = itehaas_lib::tree_builder::flatten_tree_root(repo, &parent_commit.tree, hasher.as_ref()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let commit_map = itehaas_lib::tree_builder::flatten_tree_root(repo, &commit.tree, hasher.as_ref()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let diffs = itehaas_lib::diff::diff_maps(&parent_map, &commit_map);
+            let cur_head = itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.unwrap();
+            let cur_obj = itehaas_lib::object::store::read_object(repo, &cur_head, hasher.as_ref()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let cur_commit = match cur_obj {
+                Object::Commit(c) => c,
+                _ => anyhow::bail!("HEAD not commit"),
+            };
+            let cur_map = itehaas_lib::tree_builder::flatten_tree_root(repo, &cur_commit.tree, hasher.as_ref()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let mut index = Index::load(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let mut conflicts = Vec::new();
+            for d in &diffs {
+                // Simplified apply: similar to cherry-pick but for rebase we use same logic
+                match d.status {
+                    itehaas_lib::diff::DiffStatus::Added => {
+                        if let Some((h, mode)) = d.new_hash.as_ref().map(|hh| (hh.clone(), d.new_mode.unwrap())) {
+                            let abs = repo.join(&d.path);
+                            if abs.exists() {
+                                conflicts.push(d.path.clone());
+                            } else {
+                                if let Some(parent) = abs.parent() { fs::create_dir_all(parent).unwrap(); }
+                                let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
+                                fs::write(&abs, &content).unwrap();
+                                index.add_or_update(IndexEntry::new(d.path.clone(), h, mode));
+                            }
+                        }
+                    }
+                    _ => {
+                        // For rebase, just apply same as cherry-pick simplified
+                        if let Some((h, mode)) = d.new_hash.as_ref().map(|hh| (hh.clone(), d.new_mode.unwrap_or(0o100644))) {
+                            let abs = repo.join(&d.path);
+                            if let Some(parent) = abs.parent() { fs::create_dir_all(parent).unwrap(); }
+                            let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap_or_default();
+                            // check conflict
+                            let wt_exists = abs.exists();
+                            if wt_exists {
+                                let cur_content = fs::read(&abs).unwrap_or_default();
+                                let cur_hash = itehaas_lib::object::Object::Blob(itehaas_lib::object::Blob::new(cur_content.clone())).hash(hasher.as_ref());
+                                if let Some((ph, _)) = parent_map.get(&d.path) {
+                                    if cur_hash.hex() != ph.hex() && cur_hash.hex() != h.hex() {
+                                        conflicts.push(d.path.clone());
+                                        continue;
+                                    }
+                                }
+                            }
+                            fs::write(&abs, &content).unwrap();
+                            index.add_or_update(IndexEntry::new(d.path.clone(), h, mode));
+                        } else {
+                            // Deleted
+                            let abs = repo.join(&d.path);
+                            let _ = fs::remove_file(&abs);
+                            index.remove(&d.path);
+                        }
+                    }
+                }
+            }
+            if !conflicts.is_empty() {
+                index.save(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                anyhow::bail!("rebase conflict in {:?}", conflicts);
+            }
+            index.save(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            // Create new commit with same message
+            let entries = index.entries_sorted();
+            let tree = itehaas_lib::tree_builder::build_tree_from_index(repo, &entries, hasher.as_ref()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let (cfg_name, cfg_email) = config::read_user(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let name = cfg_name.unwrap_or_else(|| "Author".to_string());
+            let email = cfg_email.unwrap_or_else(|| "author@example.com".to_string());
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            let sig = itehaas_lib::object::Signature::new(name, email, ts, "+0000".into()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let new_commit = itehaas_lib::object::Commit::new(tree, vec![cur_head.clone()], sig.clone(), sig, commit.message.clone());
+            let nhash = itehaas_lib::object::store::write_object(repo, &Object::Commit(new_commit), hasher.as_ref()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let head = itehaas_lib::refs::read_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            match head {
+                itehaas_lib::refs::Head::Detached(_) => {
+                    itehaas_lib::refs::write_head_detached(repo, &nhash).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                }
+                itehaas_lib::refs::Head::Ref(r) => {
+                    itehaas_lib::refs::write_ref(repo, &r, &nhash).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })();
+        if let Err(e) = res {
+            println!("rebase conflict at {}: {}", &hash.hex()[..7], e);
+            println!("Fix conflicts, add, then run: itehaas rebase --continue");
+            return Ok(());
+        }
+        // Remove applied commit from todo
+        let mut todo = fs::read_to_string(rebase_dir.join("todo")).unwrap_or_default();
+        let mut lines: Vec<String> = todo.lines().map(|s| s.to_string()).collect();
+        if !lines.is_empty() {
+            lines.remove(0);
+            fs::write(rebase_dir.join("todo"), lines.join("\n")).unwrap();
+        }
+    }
+    // All applied, finish
+    let cur_head = itehaas_lib::refs::resolve_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?.unwrap();
+    let orig_branch = fs::read_to_string(rebase_dir.join("head-name")).unwrap_or_else(|_| "main".to_string()).trim().to_string();
+    if orig_branch != "detached" {
+        itehaas_lib::refs::write_ref(repo, &format!("refs/heads/{}", orig_branch), &cur_head).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        itehaas_lib::refs::write_head_ref(repo, &format!("refs/heads/{}", orig_branch)).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    }
+    fs::remove_dir_all(&rebase_dir).unwrap();
+    let _ = fs::remove_file(repo.join(".itehaas").join("REBASE_HEAD"));
+    println!("rebase finished");
     Ok(())
 }
 

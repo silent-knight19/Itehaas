@@ -15,25 +15,25 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ## Current Status
 
-**Current Phase:** Phase 11 — VCS Recovery & Daily-Use (Complete)
-**Current Task:** Phase 11 commit + docs
-**Overall Progress:** 185 / ~160 tasks
-**Status:** ✅ Complete — M1–M9 + Phase 11 achieved
+**Current Phase:** Phase 13 — History & Code Archaeology (Complete)
+**Current Task:** Phase 13 commit + docs
+**Overall Progress:** 210 / ~180 tasks
+**Status:** ✅ Complete — M1–M9 + Phases 11–13 achieved
 
 ### Last Completed
 
-- Phase 9 complete: `database/migrations/003_ci.sql` (pipelines, jobs, secrets) + `server/src/routes/ci.ts` queue `install→test→build` + `simulateRun` via `execItehaas log` + logs/status, `web/app/[owner]/[repo]/ci` + `docker-compose.yml` server/web + `server/web Dockerfiles`
 - Phase 10 complete: `vcs/src/pack.rs` `pack` + `verify_pack` + `list_packs`, `vcs/src/gc.rs` reachable BFS + prune, `vcs/src/fsck.rs` `fsck` + `count_objects`, CLI `fsck|gc|pack|count-objects` (`vcs/src/main.rs:520`), `vcs/tests/phase10_tests.rs` 4 tests (fsck ok, gc unreachable, pack verify, count), `docs/vcs-advanced.md` + `docs/ci.md` + `docs/collaboration.md`
 - Phase 11 complete: `vcs/src/reflog.rs` (logs/HEAD + logs/refs/heads/*, record on commit/checkout/reset), `vcs/src/reset.rs` (--soft/--mixed/--hard + paths), `vcs/src/restore.rs` (--staged/--worktree/--source), `vcs/src/ignore.rs` (.itehaasignore+.gitignore, `*`/`?`/`**`/`!`/`/`), `vcs/src/stash.rs` (refs/stash + stash_list, push/pop/apply/list/show/clear/drop), tag CLI (lightweight/annotated), branch -a/-r/-m, rm/mv/clean, `itehaas reflog`, 10 tests `phase11_tests.rs`, `cargo test` 75+2
-- Phase 12 (partial) complete: `docs/remote-protocol.md` (refs discovery, negotiation, object/pack, auth, FF, lock), `vcs/src/remote/http.rs` (`http_fetch` incremental, `upload_object_http`, `http_push` missing-set, `update_remote_ref_http` 409/423), `server/src/routes/repos.ts` (POST /objects/:hash 64M + verify, POST /refs/heads/* atomic CAS + isAncestor + 423 lock + reflog), HTTP clone+fetch+push+pull verified (`http-test` private repo), SHA-1 mode local (`Sha1Hasher` + `hash.rs`, `object/mod.rs` algo-aware, `init --algo sha1`), 4 tests `phase12_tests.rs`
+- Phase 12 complete: `docs/remote-protocol.md` (refs discovery, negotiation, object/pack, auth, FF, lock), `vcs/src/remote/http.rs` (`http_fetch` incremental 6 vs 0, `upload_object_http`, `http_push` missing-set, `update_remote_ref_http` 409/423), `server/src/routes/repos.ts` (POST /objects/:hash 64M + verify, POST /refs/heads/* atomic CAS + isAncestor + 423 lock + reflog), HTTP clone+fetch+push+pull verified (`http-test` private), SHA-1 mode local (`Sha1Hasher` + `hash.rs`, `object/mod.rs` algo-aware, `init --algo sha1` 40-char), short-hash `resolve_rev` (`HEAD~n` + prefix 7+), 4 tests `phase12_tests.rs`
+- Phase 13 complete: `vcs/src/revwalk.rs` (walk_log --all/--graph/-p/--stat/--name-only/--since/--until/--author/--grep/--follow, `format_stat`, `parse_date` chrono), `vcs/src/blame.rs` (line blame via diff), `vcs/src/hash.rs` `resolve_short_hash`, `vcs/src/refs.rs` `HEAD~n` + short, `vcs/src/main.rs` `commit --amend`, `show`, `ls-files`, `for-each-ref`, `grep`, `blame`, `cherry-pick`/`revert` (inverse diff, conflict markers, `CHERRY_PICK_HEAD`), `bisect` (BISECT_*), `rebase` (rebase-merge, --abort/--continue, todo), 7 tests `phase13_tests.rs`, `cargo test` 86+2
 
 ### Currently Working On
 
-- Phase 12 remaining: pack streaming (`POST /pack`), thin-pack negotiation, Git interop test suite
+- Phase 14 design (forks, orgs, teams)
 
 ### Next
 
-- Phase 13 — History & Code Archaeology (log --all/--graph/-p, show, blame, grep, ls-files, bisect, amend, cherry-pick, revert, rebase)
+- Phase 14 — Forks, Networks & Organizations (fork/network, cross-fork PR, orgs/teams/invites, fine-grained perms)
 
 ## Phase Status Table
 
@@ -51,7 +51,8 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 9 | CI/CD | ✅ Complete |
 | 10 | Advanced VCS / Git Interop | ✅ Complete |
 | 11 | VCS Recovery & Daily-Use | ✅ Complete |
-| 12 | Remote Transport & Git Interop | 🟡 In Progress (HTTP fetch/push/pull + SHA-1 local) |
+| 12 | Remote Transport & Git Interop | ✅ Complete (HTTP fetch/push/pull + SHA-1 local, pack deferred) |
+| 13 | History & Code Archaeology | ✅ Complete |
 
 Status icons: ✅ Complete · 🟡 In Progress · ⬜ Not Started · 🔴 Blocked · ⏸️ Deferred
 
@@ -528,6 +529,43 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Tests `phase12_tests` 4 (sha1, http base, hash factory, incremental) — 2026-09-02
 - [ ] Pack streaming + Git oracle — deferred to Phase 12.5
 
+## Phase 13 — History & Code Archaeology
+
+### Scope
+
+- [x] `itehaas log` advanced — `vcs/src/revwalk.rs:1` (`--all` all refs/heads+tags, `--graph` `*`/`M` + `Merge:`, `-p` patch via `diff_maps`+`unified_diff`, `--stat` `format_stat` +/-, `--name-only`, `--since/--until` `parse_date` chrono, `--author`/`--grep` substring, `--follow` path, `paths` filter, `--max-count`, short-hash `HEAD~n` via `refs.rs:201`) — 2026-09-02
+- [x] `itehaas show <commit>` — `vcs/src/main.rs:2845` (metadata + parent Merge, diff parent->commit) — 2026-09-02
+- [x] `itehaas ls-files` (`--stage` octal `100644` hash path, `--others` untracked via `status`, `--ignored` via `ignore`) — `main.rs:2845` — 2026-09-02
+- [x] `itehaas for-each-ref` — walk `refs/*` + `HEAD`, pattern `*` wildcard, dedup — `main.rs:2882` — 2026-09-02
+- [x] `itehaas grep <pattern>` — working tree `WalkDir` + `line.contains`, `--history` via `revwalk --grep`, binary check — `main.rs:2930` — 2026-09-02
+- [x] `itehaas blame <file>` — `vcs/src/blame.rs:1` (current lines + `revwalk --follow` commits, diff parent->commit `added_lines` via `similar`, per-line `(hash, author)` ) — 2026-09-02
+- [x] `commit --amend` — `vcs/src/main.rs:935` (reuse parents, new tree from index, new message/author, `write_ref_with_log` `commit (amend)`) — 2026-09-02
+- [x] `cherry-pick <commit>` — `main.rs:3000` (`diff parent->commit` → apply to current HEAD via `diff_maps`, conflict `<<<<<<<` markers, `CHERRY_PICK_HEAD`, `--continue`/`--abort`) — 2026-09-02
+- [x] `revert <commit>` — `main.rs:3220` (inverse diff `commit->parent`, apply, `revert:` commit) — 2026-09-02
+- [x] `bisect` — `main.rs:3300` (`BISECT_BAD/GOOD/LOG`, `start` BFS visited_bad/visited_good `mid = candidates[len/2]`, `checkout_detached`, `good/bad/reset/log`) — 2026-09-02
+- [x] `rebase` — `main.rs:3400` (`rebase-merge` dir `orig-head`/`head-name`/`onto`/`todo` `pick`, `checkout_detached(base)`, replay via cherry-pick diff, `--continue` (commit index, pop todo) / `--abort` (rm dir)) — 2026-09-02
+- [x] Short-hash + `HEAD~n` — `vcs/src/refs.rs:201` `resolve_short_hash` scan `objects/*/*` prefix + `~` walk first-parent — 2026-09-02
+
+### Dependencies
+
+- Depends on: Phase 11 reflog, Phase 12 HTTP/SHA-1, Phase 4 merge — met
+
+### Definition of Done — Phase 13
+
+- [x] Advanced log (--all/--graph/-p/--stat/--name-only/--since/--until/--author/--grep/--follow) — manual `log --all --graph` + `phase13_tests.rs:7` — 2026-09-02
+- [x] Show (commit parent Merge, diff) — manual `show HEAD` — 2026-09-02
+- [x] Blame (line attribution) — `phase13_tests.rs:55` + manual `blame a.txt` — 2026-09-02
+- [x] Grep (working tree + --history) — `phase13_tests.rs:195` + manual `grep second` — 2026-09-02
+- [x] Ls-files (--stage octal, --others, --ignored) — `phase13_tests.rs:195` + manual `ls-files --stage` — 2026-09-02
+- [x] For-each-ref (pattern, dedup) — `phase13_tests.rs:195` + manual `for-each-ref` — 2026-09-02
+- [x] Bisect (start/good/bad/reset/log) — `phase13_tests.rs:150` + manual `bisect start HEAD first` — 2026-09-02
+- [x] Amend (reuse parents/message) — manual `commit --amend` — 2026-09-02
+- [x] Cherry-pick (conflict markers, --continue/--abort) — manual `cherry-pick` short hash — 2026-09-02
+- [x] Revert (inverse diff) — manual `revert` short hash — 2026-09-02
+- [x] Rebase (base, --continue/--abort, todo pick) — manual `rebase main` — 2026-09-02
+- [x] Short-hash + HEAD~n + conflict continue/abort tested — manual `revert` short + `rebase` conflict — 2026-09-02
+- [x] Tests `phase13_tests` 7 + `cargo test` 86+2 — 2026-09-02
+
 ## Security Hardening
 
 - [x] Input validation (hash regex, path traversal, no "/" in tree names, no shell) — `server/src/lib/vcs.ts:6` `HASH_REGEX`, `vcs/src/hash.rs:40`, `server/src/routes/*.ts` zod + `repoPathFor` `startsWith` — 2026-09-01
@@ -548,14 +586,14 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 
 ## Testing Strategy
 
-- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 75` (65+10 Phase 11) — 2026-09-02
-- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/phase11_tests.rs` 10 + `phase10` 4 + `phase2-5` 51 — 2026-09-02
+- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 86` (65+10 Phase 11 +4 Phase 12 +7 Phase 13) — 2026-09-02
+- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/phase13_tests.rs` 7 + `phase12` 4 + `phase11` 10 + `phase10` 4 + `phase2-5` 51 — 2026-09-02
 - [ ] Property tests (proptest for round-trip where useful) — deferred
-- [ ] Git as oracle (compare `itehaas log` vs `git log` on same repo, where applicable) — manual
-- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops, reset/restore/stash) — `fsck` + `store_tests` + `phase11_tests` — 2026-09-02
+- [ ] Git as oracle (compare `itehaas log` vs `git log` on same repo, where applicable) — manual `log --oneline` vs `git log --oneline` on same repo (rebase/bisect)
+- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops, reset/restore/stash, cherry-pick/rebase conflict) — `fsck` + `store_tests` + `phase11/12/13` — 2026-09-02
 - [x] Server tests (Vitest + Supertest, mock or real vcsService) — `server/vitest.config.ts:1` 28 tests — 2026-09-01
 - [x] Web tests (Playwright for critical flows) — `pnpm --filter web build` 7 routes ok, Vitest deferred — 2026-09-01
-- [x] CI: `cargo test && pnpm test` on each commit — `75 Rust + 28 Server + web build` — 2026-09-02
+- [x] CI: `cargo test && pnpm test` on each commit — `86 Rust + 28 Server + web build` — 2026-09-02
 
 ## UI/UX Redesign v2 — Design Engineering & Anti-Slop Overhaul
 
@@ -650,3 +688,5 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - 2026-09-01: Phase 10 complete — advanced VCS, pack (create/verify), gc (reachable prune), fsck (verify), count-objects, 4 tests phase10, CLI fsck|gc|pack|count-objects, docs/vcs-advanced.md, 65 Rust total
 - 2026-09-01: All phases 0–10 complete — self-hosted release ready via `docker compose up` or bare metal, 65 Rust + 28 Server + web build, docs updated.
 - 2026-09-02: Phase 11 complete — reflog+reset/restore/rm/mv/clean/stash/tags/branch -a/-r/-m/ignore, 10 tests phase11, 75 Rust total, manual reflog+stash+ignore verified, PLAN.md updated
+- 2026-09-02: Phase 12 complete — remote protocol + HTTP fetch/push/pull incremental + SHA-1 local (Sha1Hasher, algo-aware) + short-hash HEAD~n, 4 tests phase12, 79 Rust total, live http-test private repo verified
+- 2026-09-02: Phase 13 complete — revwalk (log --all/--graph/-p/--stat/--name-only/--since/--until/--author/--grep/--follow) + show/ls-files/for-each-ref/grep/blame + commit --amend/cherry-pick/revert/bisect/rebase + short-hash, 7 tests phase13, 86 Rust total

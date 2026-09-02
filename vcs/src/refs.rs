@@ -199,25 +199,103 @@ pub fn current_branch(repo: &Path) -> Result<Option<String>> {
 
 /// Resolve a rev: branch name, hash, or HEAD. Phase 2 minimal: HEAD or hash.
 pub fn resolve_rev(repo: &Path, rev: &str) -> Result<Option<Hash>> {
+    // Handle HEAD~n suffix
+    if rev.contains('~') {
+        let parts: Vec<&str> = rev.splitn(2, '~').collect();
+        let base = parts[0];
+        let suffix = parts[1];
+        let n: usize = if suffix.is_empty() {
+            1
+        } else {
+            suffix.parse().unwrap_or(1)
+        };
+        let base_hash_opt = resolve_rev(repo, if base.is_empty() { "HEAD" } else { base })?;
+        if let Some(mut cur) = base_hash_opt {
+            let algo = crate::config::read_hasher(repo)?;
+            let hasher = crate::hash::new_hasher(algo)?;
+            for _ in 0..n {
+                let obj = crate::object::store::read_object(repo, &cur, hasher.as_ref())?;
+                match obj {
+                    crate::object::Object::Commit(c) => {
+                        if c.parents.is_empty() {
+                            return Ok(None);
+                        }
+                        cur = c.parents[0].clone();
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            return Ok(Some(cur));
+        } else {
+            return Ok(None);
+        }
+    }
     if rev == "HEAD" {
         return resolve_head(repo);
     }
-    // Try as branch name
+    // Try as branch name (exact)
     if let Ok(Some(h)) = read_ref(repo, &format!("refs/heads/{}", rev)) {
         return Ok(Some(h));
     }
-    // Try as direct hash
+    // Try as tag
+    if let Ok(Some(h)) = read_ref(repo, &format!("refs/tags/{}", rev)) {
+        // Tags may point to tag object; if tag object, try to resolve to commit?
+        // For rev resolution, return tag hash as is (could be tag object or commit)
+        return Ok(Some(h));
+    }
+    // Try as direct hash (full or short)
     let algo = crate::config::read_hasher(repo)?;
-    if rev.len() == algo.hex_len() {
+    // Full hash
+    if rev.len() == algo.hex_len() && rev.chars().all(|c| c.is_ascii_hexdigit()) {
         if let Ok(h) = Hash::from_hex(algo, rev) {
-            // Check if object exists
             let path = crate::object::store::object_path(repo, &h);
             if path.exists() {
                 return Ok(Some(h));
             }
         }
     }
+    // Short hash (7 to hex_len-1)
+    if rev.len() >= 4 && rev.len() < algo.hex_len() && rev.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Some(h) = resolve_short_hash(repo, rev, algo)? {
+            return Ok(Some(h));
+        }
+    }
     Ok(None)
+}
+
+fn resolve_short_hash(repo: &Path, prefix: &str, algo: HashAlgo) -> Result<Option<Hash>> {
+    let objects_dir = repo.join(".itehaas").join("objects");
+    if !objects_dir.exists() {
+        return Ok(None);
+    }
+    let lower = prefix.to_lowercase();
+    let mut candidates = Vec::new();
+    for entry in walkdir::WalkDir::new(&objects_dir).min_depth(2).max_depth(2) {
+        let e = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let p = e.path();
+        if p.is_file() {
+            let parent = p.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let file = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let hex = format!("{}{}", parent, file);
+            if hex.starts_with(&lower) && hex.len() == algo.hex_len() {
+                if let Ok(h) = Hash::from_hex(algo, &hex) {
+                    candidates.push(h);
+                    if candidates.len() > 1 {
+                        // Ambiguous
+                        return Err(ItehaasError::Other(format!("ambiguous short hash: {}", prefix)));
+                    }
+                }
+            }
+        }
+    }
+    if candidates.len() == 1 {
+        Ok(Some(candidates.into_iter().next().unwrap()))
+    } else {
+        Ok(None)
+    }
 }
 
 /// List all branches (refs/heads/*)
