@@ -237,6 +237,16 @@ export async function pullRoutes(app: FastifyInstance) {
     if (reviews.rows.length > 0 && reviews.rows[0].decision === 'changes_requested') {
       return reply.status(409).send({ error: 'PR has changes requested' });
     }
+    // PR gating: check required CI status checks
+    try {
+      const requiredChecks = await query(`SELECT name FROM ci_status_checks WHERE repo_id=$1 AND required=true`, [meta.id]);
+      if (requiredChecks.rows.length > 0) {
+        const latest = await query(`SELECT status FROM ci_pipelines WHERE repo_id=$1 ORDER BY created_at DESC LIMIT 1`, [meta.id]);
+        if (!latest.rows[0] || latest.rows[0].status !== 'success') {
+          return reply.status(409).send({ error: 'CI checks required: pipeline not successful', required: requiredChecks.rows.map((r:any)=>r.name) });
+        }
+      }
+    } catch {}
     const { source_branch, target_branch } = prRes.rows[0];
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }

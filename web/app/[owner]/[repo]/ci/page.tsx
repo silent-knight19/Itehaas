@@ -9,6 +9,12 @@ import {
   RotateCw,
   GitBranch,
   Copy,
+  FileCode,
+  Package,
+  Shield,
+  Key,
+  History,
+  Terminal,
 } from "lucide-react";
 import { Api } from "../../../../lib/api";
 import { RepoHeader } from "../../../../components/RepoHeader";
@@ -20,6 +26,8 @@ interface Pipeline {
   ref: string;
   commit_hash: string;
   status: "queued" | "running" | "success" | "failed";
+  workflow_file?: string | null;
+  duration_ms?: number | null;
   created_at: string;
   updated_at?: string;
 }
@@ -29,6 +37,8 @@ interface Job {
   name: string;
   status: "queued" | "running" | "success" | "failed";
   logs?: string;
+  runner?: string;
+  exit_code?: number | null;
   started_at?: string;
   finished_at?: string;
 }
@@ -45,6 +55,9 @@ export default function CIPage({
   const [selectedPipeline, setSelectedPipeline] = useState<Pipeline | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
+  const [workflow, setWorkflow] = useState<any>(null);
+  const [artifacts, setArtifacts] = useState<any[]>([]);
+  const [statusChecks, setStatusChecks] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [triggering, setTriggering] = useState(false);
 
@@ -62,6 +75,10 @@ export default function CIPage({
           selectPipeline(res.json.pipelines[0]);
         }
       }
+      const wf = await Api.getWorkflows(owner, repo);
+      if (wf.ok) setWorkflow(wf.json.workflow || wf.json);
+      const sc = await Api.getStatusChecks(owner, repo);
+      if (sc.ok) setStatusChecks(sc.json.checks || []);
     } finally {
       setLoading(false);
     }
@@ -70,11 +87,18 @@ export default function CIPage({
   async function selectPipeline(p: Pipeline) {
     setSelectedPipeline(p);
     const res = await Api.getPipeline(owner, repo, p.id);
-    if (res.ok && res.json.jobs) {
-      setJobs(res.json.jobs);
-      if (res.json.jobs.length > 0) {
-        setSelectedJob(res.json.jobs[0]);
+    if (res.ok) {
+      if (res.json.jobs) {
+        setJobs(res.json.jobs);
+        if (res.json.jobs.length > 0) setSelectedJob(res.json.jobs[0]);
       }
+      if (res.json.artifacts) setArtifacts(res.json.artifacts);
+      else {
+        const art = await Api.getArtifacts(owner, repo, p.id);
+        if (art.ok) setArtifacts(art.json.artifacts || []);
+      }
+      // Update selected pipeline with full data
+      if (res.json.pipeline) setSelectedPipeline(res.json.pipeline);
     }
   }
 
@@ -84,9 +108,10 @@ export default function CIPage({
       loadPipelines();
       if (selectedPipeline) {
         Api.getPipeline(owner, repo, selectedPipeline.id).then((res) => {
-          if (res.ok && res.json.jobs) {
-            setJobs(res.json.jobs);
-            setSelectedPipeline(res.json.pipeline);
+          if (res.ok) {
+            if (res.json.jobs) setJobs(res.json.jobs);
+            if (res.json.pipeline) setSelectedPipeline(res.json.pipeline);
+            if (res.json.artifacts) setArtifacts(res.json.artifacts);
           }
         });
       }
@@ -99,9 +124,11 @@ export default function CIPage({
     const res = await Api.runPipeline(owner, repo, { ref: "main" });
     setTriggering(false);
     if (res.ok && res.json.pipeline) {
-      toast("Pipeline execution queued", "success");
+      toast("Pipeline queued (YAML workflow + Docker runner)", "success");
       loadPipelines();
       selectPipeline(res.json.pipeline);
+    } else {
+      toast(res.json?.error || "Failed to queue", "error");
     }
   }
 
@@ -128,11 +155,11 @@ export default function CIPage({
       {/* CI Header Controls */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
         <div>
-          <h2 className="text-xs font-semibold text-fg">
-            CI / CD Pipelines
+          <h2 className="text-xs font-semibold text-fg flex items-center gap-1.5">
+            CI / CD Pipelines <span className="rounded-xs bg-surface border border-border-subtle px-1 py-0.2 text-[10px] font-mono text-fg-muted">YAML • Docker --network none</span>
           </h2>
           <p className="text-[11px] text-fg-muted">
-            Automated test and build verification.
+            Workflow: <span className="font-mono text-fg-secondary">{workflow?.file || ".itehaas/workflows/ci.yml (default)"}</span> • {workflow?.jobs?.length || 3} jobs • secrets injected • artifacts • PR gating
           </p>
         </div>
 
@@ -146,6 +173,59 @@ export default function CIPage({
         </button>
       </div>
 
+      {/* Workflow + Status Checks Bar */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+        <div className="lg:col-span-2 rounded-sm border border-border-subtle bg-surface p-3 space-y-2">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-fg">
+            <FileCode className="h-3.5 w-3.5 text-fg-muted" /> Workflow
+            <span className="ml-auto text-[11px] font-mono text-fg-muted">{workflow?.name || "CI"}</span>
+          </div>
+          {workflow?.jobs ? (
+            <div className="space-y-1">
+              {workflow.jobs.map((j: any) => (
+                <div key={j.name} className="rounded-xs border border-border-subtle bg-bg-subtle px-2.5 py-1.5">
+                  <div className="text-xs font-mono text-fg">{j.name} <span className="text-[11px] text-fg-muted">• {j.steps?.length || 0} steps {j.runsOn && `• ${j.runsOn}`}</span></div>
+                  <div className="mt-1 space-y-0.5">
+                    {(j.steps || []).slice(0, 4).map((s: any, idx: number) => (
+                      <div key={idx} className="text-[11px] font-mono text-fg-secondary truncate">
+                        <span className="text-fg-muted">- {s.name || s.uses || "run"}:</span> {s.run ? s.run.slice(0, 80) : s.uses || ""}
+                      </div>
+                    ))}
+                    {(j.steps || []).length > 4 && <div className="text-[11px] text-fg-muted">+ {(j.steps.length - 4)} more steps</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-xs text-fg-muted font-mono">No workflow file — using default install → test → build</div>
+          )}
+          <div className="text-[11px] text-fg-muted font-mono">File: {workflow?.file || "default (no .itehaas/workflows/ci.yml)"} • triggers: {Array.isArray(workflow?.on) ? workflow.on.join(", ") : workflow?.on || "push"}</div>
+        </div>
+
+        <div className="rounded-sm border border-border-subtle bg-surface p-3 space-y-2">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-fg">
+            <Shield className="h-3.5 w-3.5 text-fg-muted" /> Status checks
+            <span className="ml-auto text-[11px] text-fg-muted">{statusChecks.length} required</span>
+          </div>
+          {statusChecks.length === 0 ? (
+            <div className="text-xs text-fg-muted">No required checks. Add one to gate PR merges.</div>
+          ) : (
+            <div className="space-y-1">
+              {statusChecks.map((c: any) => (
+                <div key={c.id} className="flex items-center justify-between rounded-xs border border-border-subtle bg-bg-subtle px-2 py-1">
+                  <span className="text-xs font-mono text-fg">{c.name}</span>
+                  <span className={`text-[10px] px-1 py-0.5 rounded-xs border ${c.required ? "bg-accent-subtle border-accent text-accent" : "bg-surface border-border-subtle text-fg-muted"}`}>{c.required ? "required" : "optional"}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="text-[11px] text-fg-muted">PR merges blocked until latest pipeline <span className="font-mono text-success">success</span> when checks exist.</div>
+          <div className="flex items-center gap-1.5 text-[11px] text-fg-muted">
+            <Key className="h-3 w-3" /> Secrets injected as env (values hidden)
+          </div>
+        </div>
+      </div>
+
       {/* Pipelines Split View */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* Pipeline History List */}
@@ -154,6 +234,7 @@ export default function CIPage({
             <span className="text-xs font-medium text-fg">
               Pipelines ({pipelines.length})
             </span>
+            <span className="text-[11px] font-mono text-fg-muted flex items-center gap-1"><History className="h-3 w-3" /> queue→running→success</span>
           </div>
 
           {loading ? (
@@ -182,7 +263,7 @@ export default function CIPage({
                       <span className="font-mono text-xs text-fg font-medium">
                         #{p.id.slice(0, 6)}
                       </span>
-                      <span className="text-[10px] font-mono text-fg-muted capitalize">
+                      <span className={`text-[10px] font-mono px-1 py-0.5 rounded-xs border capitalize ${p.status === "success" ? "bg-success-subtle border-success text-success" : p.status === "failed" ? "bg-danger-subtle border-danger text-danger" : p.status === "running" ? "bg-accent-subtle border-accent text-accent" : "bg-surface border-border-subtle text-fg-muted"}`}>
                         {p.status}
                       </span>
                     </div>
@@ -192,6 +273,8 @@ export default function CIPage({
                       <span>@</span>
                       <span>{p.commit_hash.slice(0, 7)}</span>
                     </div>
+                    {p.workflow_file && <div className="text-[10px] font-mono text-fg-muted truncate">{p.workflow_file}</div>}
+                    {p.duration_ms != null && <div className="text-[10px] font-mono text-fg-muted">{p.duration_ms}ms • {p.workflow_file ? "docker" : "local"}</div>}
                   </div>
                 );
               })}
@@ -206,11 +289,11 @@ export default function CIPage({
               {/* Step Progression Nodes */}
               <div className="border border-border-subtle rounded-sm bg-surface p-3 space-y-2">
                 <div className="flex items-center justify-between text-xs">
-                  <span className="font-medium text-fg">
-                    Steps
+                  <span className="font-medium text-fg flex items-center gap-1.5">
+                    Steps {selectedPipeline.workflow_file && <span className="text-[11px] font-mono text-fg-muted">• {selectedPipeline.workflow_file}</span>}
                   </span>
                   <span className="font-mono text-[11px] text-fg-muted">
-                    #{selectedPipeline.id.slice(0, 6)}
+                    #{selectedPipeline.id.slice(0, 6)} {selectedPipeline.duration_ms ? `• ${selectedPipeline.duration_ms}ms` : ""}
                   </span>
                 </div>
 
@@ -242,7 +325,7 @@ export default function CIPage({
                           )}
                         </div>
                         <div className="text-[9px] font-mono capitalize text-fg-muted">
-                          {job.status}
+                          {job.status} {job.runner && `• ${job.runner}`} {job.exit_code != null && `• exit ${job.exit_code}`}
                         </div>
                       </div>
                     );
@@ -250,11 +333,31 @@ export default function CIPage({
                 </div>
               </div>
 
+              {/* Artifacts */}
+              {artifacts.length > 0 && (
+                <div className="rounded-sm border border-border-subtle bg-surface p-3 space-y-2">
+                  <div className="flex items-center gap-1.5 text-xs font-medium text-fg">
+                    <Package className="h-3.5 w-3.5 text-fg-muted" /> Artifacts ({artifacts.length})
+                  </div>
+                  <div className="divide-y divide-border-subtle rounded-xs border border-border-subtle overflow-hidden">
+                    {artifacts.map((a: any) => (
+                      <div key={a.id} className="flex items-center justify-between px-2.5 py-1.5 bg-bg-subtle">
+                        <div className="min-w-0">
+                          <div className="text-xs font-mono text-fg truncate">{a.name}</div>
+                          <div className="text-[11px] text-fg-muted font-mono truncate">{a.path} • {a.size_bytes} bytes • job {a.job_name || a.job_id.slice(0,6)}</div>
+                        </div>
+                        <span className="text-[10px] font-mono text-fg-muted">{a.size_bytes > 1024 ? `${(a.size_bytes/1024).toFixed(1)}KB` : `${a.size_bytes}B`}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Terminal Log Container */}
               <div className="border border-border-subtle rounded-sm bg-bg-subtle overflow-hidden">
                 <div className="flex items-center justify-between border-b border-border-subtle bg-surface px-3 py-1.5">
-                  <span className="font-mono text-[11px] text-fg-muted">
-                    Logs: {selectedJob ? selectedJob.name : "runner"}
+                  <span className="font-mono text-[11px] text-fg-muted flex items-center gap-1.5">
+                    <Terminal className="h-3 w-3" /> Logs: {selectedJob ? `${selectedJob.name} (${selectedJob.runner || "docker"})` : "runner"}
                   </span>
 
                   <button

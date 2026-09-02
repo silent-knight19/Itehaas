@@ -185,15 +185,31 @@ export const Api = {
   addReviewComment: (owner: string, repo: string, id: string, payload: { body: string; path: string; line?: number; side?: 'LEFT' | 'RIGHT' | 'UNIFIED'; commit_hash?: string }) =>
     api(`/api/repos/${owner}/${repo}/pulls/${id}/review_comments`, { method: 'POST', body: JSON.stringify(payload) }),
 
-  // CI / CD
+  // CI / CD — Real (YAML workflow, Docker runner, artifacts, status checks)
   listPipelines: (owner: string, repo: string) =>
     api(`/api/repos/${owner}/${repo}/ci/pipelines`),
   getPipeline: (owner: string, repo: string, id: string) =>
     api(`/api/repos/${owner}/${repo}/ci/pipelines/${id}`),
-  runPipeline: (owner: string, repo: string, payload: { ref?: string; commit?: string }) =>
+  runPipeline: (owner: string, repo: string, payload: { ref?: string; commit?: string; workflow?: any }) =>
     api(`/api/repos/${owner}/${repo}/ci/run`, { method: 'POST', body: JSON.stringify(payload) }),
   getJobLogs: (owner: string, repo: string, jobId: string) =>
     api(`/api/repos/${owner}/${repo}/ci/jobs/${jobId}/logs`),
+  getWorkflows: (owner: string, repo: string) =>
+    api(`/api/repos/${owner}/${repo}/ci/workflows`),
+  getArtifacts: (owner: string, repo: string, pipelineId: string) =>
+    api(`/api/repos/${owner}/${repo}/ci/pipelines/${pipelineId}/artifacts`),
+  getStatusChecks: (owner: string, repo: string) =>
+    api(`/api/repos/${owner}/${repo}/ci/status_checks`),
+  createStatusCheck: (owner: string, repo: string, payload: { name: string; required?: boolean }) =>
+    api(`/api/repos/${owner}/${repo}/ci/status_checks`, { method: 'POST', body: JSON.stringify(payload) }),
+  deleteStatusCheck: (owner: string, repo: string, id: string) =>
+    api(`/api/repos/${owner}/${repo}/ci/status_checks/${id}`, { method: 'DELETE' }),
+  getPRChecks: (owner: string, repo: string, prId: string) =>
+    api(`/api/repos/${owner}/${repo}/ci/pr/${prId}/checks`),
+  getSecrets: (owner: string, repo: string) =>
+    api(`/api/repos/${owner}/${repo}/ci/secrets`),
+  createSecret: (owner: string, repo: string, payload: { key: string; value: string }) =>
+    api(`/api/repos/${owner}/${repo}/ci/secrets`, { method: 'POST', body: JSON.stringify(payload) }),
 
   // Remotes
   listRemotes: (owner: string, repo: string) =>
