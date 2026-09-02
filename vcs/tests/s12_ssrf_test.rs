@@ -29,6 +29,18 @@ fn test_private_ip_blocked() {
         "http://[::1]:3001/api/repos/a/b",
         "http://[fc00::1]/api/repos/a/b",
         "http://[fe80::1]/api/repos/a/b",
+        // S13: IPv4-mapped IPv6 variants
+        "http://[::ffff:127.0.0.1]/api/repos/a/b",
+        "http://[::ffff:169.254.169.254]/api/repos/a/b",
+        "http://[::ffff:10.0.0.1]/api/repos/a/b",
+        "http://[::ffff:192.168.1.1]/api/repos/a/b",
+        // S13: Cloud metadata and internal domains
+        "http://metadata.google.internal/api/repos/a/b",
+        "http://instance-data.internal/api/repos/a/b",
+        "http://kubernetes.default.svc.cluster.local/api/repos/a/b",
+        // S13: Carrier-grade NAT (100.64.0.0/10)
+        "http://100.64.0.1/api/repos/a/b",
+        "http://100.127.255.254/api/repos/a/b",
     ];
     for url in cases {
         let res = validate_http_base(url);

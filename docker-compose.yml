@@ -20,22 +20,27 @@ services:
 
   server:
     build:
-      context: ./server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: server/Dockerfile
     ports:
       - "127.0.0.1:3001:3001"
     environment:
-      DATABASE_URL: postgres://itehaas:itehaas@db:5432/itehaas
+      DATABASE_URL: ${DATABASE_URL:-postgres://itehaas:${POSTGRES_PASSWORD:-itehaas}@db:5432/itehaas}
       REPOS_ROOT: /data/repos
       ITEHAAS_BIN: /usr/local/bin/itehaas
-      COOKIE_SECRET: change-me-in-production
-      NODE_ENV: production
+      COOKIE_SECRET: ${COOKIE_SECRET:-change-me-in-production} # CHANGE ME: set 32+ char secret in .env for production
+      NODE_ENV: ${NODE_ENV:-development}
     volumes:
       - ./data/repos:/data/repos
-      - ./target/debug/itehaas:/usr/local/bin/itehaas:ro
+      # SEC-026: Host binary mount removed — itehaas binary is compiled in multi-stage Dockerfile for target architecture
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     command: ["node", "dist/index.js"]
     user: "65534:65534"
     read_only: true

@@ -48,4 +48,28 @@ describe('S17 Deployment / Host Hardening', () => {
     const content = fs.readFileSync('../docker-compose.yml', 'utf8');
     expect(content).toContain('CHANGE ME');
   });
+
+  it('SEC-026: Docker host binary mount removed and multi-stage container build enabled', async () => {
+    const compose = fs.readFileSync('../docker-compose.yml', 'utf8');
+    const lines = compose.split('\n').filter(l => !l.trim().startsWith('#'));
+    const hostBinaryMount = lines.some(l => l.includes('./target/debug/itehaas'));
+    expect(hostBinaryMount).toBe(false);
+
+    const serverDocker = fs.readFileSync('../server/Dockerfile', 'utf8');
+    expect(serverDocker).toContain('AS vcs-builder');
+    expect(serverDocker).toContain('USER node');
+
+    const webDocker = fs.readFileSync('../web/Dockerfile', 'utf8');
+    expect(webDocker).toContain('USER node');
+  });
+
+  it('S17-07: .dockerignore files exclude sensitive files and build caches', async () => {
+    expect(fs.existsSync('../.dockerignore')).toBe(true);
+    expect(fs.existsSync('../server/.dockerignore')).toBe(true);
+    expect(fs.existsSync('../web/.dockerignore')).toBe(true);
+
+    const rootIgnore = fs.readFileSync('../.dockerignore', 'utf8');
+    expect(rootIgnore).toContain('.env');
+    expect(rootIgnore).toContain('node_modules');
+  });
 });

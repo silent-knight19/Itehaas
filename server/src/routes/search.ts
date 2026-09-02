@@ -33,7 +33,7 @@ export async function searchRoutes(app: FastifyInstance) {
                FROM repositories r JOIN users u ON r.owner_id=u.id
                WHERE (r.visibility='public' OR r.owner_id=$1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id=r.id AND m.user_id=$1))
                  AND (r.name ILIKE $2 OR r.description ILIKE $2 OR u.username ILIKE $2)
-               ORDER BY r.updated_at DESC LIMIT $${3} OFFSET $${4}`;
+                ORDER BY r.updated_at DESC LIMIT $3 OFFSET $4`;
         params = [userId, search, lim, off];
       } else {
         sql = `SELECT r.id, r.name, r.description, r.visibility, r.updated_at, u.username as owner
@@ -54,7 +54,7 @@ export async function searchRoutes(app: FastifyInstance) {
                FROM issues i JOIN repositories r ON i.repo_id=r.id JOIN users u ON r.owner_id=u.id
                WHERE (r.visibility='public' OR r.owner_id=$1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id=r.id AND m.user_id=$1))
                  AND (i.title ILIKE $2 OR i.body ILIKE $2)
-               ORDER BY i.updated_at DESC LIMIT $${3} OFFSET $${4}`;
+               ORDER BY i.updated_at DESC LIMIT $3 OFFSET $4`;
         params = [userId, search, lim, off];
       } else {
         sql = `SELECT i.id, i.title, i.body, i.status, i.repo_id, r.name as repo, u.username as repo_owner
@@ -75,7 +75,7 @@ export async function searchRoutes(app: FastifyInstance) {
                FROM pull_requests pr JOIN repositories r ON pr.repo_id=r.id JOIN users u ON r.owner_id=u.id
                WHERE (r.visibility='public' OR r.owner_id=$1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id=r.id AND m.user_id=$1))
                  AND (pr.title ILIKE $2 OR pr.body ILIKE $2)
-               ORDER BY pr.updated_at DESC LIMIT $${3} OFFSET $${4}`;
+               ORDER BY pr.updated_at DESC LIMIT $3 OFFSET $4`;
         params = [userId, search, lim, off];
       } else {
         sql = `SELECT pr.id, pr.title, pr.body, pr.status, pr.repo_id, r.name as repo, u.username as repo_owner

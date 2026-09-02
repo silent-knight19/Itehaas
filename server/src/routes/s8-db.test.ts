@@ -7,17 +7,34 @@ vi.mock('../db', async (importOriginal) => {
   const actual: any = await importOriginal();
   return {
     ...actual,
-  query: (...args: any[]) => mockQuery(...args),
-  getClient: (...args: any[]) => mockGetClient(...args),
-  pool: {
-    on: vi.fn((event: string, cb: any) => {
-      if (event === 'connect') {
-        // Simulate connect: call cb with mock client
-        // cb({ query: () => Promise.resolve() })
-      }
-    }),
     query: (...args: any[]) => mockQuery(...args),
-  },
+    getClient: (...args: any[]) => mockGetClient(...args),
+    withTransaction: async (fn: any) => {
+      const client = await mockGetClient();
+      try {
+        await client.query('BEGIN');
+        const res = await fn(client);
+        await client.query('COMMIT');
+        return res;
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {}
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
+    pool: {
+      connect: (...args: any[]) => mockGetClient(...args),
+      on: vi.fn((event: string, cb: any) => {
+        if (event === 'connect') {
+          // Simulate connect: call cb with mock client
+          // cb({ query: () => Promise.resolve() })
+        }
+      }),
+      query: (...args: any[]) => mockQuery(...args),
+    },
   };
 });
 
@@ -166,5 +183,52 @@ describe('S8 Database / SQL Security', () => {
     expect(deleteCalled).toBe(true);
     vi.restoreAllMocks();
     await app.close();
+  });
+
+  it('S8-05 withTransaction commits and releases on success', async () => {
+    const { withTransaction } = await import('../db/index');
+    let beginCalled = false;
+    let commitCalled = false;
+    let releaseCalled = false;
+    const client = {
+      query: vi.fn(async (q: string) => {
+        if (q === 'BEGIN') beginCalled = true;
+        if (q === 'COMMIT') commitCalled = true;
+        return { rows: [] };
+      }),
+      release: vi.fn(() => { releaseCalled = true; }),
+    };
+    mockGetClient.mockResolvedValue(client);
+
+    const res = await withTransaction(async (c) => {
+      await c.query('INSERT INTO something VALUES (1)');
+      return 'success_val';
+    });
+
+    expect(res).toBe('success_val');
+    expect(beginCalled).toBe(true);
+    expect(commitCalled).toBe(true);
+    expect(releaseCalled).toBe(true);
+  });
+
+  it('S8-05 withTransaction executes ROLLBACK and releases on failure', async () => {
+    const { withTransaction } = await import('../db/index');
+    let rollbackCalled = false;
+    let releaseCalled = false;
+    const client = {
+      query: vi.fn(async (q: string) => {
+        if (q === 'ROLLBACK') rollbackCalled = true;
+        return { rows: [] };
+      }),
+      release: vi.fn(() => { releaseCalled = true; }),
+    };
+    mockGetClient.mockResolvedValue(client);
+
+    await expect(withTransaction(async () => {
+      throw new Error('database constraint violated');
+    })).rejects.toThrow('database constraint violated');
+
+    expect(rollbackCalled).toBe(true);
+    expect(releaseCalled).toBe(true);
   });
 });

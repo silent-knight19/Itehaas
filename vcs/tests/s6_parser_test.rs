@@ -176,3 +176,47 @@ fn test_pack_entry_declared_length_limit() {
     let err = format!("{:?}", res.unwrap_err());
     assert!(err.contains("too large"));
 }
+
+#[test]
+fn test_tree_cycle_detection() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo_cycle");
+    fs::create_dir_all(&repo).unwrap();
+    init(&repo, HashAlgo::Sha256).unwrap();
+    let algo = itehaas_lib::config::read_hasher(&repo).unwrap();
+    let hasher = itehaas_lib::hash::new_hasher(algo).unwrap();
+
+    let dummy_hash = Hash { algo: HashAlgo::Sha256, bytes: vec![1u8; 32] };
+    let entry_a = TreeEntry::new(0o100644, "file.txt".into(), dummy_hash).unwrap();
+    let tree_a = Tree::new(vec![entry_a]).unwrap();
+    let hash_a = itehaas_lib::object::store::write_object(&repo, &Object::Tree(tree_a), hasher.as_ref()).unwrap();
+
+    // Verify normal flatten works
+    let normal_map = itehaas_lib::tree_builder::flatten_tree_root(&repo, &hash_a, hasher.as_ref()).unwrap();
+    assert_eq!(normal_map.len(), 1);
+
+    // Now test cycle detection: if hash_a is already in active ancestors, it must reject immediately with cycle detected
+    let mut active = std::collections::BTreeSet::new();
+    active.insert(hash_a.hex());
+    let mut out = std::collections::BTreeMap::new();
+    let res = itehaas_lib::tree_builder::flatten_tree_with_ancestors(&repo, &hash_a, hasher.as_ref(), "", &mut out, 0, &mut active);
+    assert!(res.is_err());
+    let err = format!("{:?}", res.unwrap_err());
+    assert!(err.contains("cycle detected"), "expected cycle error, got: {}", err);
+}
+
+#[test]
+fn test_signature_rejection_crlf_null() {
+    use itehaas_lib::object::commit::Signature;
+
+    // CRLF in name or email must be rejected
+    assert!(Signature::new("User\r\nInjected".into(), "user@example.com".into(), 0, "+0000".into()).is_err());
+    assert!(Signature::new("User".into(), "user@example.com\r\ninjected".into(), 0, "+0000".into()).is_err());
+
+    // Null bytes must be rejected
+    assert!(Signature::new("User\0bad".into(), "user@example.com".into(), 0, "+0000".into()).is_err());
+    assert!(Signature::new("User".into(), "user@example.com\0bad".into(), 0, "+0000".into()).is_err());
+
+    // Valid signature must succeed
+    assert!(Signature::new("Alice User".into(), "alice@example.com".into(), 1600000000, "+0530".into()).is_ok());
+}

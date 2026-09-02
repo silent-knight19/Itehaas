@@ -26,20 +26,45 @@ pub struct HttpRefs {
     pub hasher: String,
 }
 
-/// Build an ureq agent with sane timeouts and TLS verification on.
+/// S13/SEC-018: DNS Rebinding defense.
+/// Resolves hostname and validates all resolved IP addresses immediately prior to socket connection.
+struct SafeResolver;
+
+impl ureq::Resolver for SafeResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+        let allow_private = std::env::var("ALLOW_PRIVATE_REMOTES").map(|v| v == "true" || v == "1").unwrap_or(false)
+            || std::env::var("ALLOW_LOCALHOST_REMOTE").map(|v| v == "true" || v == "1").unwrap_or(false);
+        for a in &addrs {
+            if !allow_private && is_private_ip(&a.ip()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("SSRF protection: resolved to private IP {:?}", a.ip()),
+                ));
+            }
+        }
+        Ok(addrs)
+    }
+}
+
+/// Build an ureq agent with sane timeouts, pinned SafeResolver, and TLS verification on.
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_read(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .timeout_write(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .timeout_connect(std::time::Duration::from_secs(10))
         .redirects(0) // S12: do not follow redirects to avoid SSRF via redirect to private IP
+        .resolver(SafeResolver)
         .build()
 }
 
 fn is_private_host(host: &str) -> bool {
-    // S12/SEC-016: Localhost is a loopback host. Block by default unless explicitly allowed for testing.
+    // S12/SEC-016/S13: Localhost and cloud metadata hostnames are blocked by default.
     let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.starts_with("localhost:") {
+    if lower == "localhost" || lower.starts_with("localhost:")
+        || lower == "metadata.google.internal" || lower.starts_with("metadata.google.internal:")
+        || lower.ends_with(".internal") || lower.ends_with(".local") {
         let allow = std::env::var("ALLOW_PRIVATE_REMOTES").map(|v| v == "true" || v == "1").unwrap_or(false)
             || std::env::var("ALLOW_LOCALHOST_REMOTE").map(|v| v == "true" || v == "1").unwrap_or(false);
         return !allow;
@@ -96,20 +121,33 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
             if oct[0] == 192 && oct[1] == 168 { return true; }
             // 169.254.0.0/16 link-local
             if oct[0] == 169 && oct[1] == 254 { return true; }
-            // 0.0.0.0
-            if oct[0] == 0 && oct[1] == 0 && oct[2] == 0 && oct[3] == 0 { return true; }
+            // 100.64.0.0/10 Carrier-Grade NAT (CGNAT)
+            if oct[0] == 100 && (64..=127).contains(&oct[1]) { return true; }
+            // 0.0.0.0/8 (RFC 1122 "this network")
+            if oct[0] == 0 { return true; }
+            // 240.0.0.0/4 Reserved
+            if oct[0] >= 240 { return true; }
             false
         }
         std::net::IpAddr::V6(v6) => {
             // ::1 loopback
             if v6.is_loopback() { return true; }
+            // :: (unspecified)
+            if v6.is_unspecified() { return true; }
+            // S13: Check IPv4-mapped IPv6 (::ffff:127.0.0.1, etc.)
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(&std::net::IpAddr::V4(v4));
+            }
+            if let Some(v4) = v6.to_ipv4() {
+                if is_private_ip(&std::net::IpAddr::V4(v4)) {
+                    return true;
+                }
+            }
             // fc00::/7 unique local
             let seg0 = v6.segments()[0];
             if (seg0 & 0xfe00) == 0xfc00 { return true; }
             // fe80::/10 link-local
             if (seg0 & 0xffc0) == 0xfe80 { return true; }
-            // :: (unspecified)
-            if v6.is_unspecified() { return true; }
             false
         }
     }

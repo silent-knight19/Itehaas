@@ -360,4 +360,235 @@ describe('S3 Authorization Matrix', () => {
     expect(res.statusCode).toBe(404);
     await app.close();
   });
+
+  it('SEC-006: POST /api/orgs/:org/teams/:team/repos rejects attaching repository if user is not repo admin', async () => {
+    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return { rows: [users.alice] };
+      }
+      if (text.includes('SELECT id FROM organizations WHERE name=$1')) {
+        return { rows: [{ id: 'org-acme' }] };
+      }
+      if (text.includes('SELECT id FROM teams WHERE org_id=$1 AND name=$2')) {
+        return { rows: [{ id: 'team-devs' }] };
+      }
+      if (text.includes('SELECT role FROM organization_members WHERE org_id=$1 AND user_id=$2')) {
+        return { rows: [{ role: 'owner' }] };
+      }
+      if (text.includes('FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2')) {
+        return { rows: [{ id: 'repo-victim' }] };
+      }
+      if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) {
+        return { rows: [{ owner_id: 'u-charlie' }] }; // Alice is not owner
+      }
+      if (text.includes('SELECT role FROM repository_members WHERE repo_id = $1 AND user_id = $2')) {
+        return { rows: [] }; // Alice is not member
+      }
+      if (text.includes('SELECT tr.permission FROM team_members tm')) {
+        return { rows: [] };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/orgs/acme/teams/devs/repos',
+      headers: { cookie: `itehaas_session=${sessionIdFor(users.alice)}` },
+      payload: { owner: 'charlie', repo: 'secret', permission: 'admin' },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toMatch(/admin permission required on target repository/);
+    await app.close();
+  });
+
+  it('SEC-007: POST /api/repos/:owner/:repo/remotes rejects filesystem remotes and URL credentials', async () => {
+    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return { rows: [users.alice] };
+      }
+      if (text.includes('FROM repositories r JOIN users u')) {
+        return { rows: [{ id: 'repo-alice' }] };
+      }
+      if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) {
+        return { rows: [{ owner_id: 'u-alice' }] };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    // file:// attempt
+    const resFile = await app.inject({
+      method: 'POST',
+      url: '/api/repos/alice/public/remotes',
+      headers: { cookie: `itehaas_session=${sessionIdFor(users.alice)}` },
+      payload: { name: 'exploit', url: 'file:///var/data/repos/victim/private.git' },
+    });
+    expect(resFile.statusCode).toBe(400);
+    expect(resFile.json().error).toMatch(/must be http:\/\/ or https:\/\//);
+
+    // Relative path attempt
+    const resRel = await app.inject({
+      method: 'POST',
+      url: '/api/repos/alice/public/remotes',
+      headers: { cookie: `itehaas_session=${sessionIdFor(users.alice)}` },
+      payload: { name: 'exploit', url: '../../victim/private.git' },
+    });
+    expect(resRel.statusCode).toBe(400);
+
+    // Credentials in URL attempt
+    const resCred = await app.inject({
+      method: 'POST',
+      url: '/api/repos/alice/public/remotes',
+      headers: { cookie: `itehaas_session=${sessionIdFor(users.alice)}` },
+      payload: { name: 'exploit', url: 'https://user:password@example.com/repo.git' },
+    });
+    expect(resCred.statusCode).toBe(400);
+    expect(resCred.json().error).toMatch(/credentials in remote url are not permitted/);
+    await app.close();
+  });
+
+  it('SEC-011: PATCH /api/repos/:owner/:repo/issues/:id prevents cross-repository BOLA tampering', async () => {
+    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return { rows: [users.bobWrite] };
+      }
+      if (text.includes('FROM repositories r JOIN users u')) {
+        return { rows: [{ id: 'repo-bob', visibility: 'public' }] };
+      }
+      // Scoped query checks id=$1 AND repo_id=$2. Return 0 rows if issue doesn't belong to repo-bob
+      if (text.includes('SELECT author_id, repo_id FROM issues WHERE id=$1 AND repo_id=$2')) {
+        return { rows: [] };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/repos/bob/public/issues/issue-foreign-123',
+      headers: { cookie: `itehaas_session=${sessionIdFor(users.bobWrite)}` },
+      payload: { title: 'hacked title' },
+    });
+    expect(res.statusCode).toBe(404);
+    await app.close();
+  });
+
+  it('SEC-012: DELETE /api/repos/:owner/:repo/pulls/:id/reviewers/:username requires author or write permission', async () => {
+    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return { rows: [users.charlie] }; // Charlie has no write permission and is not PR author
+      }
+      if (text.includes('FROM repositories r JOIN users u')) {
+        return { rows: [{ id: 'repo-alice', visibility: 'public', default_branch: 'main' }] };
+      }
+      if (text.includes('SELECT author_id FROM pull_requests WHERE id=$1 AND repo_id=$2')) {
+        return { rows: [{ author_id: 'u-alice' }] }; // Alice is author
+      }
+      if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) {
+        return { rows: [{ owner_id: 'u-alice' }] };
+      }
+      if (text.includes('SELECT role FROM repository_members')) {
+        return { rows: [] };
+      }
+      if (text.includes('SELECT tr.permission FROM team_members')) {
+        return { rows: [] };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/api/repos/alice/public/pulls/pr-123/reviewers/bob',
+      headers: { cookie: `itehaas_session=${sessionIdFor(users.charlie)}` },
+    });
+    expect(res.statusCode).toBe(403);
+    await app.close();
+  });
+
+  it('SEC-022: DELETE /api/repos/:owner/:repo rejects deletion by admin collaborator (owner-only)', async () => {
+    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return { rows: [users.bobWrite] };
+      }
+      if (text.includes('FROM repositories r JOIN users u')) {
+        return { rows: [{ id: 'repo-alice' }] };
+      }
+      if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) {
+        return { rows: [{ owner_id: 'u-alice' }] }; // Bob is NOT the owner
+      }
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/api/repos/alice/public',
+      headers: { cookie: `itehaas_session=${sessionIdFor(users.bobWrite)}` },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toMatch(/only the repository owner/);
+    await app.close();
+  });
+
+  it('SEC-023: POST /api/repos/:owner/:repo/issues allows authenticated user with read access on public repo', async () => {
+    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return { rows: [users.charlie] }; // Charlie has no write role, but repo is public
+      }
+      if (text.includes('FROM repositories r JOIN users u')) {
+        return { rows: [{ id: 'repo-alice', visibility: 'public' }] };
+      }
+      if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) {
+        return { rows: [{ owner_id: 'u-alice' }] };
+      }
+      if (text.includes('SELECT role FROM repository_members')) {
+        return { rows: [] };
+      }
+      if (text.includes('SELECT tr.permission FROM team_members')) {
+        return { rows: [] };
+      }
+      if (text.includes('INSERT INTO issues')) {
+        return { rows: [{ id: 'issue-123', title: 'bug report', body: 'details', status: 'open', created_at: new Date().toISOString() }] };
+      }
+      if (text.includes('INSERT INTO activity')) return { rows: [], rowCount: 1 };
+      if (text.includes('FROM users WHERE id=$1')) return { rows: [{ username: 'alice' }] };
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/repos/alice/public/issues',
+      headers: { cookie: `itehaas_session=${sessionIdFor(users.charlie)}` },
+      payload: { title: 'bug report', body: 'details' },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().issue.title).toBe('bug report');
+    await app.close();
+  });
+
+  it('SEC-005: GET /api/users/:username does not expose email to anonymous viewers', async () => {
+    mockQuery.mockImplementation(async (text: string) => {
+      if (text.includes('SELECT id, username, email, bio, avatar_url, created_at FROM users WHERE username = $1')) {
+        return { rows: [{ id: 'u-alice', username: 'alice', email: 'alice-private@example.com', bio: 'hello', created_at: new Date().toISOString() }] };
+      }
+      if (text.includes('SELECT count(*)::int as c FROM repositories')) return { rows: [{ c: 5 }] };
+      if (text.includes('SELECT count(*)::int as c FROM stars s JOIN repositories')) return { rows: [{ c: 10 }] };
+      if (text.includes('SELECT count(*)::int as c FROM stars WHERE user_id')) return { rows: [{ c: 2 }] };
+      if (text.includes('SELECT count(*)::int as c FROM activity')) return { rows: [{ c: 1 }] };
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/users/alice',
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().user.username).toBe('alice');
+    expect(res.json().user.email).toBeUndefined();
+    await app.close();
+  });
 });

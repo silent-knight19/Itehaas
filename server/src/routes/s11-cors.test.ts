@@ -63,15 +63,21 @@ describe('S11 CORS / CSRF / Headers', () => {
     await app.close();
   });
 
-  it('S11-01 CORS allowlist: in test (dev) origin true allows any, but prod would block', async () => {
+  it('SEC-003 CORS allowlist: untrusted origin is blocked and allowed origin is permitted', async () => {
     const app = await buildApp();
-    const res = await app.inject({
+    const untrustedRes = await app.inject({
       method: 'GET',
       url: '/health',
       headers: { origin: 'https://evil.com' },
     });
-    // In test isProd false, origin:true so ACAO is https://evil.com
-    expect(res.headers['access-control-allow-origin']).toBe('https://evil.com');
+    expect(untrustedRes.headers['access-control-allow-origin']).toBeUndefined();
+
+    const allowedRes = await app.inject({
+      method: 'GET',
+      url: '/health',
+      headers: { origin: 'http://localhost:3000' },
+    });
+    expect(allowedRes.headers['access-control-allow-origin']).toBe('http://localhost:3000');
     await app.close();
   });
 

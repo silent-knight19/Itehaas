@@ -1,133 +1,75 @@
-# Security Phase S12 — SSRF / Outbound Network Security
+# Security Phase S12 — CSRF, CORS, & Defensive Transport Headers
 
-**Status:** ✅ Complete (2026-09-02)
-**Date:** 2026-09-02
-**Owner:** Principal Security Engineer
-**Depends:** S0 ✅ + S1 ✅ + S2 ✅ + S3 ✅ + S4 ✅ + S5 ✅ + S6 ✅ + S7 ✅ + S8 ✅ + S9 ✅ + S10 ✅ + S11 ✅ (browser done)
-**Implemented:** `vcs/src/remote/http.rs:30` `vcs/src/remote/http.rs:54` + `s12_ssrf_test.rs` 4
+**Status:** ✅ Complete  
+**Date:** 2026-09-02  
+**Owner:** Principal Security Engineer  
+**Scope:** Elimination of development CORS wildcard origin reflection ([SEC-003](file:///Users/sachinkumarsingh/Projectss/Itehaas/docs/security/vulnerability-register.md#sec-003--development-cors-wildcard-origin-reflection)), elimination of CSRF double-submit bypass via cookie tossing ([SEC-004](file:///Users/sachinkumarsingh/Projectss/Itehaas/docs/security/vulnerability-register.md#sec-004--cross-subdomain-cookie-tossing-and-session-fixation)), protection of logout against unauthorized cross-origin trigger, origin verification, and preflight max-age caching.
 
 ---
 
 ## 1. Objective
 
-Harden **only server-side outbound requests** — ensure user-controlled URLs (remote clone/fetch) cannot abuse `loopback`, `private`, `link-local`, `IPv6`, `internal DNS`, `redirects`, `DNS rebinding` to access internal services.
-
-Per operator: `remote URLs → clone/fetch → avatars → images → webhooks → integrations → tests against loopback/private/link-local/IPv6/internal DNS/redirects/rebinding → STOP`
+Harden cross-origin resource sharing (CORS), protect against cross-site request forgery (CSRF) across all state-changing endpoints, and prevent session termination / data exfiltration via cookie tossing or unvalidated origin reflection.
 
 ---
 
-## 2. Scope
+## 2. Threat Analysis & Defensive Matrix
 
-**In scope:**
-- `vcs/src/remote/http.rs:54` `validate_http_base` — shape `http(s)://host/api/repos/<owner>/<repo>` + `owner/repo` regex, but still allows `http://127.0.0.1:5432/api/repos/...`, `http://10.0.0.1/api/repos/...`, `http://[::1]/api/repos/...`, `http://169.254.169.254/api/repos/...`
-- `vcs/src/remote/http.rs:30` `agent()` `ureq::AgentBuilder` `timeout_read/write/connect` — redirects not limited, `agent` follows redirects by default
-- `server/src/routes/repos.ts` `execItehaas` with remote URL via `remote add` → `clone/fetch` uses `vcs` http transport
-- `server/src/routes/users.ts:95` `avatar_url` stored but not fetched server-side — no SSRF there, but future `avatar` fetch would need same blocklist
-
-**Out of scope (other phases):**
-- S4 FS `checkout` done, S5 `spawn` done, S11 `CORS` done, S13 `CI` `sh` done
+| Threat | Attack Path | Previous State | Implemented Control (S12) |
+|---|---|---|---|
+| **Permissive CORS with Credentials in Development** (SEC-003) | Fastify CORS was initialized with `origin: true` and `credentials: true` in non-production mode. If a developer visited a malicious website while running Itehaas locally, malicious scripts could issue authenticated cross-origin requests (`credentials: 'include'`) and exfiltrate private source code or session data. | `origin: true` dynamically reflected any `Origin` header. | In `server/src/index.ts:58-85`, replaced `origin: true` with strict allowlist matching. Disallowed origins and `null` origins are strictly rejected with `cb(null, false)`. Added `maxAge: 86400` preflight caching. |
+| **CSRF Bypass via Subdomain Cookie Tossing** (SEC-004) | In `csrfCheck`, if `headerToken && cookieToken && safeCompare(headerToken, cookieToken)` matched, the request was accepted without validating against the server HMAC. An attacker on a sibling subdomain (e.g. `user-site.example.com`) could toss an arbitrary `csrf_token` cookie and send a matching header, bypassing CSRF validation completely. | Permitted arbitrary matching tokens between header and cookie. | Removed the bypass in `server/src/middleware/csrf.ts:68-85`. Enforced that `headerToken` MUST match `csrfTokenForSession(sessionId)`. If a `cookieToken` is provided, it must also match `csrfTokenForSession(sessionId)`, completely neutralizing tossed cookies. |
+| **Forced Logout via Cross-Origin POST** (SEC-004) | `/api/auth/logout` was excluded from CSRF checks in `csrfCheck:23`, allowing attackers to forge cross-origin POST requests terminating user sessions. | Explicit exclusion in `csrfCheck`. | Removed `/api/auth/logout` from the bypass list. Logout now requires CSRF validation or valid origin verification. |
+| **Cross-Origin Spoofing / Null Origin Exploitation** | Attackers use sandboxed iframes (`<iframe sandbox="...">`) or data URIs to generate `Origin: null`. | Null origin was not explicitly rejected. | `csrfCheck` and `fastifyCors` explicitly reject `Origin: 'null'`. |
 
 ---
 
-## 3. Threats (SSRF-specific)
+## 3. Files Modified
 
-| # | Threat | Precond | Impact |
-|---|--------|---------|--------|
-| S1 | Loopback `http://127.0.0.1:3001/api/repos/...` → `GET /refs` | Attacker `remote add origin http://127.0.0.1:3001/api/repos/alice/private` then `itehaas fetch` → server `ureq` fetches loopback `GET /refs` with `ITEHAAS_TOKEN` (if set) → reads private repo refs | Private disclosure, SSRF to self |
-| S2 | Private `http://10.0.0.1:5432/api/repos/...` → `GET` to `10.0.0.1:5432` (internal service) | Attacker `remote add` with private IP and path `/api/repos/...` → `ureq` hits internal service that happens to have same path prefix, or times out probing | Port scan, internal service access |
-| S3 | Link-local `http://169.254.169.254/api/repos/...` → `GET` to cloud metadata `169.254.169.254` (AWS `169.254.169.254/latest/meta-data/` does not contain `/api/repos/`, so blocked by shape, but if attacker can make DNS `evil.com` → `169.254.169.254` via rebinding, shape still `evil.com/api/repos/...` → DNS resolves to `169.254.169.254` → SSRF | Metadata exfil if DNS rebinding bypasses shape check |
-| S4 | IPv6 `http://[::1]/api/repos/...` → `::1` loopback | Same as S1 but IPv6 | Same |
-| S5 | Redirect `302` to `http://127.0.0.1:5432` | `vcs` `ureq` follows redirect by default, even if initial `validate_http_base` was `https://good.com/api/repos/...`, redirect to `http://127.0.0.1` would be followed without re-validation | SSRF via redirect |
-| S6 | DNS rebinding `http://attacker.com/api/repos/...` where `attacker.com` first resolves to `93.184.216.34` (good) then re-resolves to `127.0.0.1` on second fetch (`GET /refs` then `GET /objects/...`) | `validate_http_base` only checks host string, not IP, so rebinding bypasses | SSRF |
+1. `server/src/middleware/csrf.ts`: Enforced HMAC validation on all state-changing requests; removed the `headerToken === cookieToken` bypass; added Origin verification against allowed origins; removed `/api/auth/logout` from CSRF exclusion list.
+2. `server/src/index.ts`: Replaced permissive CORS `origin: true` with strict origin allowlist callback; explicitly rejected `null` origins; configured preflight `maxAge: 86400`.
+3. `server/src/routes/s12-csrf.test.ts`: Created regression test suite verifying SEC-003 and SEC-004 mitigations.
+4. `server/src/routes/s11-cors.test.ts`: Updated CORS assertion to reflect SEC-003 allowlist enforcement.
 
 ---
 
-## 4. Affected Components
+## 4. Verification & Regression Tests
 
-| File:line | Current | Risk |
-|-----------|---------|------|
-| `vcs/src/remote/http.rs:54` `validate_http_base` | `http(s)://` + `/api/repos/<owner>/<repo>` + `owner/repo` regex, but no IP check | S1-S4 |
-| `vcs/src/remote/http.rs:30` `agent()` `ureq::AgentBuilder` `timeout_read/write/connect` | no `redirects(0)` | S5 |
-| `vcs/src/remote/http.rs:96` `apply_auth` `Authorization: Bearer` + `Cookie` | sends token to any host that passes `validate_http_base`, including private IP | S1 |
-
----
-
-## 5. Current Controls (what is already good)
-
-- `validate_http_base` requires `http(s)://` + `/api/repos/` + `owner/repo` regex `^[a-zA-Z0-9._-]{1,100}$` — blocks arbitrary `http://127.0.0.1:80/`, `http://169.254.169.254/latest/meta-data/` (no `/api/repos/`), `http://evil.com/`, `http://127.0.0.1:5432` without `/api/repos/` — **good shape, but not IP**
-- `token_from_env` `ITEHAAS_TOKEN`/`ITEHAAS_SESSION` only sent if `validate_http_base` passed — not sent to arbitrary host
-- `ureq` `timeout_read/write 30s` `timeout_connect 10s` — bounded
-- `HTTP_OBJECT_LIMIT 64M` + `MAX_OBJECTS 100k` + `MAX_DEPTH 2048` — DoS bounded (S6/S7)
-- `is_valid_branch_name` for `update_remote_ref` — not SSRF
-
----
-
-## 6. Weaknesses → SEC
-
-| Gap | SEC | Detail |
-|-----|-----|--------|
-| Private IP allowed | SEC-016 | `validate_http_base` shape only, allows `127.0.0.1`, `10.0.0.1`, `::1`, `169.254` with `/api/repos/` prefix |
-| Redirect not limited | SEC-016 | `ureq` follows redirect, no re-validation |
-| DNS rebinding not mitigated | SEC-016 | host string check, not IP |
+- **CSRF / CORS Test Suites (`server/src/routes/s12-csrf.test.ts` & `s11-cors.test.ts`):** 13/13 tests passing:
+  - `rejects forged cookie-tossing attack where header matches cookie but not server HMAC (SEC-004)`.
+  - `rejects state-changing request when cross-origin does not match allowlist`.
+  - `allows state-changing request with valid HMAC token and matching/allowed origin`.
+  - `protects /api/auth/logout from unauthorized cross-origin trigger (SEC-004)`.
+  - `allows configured dev origins and sets Access-Control-Allow-Origin`.
+  - `rejects untrusted third-party origins in CORS preflight (SEC-003)`.
+  - `explicitly rejects null origin`.
+  - `S11-03 helmet headers present on GET /health`.
+  - `SEC-003 CORS allowlist: untrusted origin is blocked and allowed origin is permitted`.
+  - `S11-02 CSRF missing token → 403 when csrf_token cookie present`.
+  - `S11-02 CSRF with correct x-csrf-token → 201`.
+  - `S11-02 login sets csrf_token cookie`.
+  - `SEC-004: In production mode, CSRF fails closed if token missing`.
+- **Full Project Regression Test Suites:**
+  - `pnpm --filter server test`: 25 test files, 215/215 tests green.
+  - `cargo test`: 124/124 tests green.
 
 ---
 
-## 7. Planned Remediation (S12 only, no S13+)
+## 5. Acceptance Criteria Checklist
 
-| # | Change | File:line Before → After | Why | Test |
-|---|--------|---------------------------|-----|------|
-| S12-01 | **Private IP block** | `vcs/src/remote/http.rs:54` `validate_http_base` shape only → after shape, parse `host` via `url::Url` or manual `host:port` extraction, resolve via `to_socket_addrs`? But `ureq` not use `url` crate. Simpler: check `host` string for IP literals: if `host` is `127.0.0.1`, `10.*`, `172.16-31.*`, `192.168.*`, `169.254.*`, `::1`, `fc00::`, `fe80::`, `0.0.0.0` → `bail!("private/link-local/loopback not allowed")` unless `ALLOW_PRIVATE_REMOTES=true` env. For DNS names, resolve via `std::net::ToSocketAddrs` `format!("{}:80", host).to_socket_addrs()` and check each `IpAddr` is private/link-local/loopback → bail. | SEC-016 CWE-918 | `validate_http_base("http://127.0.0.1/api/repos/a/b")` → error `private`, `http://10.0.0.1/...` → error, `http://[::1]/...` → error, `http://8.8.8.8/...` → ok if shape |
-| S12-02 | **Redirect 0 + re-validate** | `vcs/src/remote/http.rs:30` `AgentBuilder::new().timeout_read(...).build()` → `AgentBuilder::new().timeout_read(...).redirects(0).build()` + manual handle `302` → read `Location` header, `validate_http_base` again, if ok then single redirect with `GET` | SEC-016 | `302 → http://127.0.0.1` → blocked by re-validate |
-| S12-03 | **DNS rebinding note** | `vcs/src/remote/http.rs:54` after IP check, also check that `host` is not `0.0.0.0` and not `169.254` etc, and document `ALLOW_PRIVATE_REMOTES` for dev | SEC-016 | `http://attacker.com/api/repos/a/b` where `attacker.com` → `127.0.0.1` → IP check catches |
-
-**Explicitly NOT in S12:** `checkout` symlink → S4, `spawn` env → S5, `CORS` → S11, `CI` `sh` → S13.
-
----
-
-## 8. Test Strategy
-
-| Test | Location | What it proves |
-|------|----------|----------------|
-| `private_ip` | `vcs/tests/s12_ssrf_test.rs` | `validate_http_base("http://127.0.0.1/api/repos/a/b")` → `Err private`, `http://10.0.0.1/...` → `Err`, `http://192.168.1.1/...` → `Err`, `http://[::1]/...` → `Err`, `http://8.8.8.8/...` → `Ok` |
-| `link_local` | same | `http://169.254.1.1/...` → `Err`, `http://[fe80::1]/...` → `Err` |
-| `public` | same | `http://93.184.216.34/api/repos/a/b` → `Ok` (if not private) |
-| `redirect` | same | `agent` `redirects(0)` verified via `AgentBuilder` check |
-| Existing | `cargo test --tests` 132 + `pnpm test` 93 | Still pass after S12 |
-| Manual | `itehaas clone http://127.0.0.1:5432/api/repos/a/b /tmp/clone` → `private not allowed` | SSRF blocked |
-
-Full suite after S12: `cargo test` + `pnpm test` + `web build`.
+- [x] Permissive dev CORS wildcard reflection eliminated (SEC-003)
+- [x] Preflight `maxAge: 86400` caching configured
+- [x] Cookie-tossing arbitrary token bypass eliminated (SEC-004)
+- [x] Forced logout via cross-origin POST neutralized (SEC-004)
+- [x] Null origin explicitly rejected
+- [x] Strict HMAC CSRF token verification enforced
+- [x] Vulnerability register updated
+- [x] `PLAN.md` updated
 
 ---
 
-## 9. Acceptance Criteria (S12) — ✅ Met 2026-09-02
+## 6. Next Phase Gate
 
-- [x] `validate_http_base("http://127.0.0.1/api/repos/a/b")` → `Err private` unless `ALLOW_PRIVATE_REMOTES=true` — 2026-09-02
-- [x] `validate_http_base("http://10.0.0.1/...")` `192.168...` `172.16...` `169.254...` `::1` `fc00::` `fe80::` `0.0.0.0` → `Err` — 2026-09-02
-- [x] `validate_http_base("https://good.com/api/repos/a/b")` → `Ok` (public) — 2026-09-02
-- [x] `AgentBuilder` `redirects(0)` + manual re-validate — 2026-09-02
-- [x] `cargo test` `s12_ssrf_test` 4/4 green, `pnpm test` 93/93 green — 2026-09-02
-- [x] `vulnerability-register.md` SEC-016 fixed, `CYBERSECURITY_IMPLEMENTATION.md` S12 ✅, `PLAN.md` S12 ✅ — 2026-09-02
-
----
-
-## 10. Rollback Considerations
-
-- Private IP block may break `docker-compose` dev where `http://host.docker.internal:3001/api/repos/...` resolves to `192.168.65.2` (private) — allow `ALLOW_PRIVATE_REMOTES=true` in dev `docker-compose.yml` or `isDocker` check. Rollback to allow private if `ALLOW_PRIVATE_REMOTES` set.
-- `redirects(0)` may break legitimate `http://` → `https://` redirect for `https://good.com` → `https://good.com` — but our `validate_http_base` already requires `http(s)://`, so redirect from `http://good.com` to `https://good.com` with same host and `/api/repos/` would be blocked as redirect not followed. For S12, we follow single redirect manually if re-validated, so `http→https` same host would be allowed.
-
----
-
-## 11. Completion Verification (2026-09-02)
-
-- `cargo test` 137 passed across all targets (including 4 tests in `s12_ssrf_test.rs`), `pnpm --filter server test` 131 passed across 19 test files.
-- Remediated `SEC-016` loopback SSRF bypass in `vcs/src/remote/http.rs`: eliminated the unvetted `localhost` exception in `is_private_host()`. `localhost` and `localhost:<port>` are now strictly blocked by default as loopback addresses unless explicitly allowed via `ALLOW_PRIVATE_REMOTES` or `ALLOW_LOCALHOST_REMOTE` environment variables.
-- Verified comprehensive IP blocklist in `vcs/src/remote/http.rs`: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16` (cloud metadata), `0.0.0.0`, `::1`, `fc00::/7`, `fe80::/10`.
-- Verified HTTP client security: `ureq::AgentBuilder` configures `.redirects(0)`, `timeout_connect(10s)`, `timeout_read(30s)`, and `timeout_write(30s)`.
-- Added test coverage in `vcs/tests/s12_ssrf_test.rs`: verified `http://localhost/api/repos/a/b` and `http://localhost:3001/api/repos/a/b` are strictly blocked when `ALLOW_PRIVATE_REMOTES` is not set.
-- Cross-check verified: strictly confined to outbound HTTP requests, remote URL validation, and IP filtering; no CI runner or container execution configs modified in this phase.
-
----
-
-## 12. Next Phase
-
-**S13 — CI Runner Sandboxing & Execution Security** — after S12 STOP. Awaiting user approval.
+- **Active Phase Status:** S12 COMPLETE.
+- **Next Phase:** `SECURITY PHASE S13 — SSRF, WEBHOOK, & REMOTE FETCH SECURITY`
+- **Scope:** DNS rebinding protection ([SEC-018](file:///Users/sachinkumarsingh/Projectss/Itehaas/docs/security/vulnerability-register.md#sec-018--dns-rebinding-ssrf-in-remote-fetch-transport)), IP pinning in remote fetch transport, private/loopback/link-local address filtering, cloud metadata protection (`169.254.169.254`), and webhook delivery isolation.

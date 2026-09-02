@@ -10,7 +10,7 @@ import { spawn } from 'child_process';
 import * as yaml from 'yaml';
 import { incCIPipelines } from '../lib/metrics';
 import { checkRateLimit, rateLimitReply } from '../lib/rateLimit';
-import { encryptSecret, decryptSecretSafe } from '../lib/secrets';
+import { encryptSecret, decryptSecretSafe, maskSecretInLog } from '../lib/secrets';
 import { config } from '../config';
 import { auditLog } from '../lib/audit';
 
@@ -158,7 +158,7 @@ async function executeInRunner(repoPath: string, script: string, env: Record<str
       '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
       '--cap-drop', 'ALL',
       '--security-opt', 'no-new-privileges:true',
-      '-v', `${repoPath}:/workspace`,
+      '-v', `${repoPath}:/workspace:ro`,
       '-w', '/workspace',
     ];
     for (const [k, v] of Object.entries(env)) {
@@ -261,16 +261,49 @@ async function runPipeline(pipelineId: string, repoPath: string, repoId: string)
       secretsEnv[s.key] = s.value;
     }
   }
-  // S9: fork isolation — if commit not in repo objects, treat as fork PR and clear secrets
+  // S10/SEC-008: Fork PR & untrusted contributor secret exclusion
+  // Untrusted PRs (from forks, external contributors, or non-collaborators) must NEVER receive repository secrets.
   try {
-    const pipeCommit = await query(`SELECT commit_hash FROM ci_pipelines WHERE id=$1`, [pipelineId]);
-    const commitHash = pipeCommit.rows[0]?.commit_hash as string | undefined;
-    if (commitHash) {
-      const objPath = path.join(repoPath, '.itehaas', 'objects', commitHash.slice(0, 2), commitHash.slice(2));
-      if (!fs.existsSync(objPath)) {
-        // Fork commit not in target repo — clear secrets per GitHub model
-        for (const k of Object.keys(secretsEnv)) delete secretsEnv[k];
+    const pipeRes = await query(
+      `SELECT p.ref, p.branch, p.commit_hash, p.created_by,
+              EXISTS(
+                SELECT 1 FROM pull_requests pr
+                WHERE pr.repo_id = p.repo_id
+                  AND (pr.source_repo_id IS NOT NULL OR pr.source_branch LIKE 'fork/%')
+                  AND (pr.source_branch = p.branch OR pr.source_branch = p.ref)
+              ) as is_fork_pr
+       FROM ci_pipelines p WHERE p.id = $1`,
+      [pipelineId]
+    );
+    const pipeInfo = pipeRes.rows[0];
+    const isForkBranch = pipeInfo?.branch?.startsWith('fork/') || pipeInfo?.ref?.includes('/fork/') || Boolean(pipeInfo?.is_fork_pr);
+
+    let isCollaborator = false;
+    if (pipeInfo?.created_by) {
+      const ownerCheck = await query(`SELECT owner_id FROM repositories WHERE id=$1`, [repoId]);
+      if (ownerCheck.rows[0]?.owner_id === pipeInfo.created_by) {
+        isCollaborator = true;
+      } else {
+        const memCheck = await query(
+          `SELECT 1 FROM repository_members WHERE repo_id=$1 AND user_id=$2 AND role IN ('admin', 'write', 'maintainer')`,
+          [repoId, pipeInfo.created_by]
+        );
+        if (memCheck.rows.length > 0) isCollaborator = true;
       }
+    }
+
+    let isUntrusted = isForkBranch || !isCollaborator;
+
+    if (pipeInfo?.commit_hash) {
+      const objPath = path.join(repoPath, '.itehaas', 'objects', pipeInfo.commit_hash.slice(0, 2), pipeInfo.commit_hash.slice(2));
+      if (!fs.existsSync(objPath)) {
+        isUntrusted = true;
+      }
+    }
+
+    if (isUntrusted) {
+      // Untrusted PR or fork commit — clear secrets per GitHub Actions security model
+      for (const k of Object.keys(secretsEnv)) delete secretsEnv[k];
     }
   } catch {}
 
@@ -307,20 +340,19 @@ async function runPipeline(pipelineId: string, repoPath: string, repoId: string)
 
     const { logs, exitCode, runner } = await executeInRunner(repoPath, script, secretsEnv, 30000);
     let fullLogs = logsPrefix + logs + `\n# Exit: ${exitCode} (${runner})\n` + (workflowFile ? `# Workflow: ${workflowFile}\n` : '');
-    // S9: scrub secrets from logs (values hidden, but if job does `env` it would leak)
+    // S9: scrub secrets from logs (handling raw, url-encoded, base64, json-escaped)
     for (const v of Object.values(secretsEnv)) {
-      if (v && v.length >= 3) {
-        fullLogs = fullLogs.split(v).join('***');
+      if (v) {
+        fullLogs = maskSecretInLog(fullLogs, v);
       }
     }
     // Also scrub cookieSecret and databaseUrl if leaked
     try {
-      if (config.cookieSecret && config.cookieSecret.length >= 3) {
-        fullLogs = fullLogs.split(config.cookieSecret).join('***');
+      if (config.cookieSecret) {
+        fullLogs = maskSecretInLog(fullLogs, config.cookieSecret);
       }
-      if (config.databaseUrl && config.databaseUrl.length >= 3) {
-        // Scrub password part only to avoid breaking logs, but scrub full for safety
-        fullLogs = fullLogs.split(config.databaseUrl).join('***');
+      if (config.databaseUrl) {
+        fullLogs = maskSecretInLog(fullLogs, config.databaseUrl);
       }
     } catch {}
 

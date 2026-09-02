@@ -303,4 +303,195 @@ describe('S2 Authentication Hardening', () => {
     expect(resB.statusCode).toBe(401);
     await app.close();
   });
+
+  it('S2: validatePassword rejects common weak passwords', () => {
+    expect(authLib.validatePassword('password123')).toMatch(/too common or weak/);
+    expect(authLib.validatePassword('qwertyuiop')).toMatch(/too common or weak/);
+    expect(authLib.validatePassword('12345678')).toMatch(/too common or weak/);
+    expect(authLib.validatePassword('itehaas123')).toMatch(/too common or weak/);
+    expect(authLib.validatePassword('short')).toMatch(/at least 8 characters/);
+    expect(authLib.validatePassword('AStrongAndValidPassword2026!')).toBeNull();
+  });
+
+  it('S2: csrfTokenForSession never leaks raw sessionId bytes', () => {
+    const sid = '12345678-1234-4321-abcd-123456789abc';
+    const token = authLib.csrfTokenForSession(sid);
+    expect(token).toBeDefined();
+    expect(token.length).toBeGreaterThanOrEqual(24);
+    // Ensure raw sessionId or its direct base64 representation is not leaked
+    expect(token).not.toContain(sid);
+    expect(token).not.toContain(Buffer.from(sid).toString('base64url').slice(0, 16));
+  });
+
+  it('S2: POST /api/auth/password requires authentication', async () => {
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/password',
+      payload: { currentPassword: 'old', newPassword: 'new' },
+    });
+    expect(res.statusCode).toBe(401);
+    await app.close();
+  });
+
+  it('S2: POST /api/auth/password fails with incorrect current password', async () => {
+    const hash = await authLib.hashPassword('CorrectOldPassword123!');
+    mockQuery.mockImplementation(async (text: string) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return { rows: [{ id: 'user-1', username: 'alice', email: 'alice@example.com' }] };
+      }
+      if (text.includes('SELECT password_hash FROM users WHERE id')) {
+        return { rows: [{ password_hash: hash }] };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/password',
+      cookies: { itehaas_session: '11111111-1111-1111-1111-111111111111' },
+      payload: {
+        currentPassword: 'WrongPassword!',
+        newPassword: 'BrandNewSecurePassword123!',
+      },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(res.json().error).toMatch(/current password incorrect/);
+    await app.close();
+  });
+
+  it('S2: POST /api/auth/password rejects weak new password or same password', async () => {
+    const hash = await authLib.hashPassword('CorrectOldPassword123!');
+    mockQuery.mockImplementation(async (text: string) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return { rows: [{ id: 'user-1', username: 'alice', email: 'alice@example.com' }] };
+      }
+      if (text.includes('SELECT password_hash FROM users WHERE id')) {
+        return { rows: [{ password_hash: hash }] };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    // Weak new password
+    const resWeak = await app.inject({
+      method: 'POST',
+      url: '/api/auth/password',
+      cookies: { itehaas_session: '11111111-1111-1111-1111-111111111111' },
+      payload: {
+        currentPassword: 'CorrectOldPassword123!',
+        newPassword: 'password123',
+      },
+    });
+    expect(resWeak.statusCode).toBe(400);
+
+    // Same password as current
+    const resSame = await app.inject({
+      method: 'POST',
+      url: '/api/auth/password',
+      cookies: { itehaas_session: '11111111-1111-1111-1111-111111111111' },
+      payload: {
+        currentPassword: 'CorrectOldPassword123!',
+        newPassword: 'CorrectOldPassword123!',
+      },
+    });
+    expect(resSame.statusCode).toBe(400);
+    expect(resSame.json().error).toMatch(/different from current password/);
+    await app.close();
+  });
+
+  it('S2: POST /api/auth/password updates hash and revokes all other sessions', async () => {
+    const hash = await authLib.hashPassword('CorrectOldPassword123!');
+    let passwordUpdated = false;
+    let otherSessionsDeleted = false;
+
+    mockQuery.mockImplementation(async (text: string, params: any[]) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return { rows: [{ id: 'user-1', username: 'alice', email: 'alice@example.com' }] };
+      }
+      if (text.includes('SELECT password_hash FROM users WHERE id')) {
+        return { rows: [{ password_hash: hash }] };
+      }
+      if (text.includes('UPDATE users SET password_hash')) {
+        passwordUpdated = true;
+        return { rows: [], rowCount: 1 };
+      }
+      if (text.includes('DELETE FROM sessions WHERE user_id = $1 AND id != $2')) {
+        otherSessionsDeleted = true;
+        return { rows: [], rowCount: 3 };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/password',
+      cookies: { itehaas_session: '11111111-1111-1111-1111-111111111111' },
+      payload: {
+        currentPassword: 'CorrectOldPassword123!',
+        newPassword: 'BrandNewSecurePassword123!',
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().ok).toBe(true);
+    expect(passwordUpdated).toBe(true);
+    expect(otherSessionsDeleted).toBe(true);
+    await app.close();
+  });
+
+  it('S2: POST /api/auth/sessions/revoke-all terminates all sessions and clears cookie', async () => {
+    let sessionsRevoked = false;
+    mockQuery.mockImplementation(async (text: string) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return { rows: [{ id: 'user-1', username: 'alice', email: 'alice@example.com' }] };
+      }
+      if (text.includes('DELETE FROM sessions WHERE user_id = $1')) {
+        sessionsRevoked = true;
+        return { rows: [], rowCount: 5 };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/sessions/revoke-all',
+      cookies: { itehaas_session: '11111111-1111-1111-1111-111111111111' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().ok).toBe(true);
+    expect(sessionsRevoked).toBe(true);
+    await app.close();
+  });
+
+  it('SEC-024: GET /api/invites strictly scopes to invited_user_id (no email harvesting)', async () => {
+    let queryExecuted = '';
+    let queryParams: any[] = [];
+    mockQuery.mockImplementation(async (text: string, params: any[]) => {
+      if (text.includes('FROM sessions s JOIN users u')) {
+        return { rows: [{ id: 'user-victim', username: 'attacker', email: 'victim@company.com' }] };
+      }
+      if (text.includes('FROM invites WHERE')) {
+        queryExecuted = text;
+        queryParams = params;
+        return { rows: [] };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/invites',
+      cookies: { itehaas_session: '11111111-1111-1111-1111-111111111111' },
+    });
+    expect(res.statusCode).toBe(200);
+    // Verifies query does NOT check email = $2, only invited_user_id = $1
+    expect(queryExecuted).toContain('WHERE invited_user_id = $1');
+    expect(queryExecuted).not.toContain('OR email = $2');
+    expect(queryParams).toEqual(['user-victim']);
+    await app.close();
+  });
 });

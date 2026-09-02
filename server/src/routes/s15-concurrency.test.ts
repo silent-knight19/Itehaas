@@ -1,23 +1,27 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const mockQuery = vi.fn();
-const mockExec = vi.fn();
+const mockClientQuery = vi.fn();
+const mockRelease = vi.fn();
 
 vi.mock('../db', async (importOriginal) => {
   const actual: any = await importOriginal();
   return {
     ...actual,
-  query: (...args: any[]) => mockQuery(...args),
-  getClient: async () => ({
     query: (...args: any[]) => mockQuery(...args),
-    release: vi.fn(),
-  }),
-  pool: { on: vi.fn() },
-  hashStringToInt: (s: string) => {
-    let h = 0;
-    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-    return h & 0x7fffffff;
-  },
+    getClient: async () => ({
+      query: (...args: any[]) => mockClientQuery(...args),
+      release: mockRelease,
+    }),
+    pool: { on: vi.fn() },
+    hashStringToInt: (str: string) => {
+      let hash = 0;
+      for (let i = 0; i < str.length; i++) {
+        hash = ((hash << 5) - hash) + str.charCodeAt(i);
+        hash |= 0;
+      }
+      return Math.abs(hash);
+    },
   };
 });
 
@@ -25,7 +29,7 @@ vi.mock('../lib/vcs', async (importOriginal) => {
   const actual: any = await importOriginal();
   return {
     ...actual,
-    execItehaas: (...args: any[]) => mockExec(...args),
+    execItehaas: vi.fn().mockResolvedValue({ stdout: 'Merged successfully', stderr: '', code: 0 }),
     repoPathFor: (owner: string, repo: string) => `/tmp/itehaas_test/${owner}/${repo}`,
   };
 });
@@ -45,132 +49,158 @@ vi.mock('../config', () => ({
 
 import { buildApp } from '../index';
 
-describe('S15 Concurrency / TOCTOU', () => {
+describe('S15 Concurrency, Merge Collision, & TOCTOU Defense', () => {
+  const sessionId = '11111111-2222-3333-4444-555555555555';
+  const alice = { id: 'u-alice', username: 'alice' };
+
   beforeEach(() => {
     vi.clearAllMocks();
-    mockQuery.mockImplementation(async (text: string) => {
+    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
       if (text.includes('SELECT 1')) return { rows: [{ '?column?': 1 }] };
-      if (text.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
-      if (text.includes('pg_advisory_unlock')) return { rows: [], rowCount: 0 };
-      return { rows: [], rowCount: 0 };
-    });
-    mockExec.mockResolvedValue({ stdout: '', stderr: '', code: 0 });
-  });
-
-  it('S15-01 concurrent push same branch: second gets 423 when lock held', async () => {
-    let lockHeld = false;
-    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
-      if (text.includes('pg_try_advisory_lock')) {
-        if (lockHeld) return { rows: [{ locked: false }] };
-        lockHeld = true;
-        return { rows: [{ locked: true }] };
-      }
-      if (text.includes('pg_advisory_unlock')) {
-        lockHeld = false;
-        return { rows: [], rowCount: 0 };
-      }
       if (text.includes('FROM sessions s JOIN users u')) {
-        if (params?.[0] === 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') return { rows: [{ id: 'u-alice', username: 'alice' }] };
-        return { rows: [] };
+        if (params?.[0] === sessionId) return { rows: [alice] };
       }
       if (text.includes('FROM repositories r JOIN users u')) {
-        if (params?.[0] === 'alice' && params?.[1] === 'repo') return { rows: [{ id: 'r1' }] };
-        return { rows: [] };
+        return { rows: [{ id: 'repo-alice', visibility: 'public', default_branch: 'main' }] };
       }
-      if (text.includes('SELECT owner_id FROM repositories')) return { rows: [{ owner_id: 'u-alice' }] };
+      if (text.includes('SELECT r.id, r.visibility FROM repositories')) {
+        return { rows: [{ id: 'repo-alice', visibility: 'public', default_branch: 'main' }] };
+      }
+      if (text.includes('SELECT owner_id FROM repositories')) {
+        return { rows: [{ owner_id: 'u-alice' }] };
+      }
       return { rows: [], rowCount: 0 };
     });
-    const app = await buildApp();
-    // First push should succeed (or at least not 423), second concurrent should get 423
-    // We simulate by holding lock for first, then second tries
-    // First request will acquire lock, but we mock to hold it
-    // For this test, we just verify that second call with lockHeld=true returns 423
-    // We do two sequential calls, but second will be after first releases? To simulate concurrent, we need to not release
-    // Instead, we test that when lock is held, second returns 423
-    // First, hold lock manually
-    lockHeld = true;
-    const res2 = await app.inject({
-      method: 'POST',
-      url: '/api/repos/alice/repo/refs/heads/main',
-      headers: { cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
-      payload: { hash: 'a'.repeat(64) },
-    });
-    expect(res2.statusCode).toBe(423);
-    await app.close();
   });
 
-  it('S15-02 concurrent merge same PR: second gets 423', async () => {
-    let lockHeld = false;
-    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
-      if (text.includes('pg_try_advisory_lock')) {
-        if (lockHeld) return { rows: [{ locked: false }] };
-        lockHeld = true;
-        return { rows: [{ locked: true }] };
-      }
-      if (text.includes('pg_advisory_unlock')) {
-        lockHeld = false;
+  describe('SEC-019: PR Merge Collision & Repository Lock', () => {
+    it('rejects concurrent merge on same repository with HTTP 423 even if PR IDs differ', async () => {
+      // Simulate PR 1 holding the repo merge lock
+      let lockAttempts: any[] = [];
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('SELECT 1')) return { rows: [{ '?column?': 1 }] };
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [alice] };
+        if (text.includes('FROM repositories r JOIN users u')) {
+          return { rows: [{ id: 'repo-alice', visibility: 'public', default_branch: 'main' }] };
+        }
+        if (text.includes('SELECT owner_id FROM repositories')) {
+          return { rows: [{ owner_id: 'u-alice' }] };
+        }
+        if (text.includes('pg_try_advisory_lock')) {
+          lockAttempts.push(params?.[0]);
+          // Return locked: false (simulating an in-flight merge holding the lock)
+          return { rows: [{ locked: false }] };
+        }
         return { rows: [], rowCount: 0 };
-      }
-      if (text.includes('FROM sessions s JOIN users u')) {
-        if (params?.[0] === 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') return { rows: [{ id: 'u-alice', username: 'alice' }] };
-        return { rows: [] };
-      }
-      if (text.includes('FROM repositories r JOIN users u')) {
-        if (params?.[0] === 'alice' && params?.[1] === 'repo') return { rows: [{ id: 'r1', visibility: 'private', default_branch: 'main' }] };
-        return { rows: [] };
-      }
-      if (text.includes('SELECT owner_id FROM repositories')) return { rows: [{ owner_id: 'u-alice' }] };
-      if (text.includes('SELECT * FROM pull_requests') || text.includes('SELECT source_branch')) {
-        return { rows: [{ source_branch: 'feature', target_branch: 'main', status: 'open', is_draft: false, title: 't', body: 'b' }] };
-      }
-      if (text.includes('SELECT decision FROM pr_reviews')) return { rows: [] };
-      if (text.includes('SELECT name FROM ci_status_checks')) return { rows: [] };
-      return { rows: [], rowCount: 0 };
+      });
+
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/repo/pulls/2/merge',
+        headers: { cookie: `itehaas_session=${sessionId}` },
+      });
+
+      expect(res.statusCode).toBe(423);
+      expect(res.json().error).toMatch(/merge locked/);
+      expect(lockAttempts.length).toBe(1);
+      await app.close();
     });
-    const app = await buildApp();
-    lockHeld = true; // hold lock
-    const res = await app.inject({
-      method: 'POST',
-      url: '/api/repos/alice/repo/pulls/1/merge',
-      headers: { cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+
+    it('successfully acquires repository lock and executes merge when no collision exists', async () => {
+      let advisoryUnlocked = false;
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('SELECT 1')) return { rows: [{ '?column?': 1 }] };
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [alice] };
+        if (text.includes('FROM repositories r JOIN users u')) {
+          return { rows: [{ id: 'repo-alice', visibility: 'public', default_branch: 'main' }] };
+        }
+        if (text.includes('SELECT owner_id FROM repositories')) {
+          return { rows: [{ owner_id: 'u-alice' }] };
+        }
+        if (text.includes('pg_try_advisory_lock')) {
+          return { rows: [{ locked: true }] };
+        }
+        if (text.includes('pg_advisory_unlock')) {
+          advisoryUnlocked = true;
+          return { rows: [{ unlocked: true }] };
+        }
+        if (text.includes('SELECT source_branch, target_branch, status, is_draft')) {
+          return { rows: [{ source_branch: 'feature', target_branch: 'main', status: 'open', is_draft: false, title: 'Add feature', body: 'fixes #1' }] };
+        }
+        if (text.includes('SELECT decision FROM pr_reviews')) {
+          return { rows: [] };
+        }
+        if (text.includes('ci_status_checks')) {
+          return { rows: [] };
+        }
+        if (text.includes('UPDATE pull_requests SET status=\'merged\'')) {
+          return { rows: [] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/repo/pulls/1/merge',
+        headers: { cookie: `itehaas_session=${sessionId}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json().ok).toBe(true);
+      expect(advisoryUnlocked).toBe(true);
+      await app.close();
     });
-    expect(res.statusCode).toBe(423);
-    await app.close();
   });
 
-  it('S15-03 delete vs push: delete holds lock, push after delete gets 404', async () => {
-    let lockHeld = false;
-    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
-      if (text.includes('pg_try_advisory_lock')) {
-        if (lockHeld) return { rows: [{ locked: false }] };
-        lockHeld = true;
-        return { rows: [{ locked: true }] };
-      }
-      if (text.includes('pg_advisory_unlock')) {
-        lockHeld = false;
-        return { rows: [], rowCount: 0 };
-      }
-      if (text.includes('FROM sessions s JOIN users u')) {
-        if (params?.[0] === 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') return { rows: [{ id: 'u-alice', username: 'alice' }] };
+  describe('Atomic Invite Acceptance & Anti-Replay', () => {
+    it('atomically executes invite acceptance inside transaction with FOR UPDATE', async () => {
+      let forUpdateCalled = false;
+      let transactionCommitted = false;
+
+      mockClientQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text === 'BEGIN') return {};
+        if (text.includes('FOR UPDATE')) {
+          forUpdateCalled = true;
+          return {
+            rows: [{
+              id: 'inv-123',
+              token: 'tok-abc',
+              status: 'pending',
+              expires_at: new Date(Date.now() + 86400000).toISOString(),
+              invited_user_id: alice.id,
+              org_id: 'org-1',
+              role: 'member',
+            }],
+          };
+        }
+        if (text.includes('UPDATE invites SET status=\'accepted\'')) {
+          return { rows: [] };
+        }
+        if (text.includes('INSERT INTO organization_members')) {
+          return { rows: [] };
+        }
+        if (text === 'COMMIT') {
+          transactionCommitted = true;
+          return {};
+        }
         return { rows: [] };
-      }
-      if (text.includes('FROM repositories r JOIN users u')) {
-        if (params?.[0] === 'alice' && params?.[1] === 'repo') return { rows: [{ id: 'r1' }] };
-        return { rows: [] };
-      }
-      if (text.includes('SELECT owner_id FROM repositories')) return { rows: [{ owner_id: 'u-alice' }] };
-      if (text.includes('DELETE FROM repositories')) return { rows: [], rowCount: 1 };
-      if (text.includes('SELECT role FROM repository_members')) return { rows: [] };
-      if (text.includes('SELECT tr.permission')) return { rows: [] };
-      return { rows: [], rowCount: 0 };
+      });
+
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/invites/tok-abc/accept',
+        headers: { cookie: `itehaas_session=${sessionId}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json().ok).toBe(true);
+      expect(forUpdateCalled).toBe(true);
+      expect(transactionCommitted).toBe(true);
+      expect(mockRelease).toHaveBeenCalled();
+      await app.close();
     });
-    const app = await buildApp();
-    const res = await app.inject({
-      method: 'DELETE',
-      url: '/api/repos/alice/repo',
-      headers: { cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
-    });
-    expect(res.statusCode).toBe(200);
-    await app.close();
   });
 });

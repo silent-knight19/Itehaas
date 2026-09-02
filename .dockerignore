@@ -1,0 +1,12 @@
+.git
+.env*
+*.env
+node_modules
+dist
+.next
+target
+data
+coverage
+.system_generated
+.gemini
+*.log

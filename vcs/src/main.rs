@@ -428,6 +428,21 @@ enum Commands {
         #[arg(short = 'i', long)]
         interactive: bool,
     },
+    /// Find merge base or check ancestor relationship
+    #[command(name = "merge-base")]
+    MergeBase {
+        /// Check if ancestor is an ancestor of descendant
+        #[arg(long = "is-ancestor")]
+        is_ancestor: bool,
+        ancestor: String,
+        descendant: String,
+    },
+    /// Check if ancestor is an ancestor of descendant
+    #[command(name = "is-ancestor")]
+    IsAncestor {
+        ancestor: String,
+        descendant: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -616,6 +631,47 @@ fn main() -> Result<()> {
             itehaas_lib::object::store::verify_object(&repo, &hash, hasher.as_ref())
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             println!("ok: {}", hash_hex);
+        }
+        Commands::MergeBase {
+            is_ancestor,
+            ancestor,
+            descendant,
+        } => {
+            let repo = find_repo_or_cwd()?;
+            let algo = config::read_hasher(&repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let ancestor_hash = Hash::from_hex(algo, &ancestor).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let descendant_hash = Hash::from_hex(algo, &descendant).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if is_ancestor {
+                let ans = itehaas_lib::merge::is_ancestor(&repo, &ancestor_hash, &descendant_hash)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if ans {
+                    println!("true");
+                    std::process::exit(0);
+                } else {
+                    println!("false");
+                    std::process::exit(1);
+                }
+            } else {
+                anyhow::bail!("only --is-ancestor is supported for merge-base");
+            }
+        }
+        Commands::IsAncestor {
+            ancestor,
+            descendant,
+        } => {
+            let repo = find_repo_or_cwd()?;
+            let algo = config::read_hasher(&repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let ancestor_hash = Hash::from_hex(algo, &ancestor).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let descendant_hash = Hash::from_hex(algo, &descendant).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let ans = itehaas_lib::merge::is_ancestor(&repo, &ancestor_hash, &descendant_hash)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if ans {
+                println!("true");
+                std::process::exit(0);
+            } else {
+                println!("false");
+                std::process::exit(1);
+            }
         }
         Commands::Add { paths } => {
             let repo = find_repo_or_cwd()?;

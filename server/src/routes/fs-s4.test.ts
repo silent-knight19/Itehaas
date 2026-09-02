@@ -271,4 +271,52 @@ describe('S4 Filesystem / Path Traversal & Symlink', () => {
     await app.close();
     try { fs.rmSync(testRepoDir, { recursive: true, force: true }); } catch {}
   });
+
+  it('SEC-013: isValidFilePath blocks case-insensitive control structure collisions', async () => {
+    const { isValidFilePath } = await import('./repos');
+    // Exact match
+    expect(isValidFilePath('.itehaas/config')).toBe(false);
+    expect(isValidFilePath('.git/HEAD')).toBe(false);
+    // Case variants (macOS APFS / Windows NTFS collision)
+    expect(isValidFilePath('.Itehaas/config')).toBe(false);
+    expect(isValidFilePath('.ITEHAAS/HEAD')).toBe(false);
+    expect(isValidFilePath('.iTeHaAs/refs/heads/main')).toBe(false);
+    expect(isValidFilePath('a/.Itehaas/config')).toBe(false);
+    expect(isValidFilePath('.Git/HEAD')).toBe(false);
+    expect(isValidFilePath('.GIT/config')).toBe(false);
+    expect(isValidFilePath('.hg/hgrc')).toBe(false);
+    expect(isValidFilePath('.svn/entries')).toBe(false);
+  });
+
+  it('SEC-013: isValidFilePath blocks 8.3 short filename collisions and Windows device names', async () => {
+    const { isValidFilePath } = await import('./repos');
+    // 8.3 aliases
+    expect(isValidFilePath('itehaa~1/config')).toBe(false);
+    expect(isValidFilePath('ITEHAA~1/HEAD')).toBe(false);
+    expect(isValidFilePath('git~1/HEAD')).toBe(false);
+    expect(isValidFilePath('GIT~1/config')).toBe(false);
+
+    // Windows reserved device names
+    expect(isValidFilePath('CON')).toBe(false);
+    expect(isValidFilePath('prn')).toBe(false);
+    expect(isValidFilePath('aux.txt')).toBe(false);
+    expect(isValidFilePath('NUL.png')).toBe(false);
+    expect(isValidFilePath('com1')).toBe(false);
+    expect(isValidFilePath('lpt1.log')).toBe(false);
+    expect(isValidFilePath('sub/COM2/file.txt')).toBe(false);
+
+    // Trailing dots and spaces
+    expect(isValidFilePath('bad.')).toBe(false);
+    expect(isValidFilePath('bad ')).toBe(false);
+    expect(isValidFilePath('sub/bad./file')).toBe(false);
+  });
+
+  it('SEC-013: isValidFilePath permits valid safe file paths', async () => {
+    const { isValidFilePath } = await import('./repos');
+    expect(isValidFilePath('README.md')).toBe(true);
+    expect(isValidFilePath('src/main.rs')).toBe(true);
+    expect(isValidFilePath('.gitignore')).toBe(true);
+    expect(isValidFilePath('docs/architecture/spec.md')).toBe(true);
+    expect(isValidFilePath('public/assets/logo.png')).toBe(true);
+  });
 });

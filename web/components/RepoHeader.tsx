@@ -1,5 +1,5 @@
 "use client";
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import Link from "next/link";
 import {
   FolderGit2,
@@ -42,35 +42,73 @@ export function RepoHeader({
 
   const { toast } = useToast();
 
+  useEffect(() => {
+    let active = true;
+    async function loadStars() {
+      try {
+        const s = await Api.getStars(owner, repo);
+        if (active && s.ok) {
+          setCurrentStars(s.json.count);
+          setStarred(Boolean(s.json.starred));
+        }
+      } catch {}
+    }
+    loadStars();
+    return () => {
+      active = false;
+    };
+  }, [owner, repo]);
+
+  useEffect(() => {
+    if (starsCount !== undefined) setCurrentStars(starsCount);
+  }, [starsCount]);
+
+  useEffect(() => {
+    if (isStarred !== undefined) setStarred(isStarred);
+  }, [isStarred]);
+
   const cliCloneCmd = `itehaas clone data/repos/${owner}/${repo} ${repo}`;
   const httpCloneCmd = `itehaas clone http://localhost:3001/api/repos/${owner}/${repo} ${repo}`;
 
   async function handleToggleStar() {
     if (starring) return;
     setStarring(true);
+    const prevStarred = starred;
+    const prevCount = currentStars;
     const nextStarred = !starred;
-    const nextCount = nextStarred ? currentStars + 1 : Math.max(0, currentStars - 1);
+    const nextCount = nextStarred ? prevCount + 1 : Math.max(0, prevCount - 1);
 
+    // Optimistic update
     setStarred(nextStarred);
     setCurrentStars(nextCount);
     if (onStarChange) onStarChange(nextCount, nextStarred);
 
     try {
-      if (nextStarred) {
-        await Api.starRepo(owner, repo);
-        toast("Starred repository", "info");
-      } else {
-        await Api.unstarRepo(owner, repo);
-        toast("Unstarred repository", "info");
+      const res = nextStarred
+        ? await Api.starRepo(owner, repo)
+        : await Api.unstarRepo(owner, repo);
+
+      if (!res.ok) {
+        setStarred(prevStarred);
+        setCurrentStars(prevCount);
+        if (onStarChange) onStarChange(prevCount, prevStarred);
+        toast(res.json?.error || "Failed to update star", "error");
+        return;
       }
+
+      toast(nextStarred ? "Starred repository" : "Unstarred repository", "info");
+
       const s = await Api.getStars(owner, repo);
       if (s.ok) {
         setCurrentStars(s.json.count);
-        setStarred(s.json.starred);
+        setStarred(Boolean(s.json.starred));
+        if (onStarChange) onStarChange(s.json.count, Boolean(s.json.starred));
       }
     } catch {
-      setStarred(!nextStarred);
-      setCurrentStars(starsCount);
+      setStarred(prevStarred);
+      setCurrentStars(prevCount);
+      if (onStarChange) onStarChange(prevCount, prevStarred);
+      toast("Failed to update star", "error");
     } finally {
       setStarring(false);
     }

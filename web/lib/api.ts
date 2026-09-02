@@ -2,16 +2,31 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
 export type FetchOpts = RequestInit & { auth?: boolean };
 
+function getCsrfToken(): string | undefined {
+  if (typeof document === 'undefined') return undefined;
+  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : undefined;
+}
+
 export async function api(path: string, opts: FetchOpts = {}) {
   const url = `${API_URL}${path}`;
   try {
+    const headers: Record<string, string> = {};
+    if (opts.body) {
+      headers['Content-Type'] = 'application/json';
+    }
+    const csrfToken = getCsrfToken();
+    if (csrfToken) {
+      headers['x-csrf-token'] = csrfToken;
+    }
+    if (opts.headers) {
+      Object.assign(headers, opts.headers);
+    }
+
     const res = await fetch(url, {
       ...opts,
       credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(opts.headers || {}),
-      },
+      headers,
     });
     const text = await res.text();
     let json: any = null;
@@ -70,8 +85,10 @@ export const Api = {
 
   // Branches & VCS History
   listBranches: (owner: string, repo: string) => api(`/api/repos/${owner}/${repo}/branches`),
-  log: (owner: string, repo: string, maxCount = 100) =>
-    api(`/api/repos/${owner}/${repo}/log?max_count=${maxCount}&full=1`),
+  log: (owner: string, repo: string, maxCount = 100, branch?: string) => {
+    const ref = branch ? `&ref=${encodeURIComponent(branch)}` : '';
+    return api(`/api/repos/${owner}/${repo}/log?max_count=${maxCount}&full=1${ref}`);
+  },
   tree: (owner: string, repo: string, hash: string) =>
     api(`/api/repos/${owner}/${repo}/tree/${hash}`),
   // File browsing (recursive ?path)
@@ -103,7 +120,7 @@ export const Api = {
   // Stars
   getStars: (owner: string, repo: string) => api(`/api/repos/${owner}/${repo}/stars`),
   starRepo: (owner: string, repo: string) =>
-    api(`/api/repos/${owner}/${repo}/star`, { method: 'POST' }),
+    api(`/api/repos/${owner}/${repo}/star`, { method: 'POST', body: '{}' }),
   unstarRepo: (owner: string, repo: string) =>
     api(`/api/repos/${owner}/${repo}/star`, { method: 'DELETE' }),
 

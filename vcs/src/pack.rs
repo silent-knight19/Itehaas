@@ -39,6 +39,14 @@ pub fn create_pack(repo: &Path) -> Result<(PathBuf, usize, u64, u64)> {
         return Err(crate::error::ItehaasError::Other("no objects to pack".into()));
     }
 
+    // S6/SEC-017: limit pack size to prevent unbounded memory allocation
+    if entries.len() > 10000 {
+        return Err(crate::error::ItehaasError::InvalidObject(format!("pack too many entries: {}", entries.len())));
+    }
+    if original_bytes > 512 * 1024 * 1024 {
+        return Err(crate::error::ItehaasError::Other("pack total uncompressed data exceeds 512 MiB limit".into()));
+    }
+
     // Sort for determinism
     entries.sort_by(|a,b| a.0.cmp(&b.0));
 
@@ -95,6 +103,7 @@ pub fn verify_pack(repo: &Path, pack_path: &Path) -> Result<usize> {
         return Err(crate::error::ItehaasError::InvalidObject(format!("pack too many entries: {}", count)));
     }
     let mut verified = 0;
+    let mut total_pack_bytes: u64 = 0;
     for _ in 0..count {
         let mut hex_buf = [0u8; 64];
         f.read_exact(&mut hex_buf)?;
@@ -105,6 +114,11 @@ pub fn verify_pack(repo: &Path, pack_path: &Path) -> Result<usize> {
         // S6/SEC-015: bound declared length before allocation to prevent heap exhaustion
         if len > 64 * 1024 * 1024 {
             return Err(crate::error::ItehaasError::InvalidObject(format!("pack entry declared too large: {}", len)));
+        }
+        total_pack_bytes += len as u64;
+        // S6/SEC-017: bound cumulative pack size to prevent memory exhaustion
+        if total_pack_bytes > 512 * 1024 * 1024 {
+            return Err(crate::error::ItehaasError::InvalidObject("pack cumulative data exceeds 512 MiB limit".into()));
         }
         let mut data = vec![0u8; len];
         f.read_exact(&mut data)?;

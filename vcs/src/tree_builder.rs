@@ -134,14 +134,39 @@ pub fn flatten_tree(
     out: &mut BTreeMap<String, (Hash, u32)>,
     depth: usize,
 ) -> Result<()> {
+    let mut active = std::collections::BTreeSet::new();
+    flatten_tree_with_ancestors(repo, tree_hash, hasher, prefix, out, depth, &mut active)
+}
+
+pub fn flatten_tree_with_ancestors(
+    repo: &Path,
+    tree_hash: &Hash,
+    hasher: &dyn Hasher,
+    prefix: &str,
+    out: &mut BTreeMap<String, (Hash, u32)>,
+    depth: usize,
+    active_ancestors: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
     // S6: depth limit
     if depth > 100 {
         return Err(crate::error::ItehaasError::InvalidObject(format!("tree depth too deep: {}", depth)));
     }
+    // SEC-014: bound total flattened entries to prevent DAG expansion bomb
+    if out.len() > 100_000 {
+        return Err(crate::error::ItehaasError::InvalidObject("flattened tree too large (exceeded 100,000 entries)".into()));
+    }
+    // Cycle detection
+    let hex = tree_hash.hex();
+    if active_ancestors.contains(&hex) {
+        return Err(crate::error::ItehaasError::InvalidObject(format!("cycle detected in tree: {}", hex)));
+    }
+    active_ancestors.insert(hex.clone());
+
     let obj = crate::object::store::read_object(repo, tree_hash, hasher)?;
     let tree = match obj {
         crate::object::Object::Tree(t) => t,
         _ => {
+            active_ancestors.remove(&hex);
             return Err(crate::error::ItehaasError::InvalidObject(format!(
                 "expected tree, got {}",
                 obj.object_type()
@@ -156,11 +181,16 @@ pub fn flatten_tree(
         };
         if e.mode == 0o040000 {
             // Subdirectory — recurse
-            flatten_tree(repo, &e.hash, hasher, &full_path, out, depth + 1)?;
+            flatten_tree_with_ancestors(repo, &e.hash, hasher, &full_path, out, depth + 1, active_ancestors)?;
         } else {
+            if out.len() >= 100_000 {
+                active_ancestors.remove(&hex);
+                return Err(crate::error::ItehaasError::InvalidObject("flattened tree too large (exceeded 100,000 entries)".into()));
+            }
             out.insert(full_path, (e.hash, e.mode));
         }
     }
+    active_ancestors.remove(&hex);
     Ok(())
 }
 

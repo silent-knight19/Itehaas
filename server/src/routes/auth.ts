@@ -2,7 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { query } from '../db';
 import { hashPassword, verifyPassword, validateUsername, validatePassword, validateEmail, sessionCookieName, newSessionExpiry, csrfTokenForSession } from '../lib/auth';
-import { cleanupExpiredSessions } from '../middleware/auth';
+import { cleanupExpiredSessions, requireAuth } from '../middleware/auth';
 import { checkRateLimit, rateLimitReply, isLoginLocked, recordLoginFail, clearLoginFails, getLoginLockMs } from '../lib/rateLimit';
 import * as argon2 from 'argon2';
 import { auditLog } from '../lib/audit';
@@ -191,5 +191,65 @@ export async function authRoutes(app: FastifyInstance) {
 
     const user = res.rows[0];
     return reply.send({ user: { id: user.id, username: user.username, email: user.email, created_at: user.created_at } });
+  });
+
+  // Change password (re-authentication required)
+  app.post('/api/auth/password', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const schema = z.object({
+      currentPassword: z.string().min(1),
+      newPassword: z.string().min(8).max(128),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.issues[0].message });
+    }
+    const { currentPassword, newPassword } = parsed.data;
+
+    const pErr = validatePassword(newPassword);
+    if (pErr) return reply.status(400).send({ error: pErr });
+
+    const uRes = await query(`SELECT password_hash FROM users WHERE id = $1`, [user.id]);
+    if (uRes.rows.length === 0) return reply.status(401).send({ error: 'not authenticated' });
+
+    const validCurrent = await verifyPassword(uRes.rows[0].password_hash, currentPassword);
+    if (!validCurrent) {
+      await auditLog({ userId: user.id, action: 'auth.password_change_failure', target: user.username, req });
+      return reply.status(401).send({ error: 'current password incorrect' });
+    }
+
+    if (currentPassword === newPassword) {
+      return reply.status(400).send({ error: 'new password must be different from current password' });
+    }
+
+    const newHash = await hashPassword(newPassword);
+    await query(`UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`, [newHash, user.id]);
+
+    // Revoke all OTHER sessions for this user (prevent persistent access on compromised devices)
+    let currentSessionId: string | undefined = (req.cookies as any)?.[sessionCookieName()];
+    if (!currentSessionId) {
+      const auth = (req.headers as any)?.authorization as string | undefined;
+      if (auth && auth.startsWith('Bearer ')) currentSessionId = auth.slice(7).trim();
+    }
+    if (currentSessionId) {
+      await query(`DELETE FROM sessions WHERE user_id = $1 AND id != $2`, [user.id, currentSessionId]);
+    } else {
+      await query(`DELETE FROM sessions WHERE user_id = $1`, [user.id]);
+    }
+
+    await auditLog({ userId: user.id, action: 'auth.password_change_success', target: user.username, req });
+    return reply.send({ ok: true });
+  });
+
+  // Revoke all sessions
+  app.post('/api/auth/sessions/revoke-all', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    await query(`DELETE FROM sessions WHERE user_id = $1`, [user.id]);
+    reply.clearCookie(sessionCookieName(), { path: '/' });
+    reply.clearCookie('csrf_token', { path: '/' });
+    await auditLog({ userId: user.id, action: 'auth.sessions_revoked_all', target: user.username, req });
+    return reply.send({ ok: true });
   });
 }

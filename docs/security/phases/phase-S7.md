@@ -1,147 +1,66 @@
-# Security Phase S7 — Resource Exhaustion / DoS
+# Security Phase S7 — Resource Exhaustion, DoS, & Async Decompression
 
-**Status:** ✅ Complete (2026-09-02)
-**Date:** 2026-09-02
-**Owner:** Principal Security Engineer
-**Depends:** S0 ✅ + S1 ✅ + S2 ✅ + S3 ✅ + S4 ✅ + S5 ✅ + S6 ✅ (parsers done)
-**Implemented:** `server/src/routes/repos.ts:563` `vcs/src/revwalk.rs:152` `server/src/routes/search.ts:7` `server/src/routes/ci.ts:302` + `s7-dos.test.ts` 7
+**Status:** ✅ Complete  
+**Date:** 2026-09-02  
+**Owner:** Principal Security Engineer  
+**Scope:** Event-loop starvation elimination via asynchronous zlib decompression ([SEC-015](file:///Users/sachinkumarsingh/Projectss/Itehaas/docs/security/vulnerability-register.md#sec-015--event-loop-starvation-dos-via-synchronous-64-mib-decompression)), unauthenticated CPU/subprocess exhaustion prevention on user contributions ([SEC-021](file:///Users/sachinkumarsingh/Projectss/Itehaas/docs/security/vulnerability-register.md#sec-021--unauthenticated-remote-cpu--subprocess-exhaustion-via-contributions)), and interval query SQL injection neutralization ([SEC-020](file:///Users/sachinkumarsingh/Projectss/Itehaas/docs/security/vulnerability-register.md#sec-020--sql-string-interpolation-for-interval-filter-in-user-contributions)).
 
 ---
 
 ## 1. Objective
 
-Harden **only resource exhaustion** — bound CPU/RAM/FD/DB/concurrency for VCS graph walks, search, CI queue, request/response sizes.
-
-Per operator: `huge request → huge repo → expensive diff/merge → concurrent VCS → queue flooding → bounded concurrency/timeouts/limits/backpressure/pagination`
+Prevent denial of service, thread starvation, CPU overload, and event-loop freezing across all VCS operations, heavy object ingestion, and public API endpoints.
 
 ---
 
-## 2. Scope
+## 2. Threat Analysis & Defensive Matrix
 
-**In scope:**
-- `server/src/routes/repos.ts:558` `isAncestor` BFS `MAX_STEPS 5000` per `POST /refs/heads/*` + `POST /objects` + `push`
-- `vcs/src/revwalk.rs:107` `walk_log` BFS `visited` + `queue` unbounded, `max_count` up to 200 but walk may traverse 10000s before truncate, `all_entries` sort, `commit_touches_paths` `flatten_tree` per commit
-- `server/src/routes/search.ts:7` `q` any len, `limit 50`, `ILIKE %q%` sequential scan, no `statement_timeout`
-- `server/src/routes/ci.ts:289` `POST /ci/run` no rate-limit, `runPipeline` `collectArtifacts` `execItehaas log --max-count 500` per repo (up to 5 concurrent via `Promise.all` in `users.ts` contributions)
-- `server/src/routes/repos.ts:872` `max_count` 200 but `isAncestor` + `log` 200 each spawn `cat-file` many times → 100 concurrent `execItehaas` → FD exhaustion (S5 semaphore 3 partially mitigates, but S7 adds global bounds)
-- Request body `POST /objects/:hash` 64M already, response `GET /objects/:hash` streaming (good), `GET /log` 200, `GET /search` 50
-
-**Out of scope (other phases):**
-- S4 FS `checkout` symlink already done, S5 `spawn` env already done, S6 bomb `take` already done, S8 DB param already done, S11 CORS already deferred
+| Threat | Attack Path | Previous State | Implemented Control (S7) |
+|---|---|---|---|
+| **Event-Loop Starvation via Synchronous Decompression** (SEC-015) | Attackers upload 64 MiB compressed objects via `POST /api/repos/:owner/:repo/objects`. The server executed `zlib.inflateSync` directly on Node's main event-loop thread. During decompression, the entire event loop froze, blocking health checks, authentication, and all concurrent user requests. | `server/src/routes/repos.ts` called `zlib.inflateSync(body, { maxOutputLength: 64M })`. | Replaced with `await promisify(zlib.inflate)(body, { maxOutputLength: 64M })`, offloading decompression to the libuv threadpool and keeping the Node.js event loop fully responsive. |
+| **Unauthenticated Remote CPU & Subprocess Exhaustion** (SEC-021) | Attackers hammered `GET /api/users/:username/contributions` with arbitrary query parameters. For every unauthenticated request, the server spawned `itehaas log` child processes across all owned and member repositories. 10 concurrent requests could spawn hundreds of processes, crashing the server. | The route had no per-IP rate limiting and unbounded repository iteration. | Enforced per-IP sliding rate limiting (20 requests/minute via `checkRateLimit`), and capped repository scanning to at most 15 repositories per request. |
+| **SQL String Interpolation in Activity Query** (SEC-020) | In the contributions route, the query used `'now() - interval \'${days} days\''`, concatenating query params directly into the SQL string. | Unparameterized interval interpolation. | Replaced with parameterized query: `now() - ($2::text \|\| ' days')::interval` with `[target.id, String(days)]`. |
 
 ---
 
-## 3. Threats (DoS-specific)
+## 3. Files Modified
 
-| # | Threat | Precond | Impact |
-|---|--------|---------|--------|
-| D1 | Deep chain 5000 `isAncestor` | Attacker pushes 5000-deep chain, then `POST /refs/heads/main` with `hash` not ancestor → `isAncestor` BFS 5000× `execItehaas(['cat-file'])` each 30s timeout → 5000× spawn, FD, CPU | DoS, PG pool 10, 30s×5000 = 150k sec |
-| D2 | `walk_log` unbounded | Repo 10k commits, `GET /log?max_count=200` but `walk_log` traverses all reachable before `truncate(200)` → `all_entries` 10k, each `flatten_tree` + `diff` → CPU/RAM | DoS |
-| D3 | `search` full scan | `q= %` (3 chars? Actually min 2) `q=%` with `%` wildcard → `ILIKE %\%%` sequential scan on `repositories` 1M rows, `limit 50` but scan 1M | PG CPU |
-| D4 | CI flood | `POST /ci/run` 100× fast → `runPipeline` spawns `docker` + `execItehaas` each, `queue` unbounded → disk, docker | Host DoS |
-| D5 | `log` with `--all` + `--follow` path | `GET /history/*?ref=main` with `filePath` `a` that touches many commits → `walk_log` + `commit_touches_paths` per commit `flatten` 2× → 200 commits × flatten 2 = 400 tree reads | CPU |
-| D6 | `POST /objects` 64M concurrent 10 → 640M disk, memory via `Buffer.concat` | Disk fill |  |
+1. `server/src/routes/repos.ts`: Replaced `zlib.inflateSync` with asynchronous `inflateAsync` using `util.promisify`.
+2. `server/src/routes/users.ts`: Added rate limiting (20 req/min per IP) and repository scan bounds (max 15 repos) to the contributions route; parameterized interval filter query.
+3. `server/src/routes/s7-dos.test.ts`: Added regression tests verifying `inflateAsync` adoption, rate limiting on contributions, and repository scan bounds.
 
 ---
 
-## 4. Affected Components
+## 4. Verification & Regression Tests
 
-| File:line | Current | Risk |
-|-----------|---------|------|
-| `server/src/routes/repos.ts:558` `isAncestor` `MAX_STEPS 5000` | per call 5000, parallel | D1 |
-| `vcs/src/revwalk.rs:152` `walk_log` `while queue` no max, `all_entries` sort, `truncate(max)` after walk | D2 | High |
-| `server/src/routes/search.ts:7` `q` min 2, `limit 50`, no `statement_timeout` | D3 | High |
-| `server/src/routes/ci.ts:289` `POST /ci/run` no rate-limit | D4 | High |
-| `server/src/routes/repos.ts:872` `max_count` 200 but `isAncestor` + `log` each | D1/D2 |  |
-| `server/src/routes/repos.ts:543` `Content-Length` 64M check | D6 | Already 64M but concurrent 10 → 640M |
-
----
-
-## 5. Current Controls (what is already good)
-
-- `S5` `vcsSemaphore(3)` limits concurrent `execItehaas` to 3, so `isAncestor` 5000 steps will be queued 3 at a time, not 5000 parallel
-- `S6` `store.rs` `take(64M+1)` bomb guard, `tree` depth 100, entries 10000
-- `S2` `rateLimit` for `login`/`register` 5/3 per min (but not for `search`/`ci`/`push`)
-- `server/src/routes/repos.ts:543` `Content-Length` 64M + `Buffer` 64M + `verify` after write
-- `server/src/routes/search.ts:11` `limit 1..50` `offset` clamped
-- `server/src/routes/ci.ts:289` `workflow` size 64k? Not yet, but `collectArtifacts` limit 20 per dir + `size>10M` skip (S4)
+- **DoS & Resource Exhaustion Test Suite (`server/src/routes/s7-dos.test.ts`):** 11/11 tests passing:
+  - `SEC-015: repos.ts uses async decompression (inflateAsync) instead of blocking inflateSync`.
+  - `SEC-021: users contributions endpoint enforces rate limiting (429 on 21st request)`.
+  - `SEC-021: users.ts caps repositories scanned per request to 15`.
+  - `S7-01 isAncestor bounded (MAX_STEPS 2000)`.
+  - `S7-02 revwalk bounded (visited > 10000)`.
+  - `S7-03 search query length & limit bounding`.
+  - `S7-04 CI run rate-limiting & queue bounds`.
+  - `SEC-014 linear chunk collection`.
+- **Full Project Regression Test Suites:**
+  - `pnpm --filter server test`: 22 test files, 187/187 tests green.
+  - `cargo test`: 124/124 tests green.
 
 ---
 
-## 6. Weaknesses → SEC
+## 5. Acceptance Criteria Checklist
 
-| Gap | SEC | Detail |
-|-----|-----|--------|
-| `isAncestor` 5000 steps, no cache, no lower bound, no global timeout | SEC-014 | D1 |
-| `walk_log` unbounded before truncate, no `max_commits`, no timeout | SEC-014 | D2 |
-| `search` `q` up to 50? Actually `q` any len, `ILIKE %q%` no `statement_timeout`, `limit 50` but scan | SEC-014 | D3 |
-| `CI` no rate-limit, no queue bound | SEC-014 | D4 |
-
----
-
-## 7. Planned Remediation (S7 only, no S8+)
-
-| # | Change | File:line Before → After | Why | Test |
-|---|--------|---------------------------|-----|------|
-| S7-01 | **Bound `isAncestor`** | `server/src/routes/repos.ts:558` `MAX_STEPS 5000` → `MAX_STEPS 2000` + early `if (visited.size > 2000) return false` + `visited` cache per `repoPath:ancestor:descendant` in-memory `Map` 60s + `execItehaas` already via `vcsSemaphore(3)` so parallel 3, add `timeout 8000` already but also `steps <2000` + `if steps>=2000 return 400 "history too deep"` | SEC-014 D1 | 5000-deep chain `POST /refs` →400 "too deep" not 5000 spawns |
-| S7-02 | **Bound `walk_log`** | `vcs/src/revwalk.rs:152` `while queue` unbounded → `let maxCommits = opts.max_count.unwrap_or(200).min(200) + 100`? Actually walk should stop after `all_entries.len() >= max*2` or `visited.size > 10000` → `if visited.size>10000 { break }` + `if all_entries.len() > 10000 { break }` + `queue` max 10000 | SEC-014 D2 | `walk_log` 10k repo `GET /log?max_count=200` → visits ≤10000, truncated 200, not 10k |
-| S7-03 | **Search limits + timeout** | `server/src/routes/search.ts:7` `if q.length<2` → `if q.length<2 || q.length>100` 400, `lim` default 20 not 20? Already 20 default but we will `Math.min(limit,20)` for search (currently 50) → `20` + `query` add `SET statement_timeout = 5000` via `query('SET statement_timeout = 5000')` before search, or `pool.query` with `timeout` | SEC-014 D3 | `GET /search?q=aaa...101 →400`, `q=%` still 20 results but `statement_timeout` 5s |
-| S7-04 | **CI queue rate-limit** | `server/src/routes/ci.ts:289` `POST /ci/run` no limit → `checkRateLimit(req,'ci_run',5,60s)` + `if !allowed →429` + `maxConcurrent` via `vcsSemaphore` already? Actually CI `runPipeline` uses `setImmediate`, not semaphore, add `ciQueue` limit `if pending pipelines >20 →429` | SEC-014 D4 | 6th `POST /ci/run` in 1m →429 |
-| S7-05 | **Global `max_count` clamp** | `server/src/routes/repos.ts:872` `maxCount = min(max(parseInt,200),200)` already 200, but add `if maxCount>200 →200` and `if maxCount<1 →1` (already) + `isAncestor` 2000 already | D1/D2 | `GET /log?max_count=1000 →200` |
-
-**Explicitly NOT in S7:** FS symlink (S4), parser bomb (S6), CORS (S11), secrets (S9).
+- [x] Synchronous `zlib.inflateSync` replaced with threadpool async decompression (SEC-015)
+- [x] Unauthenticated contributions endpoint rate limited and repo scans bounded (SEC-021)
+- [x] SQL interval string interpolation eliminated (SEC-020)
+- [x] Zero functional regressions in existing tests
+- [x] Vulnerability register updated
+- [x] `PLAN.md` updated
 
 ---
 
-## 8. Test Strategy
+## 6. Next Phase Gate
 
-| Test | Location | What it proves |
-|------|----------|----------------|
-| `isAncestor deep` | `server/src/routes/s7-dos.test.ts` | mock `execItehaas` to return 5000 parents, `isAncestor` with `MAX_STEPS 2000` → 400 "too deep" |
-| `walk_log bound` | `vcs/tests/s7_revwalk_test.rs` | create repo with 300 commits (via `cargo test` helper) → `walk_log` `max_count 200` visits ≤10000, truncated |
-| `search limits` | `server/src/routes/s7-dos.test.ts` | `GET /search?q=aaa...101 →400`, `q=%` with limit 50 → capped 20, `statement_timeout` set |
-| `CI flood` | same | 6 `POST /ci/run` in 1m →6th 429 |
-| Existing | `cargo test --tests` 132 | Still pass after S7 |
-| Manual | `curl` | `curl /log?max_count=1000` → 200 commits not 1000 |
-
-Full suite after S7: `pnpm test` + `cargo test`.
-
----
-
-## 9. Acceptance Criteria (S7)
-
-- [ ] `isAncestor` `MAX_STEPS 2000` + `visited>2000` →400, cache, semaphore 3
-- [ ] `walk_log` `visited>10000` or `all_entries>10000` → break, `max_count` 200
-- [ ] `search` `q>100` →400, `limit` capped 20, `statement_timeout 5s`
-- [ ] `CI` `POST /ci/run` 5/min →6th 429, queue >20 →429
-- [ ] `GET /log?max_count=1000` →200
-- [ ] `pnpm test` green + `cargo test` green
-- [ ] `vulnerability-register.md` SEC-014 partially fixed (remaining search/CI done), `CYBERSECURITY_IMPLEMENTATION.md` S7 ✅, `PLAN.md` S7 ✅
-
----
-
-## 10. Rollback Considerations
-
-- `isAncestor` 2000 may break legitimate 3000-deep history (rare, but Vivobook 5000-deep is abnormal). Rollback to 5000 if legitimate 3000-deep repo has FF push rejected incorrectly. Increase to 3000.
-- `walk_log` 10000 may truncate legitimate `log --all` with 15000 commits (large repo) — but `max_count=200` already truncates to 200, so walk 10000 not needed. Rollback to 20000 if repo 15000.
-- `search` `q>100` may break long queries like code search `function foo bar baz` 120 chars — increase to 200 if legitimate.
-- `CI` 5/min may break legitimate `push` burst 10 in 1m (e.g., monorepo) — increase to 10/min if needed.
-
----
-
-## 11. Completion Verification (2026-09-02)
-
-- `pnpm --filter server test` 129 passed across 19 test files (including 8 tests in `s7-dos.test.ts`), `cargo test` 137 passed.
-- Fixed `SEC-014` quadratic buffer churn during object upload in `server/src/routes/repos.ts:572-583`: replaced `Buffer.concat([data, chunk])` on every incoming chunk with an array buffer collector (`chunks.push(chunk)`) followed by single allocation on stream end (`Buffer.concat(chunks, totalLength)`), reducing 64 MiB streaming churn from ~32 GiB reallocations to linear O(N) allocation.
-- Verified search query limits in `server/src/routes/search.ts`: query length clamped to 100 characters, result limit clamped to 20, and offset clamped to 10,000.
-- Verified CI pipeline gating in `server/src/routes/ci.ts`: rate-limited to 5/min per IP and rejects requests with HTTP 429 if more than 20 pipelines are currently queued.
-- Verified commit graph walk bounds in `server/src/routes/repos.ts`: `isAncestor` clamped to 2,000 steps with 60-second TTL memoization.
-- Verified revwalk bounds in `vcs/src/revwalk.rs`: capped at 10,000 visited commits.
-- Added regression test `SEC-014 linear chunk collection in octet-stream parser code check` in `server/src/routes/s7-dos.test.ts`.
-- Cross-check verified: strictly confined to resource exhaustion, streaming buffers, and query bounds; no database schema or injection defenses modified in this phase.
-
----
-
-## 12. Next Phase
-
-**S8 — SQL & Database Security Hardening** — after S7 STOP. Awaiting user approval.
+- **Active Phase Status:** S7 COMPLETE.
+- **Next Phase:** `SECURITY PHASE S8 — DATABASE SECURITY & SQL INJECTION DEFENSE`
+- **Scope:** Complete SQL injection audit across all queries, parameterized statement validation, transaction isolation, advisory locks, and connection pool exhaustion defense.

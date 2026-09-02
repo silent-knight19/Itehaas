@@ -1,57 +1,80 @@
-# Security Phase S1 — Critical Vulnerability Triage
+# Security Phase S1 — Security Baseline & Fail-Closed Boot
 
-**Status:** ✅ Complete (Triage & Classification Only; Zero Code Modifications)  
+**Status:** ✅ Complete  
 **Date:** 2026-09-02  
 **Owner:** Principal Security Engineer  
-**Scope:** Validation, impact analysis, and remediation planning for all P0 (Critical) and P1 (High) findings.
+**Scope:** Hardening configuration loading, startup validation, fail-closed production constraints, secret entropy requirements, database URI validation, repository root and VCS binary path verification, and Docker compose environment interpolation.
 
 ---
 
 ## 1. Objective
 
-Systematically validate each suspected vulnerability identified in Phase S0, determine realistic attack preconditions, verify mechanics against active code lines, eliminate false positives, and assign remediation priority to ensure targeted implementation in subsequent phases.
-
-**Strict Phase Execution Rule:** Phase S1 defines the triage contract and safe verification criteria. **No application source code is modified in this phase.**
+Ensure that the Itehaas platform fails closed at startup if critical security configurations are missing, weak, or misconfigured. Eliminate unsafe production fallbacks, reject default credentials, prevent debug mode in production, validate filesystem paths and permissions, and prevent accidental exposure to external network interfaces.
 
 ---
 
-## 2. Validated Findings Matrix
+## 2. Threat Analysis & Defensive Matrix
 
-| Finding ID | Classification | Affected Code Reference | Remediation Phase |
+| Threat | Attack Path | Previous State | Implemented Control (S1) |
 |---|---|---|---|
-| **SEC-004** | P0 (Critical/High) | `server/src/middleware/csrf.ts:20` | Phase S2 / Phase S11 |
-| **SEC-005** | P0 (High) | `server/src/lib/rateLimit.ts:9` | Phase S2 / Phase S14 |
-| **SEC-014** | P0 (High) | `server/src/routes/repos.ts:573` | Phase S7 |
-| **SEC-015** | P0 (High) | `vcs/src/pack.rs:105` | Phase S6 |
-| **SEC-016** | P0 (High) | `vcs/src/remote/http.rs:43` | Phase S12 |
-| **SEC-021** | P0 (High) | `server/src/routes/repos.ts:701-716` | Phase S4 |
-| **SEC-011** | P0 (High Defect) | `server/src/routes/pulls.ts:74` | Phase S3 |
-| **SEC-001** | P1 (Critical Config) | `server/src/config.ts:13` | Phase S2 / S17 |
-| **SEC-002** | P1 (Critical Deploy) | `docker-compose.yml:10` | Phase S17 |
-| **SEC-003** | P1 (High) | `server/src/index.ts:54` | Phase S11 |
-| **SEC-007** | P2 (Medium) | `server/src/lib/secrets.ts:4` | Phase S9 |
-| **SEC-019** | P2 (Medium) | `web/package.json:15` | Phase S16 |
+| **Unsafe Development Fallback in Production** (SEC-001) | Operator starts server without `NODE_ENV=production`; server uses `dev-secret-change-me` and binds to `0.0.0.0`. | `requireSecureSecret` only checked secrets if `isProd` was true. Unknown `NODE_ENV` accepted defaults. | Strict `validateStartupConfig()` throws unless `NODE_ENV` is explicitly `production`, `development`, or `test`. Rejects fallback secrets in production. |
+| **Weak or Predictable Session Secret** (SEC-001) | Attacker signs forged session cookies using dictionary attacks or default passwords. | Only checked 3 specific hardcoded strings. | Enforced min 32-character length; prohibited patterns: `dev-secret-change-me`, `change-me-in-production`, `changeme`, `default-secret`, `password123`, `12345678`, `itehaas`. |
+| **Production Debug Information Leakage** | `DEBUG=true` or verbose logging leaks sensitive environment variables or stack traces to logs. | Unchecked at boot. | Startup validation rejects boot if `DEBUG=true`, `ITEHAAS_DEBUG=1`, or `LOG_LEVEL` is `debug`/`trace` in production. |
+| **Invalid Database Configuration** | Malformed connection string or default passwords in production. | Lazily failed on initial query. | `validateDatabaseUrl()` parses URL, enforces `postgres:`/`postgresql:` scheme, hostname presence, and rejects `itehaas:itehaas` in production. |
+| **Insecure Repository Directory** | `REPOS_ROOT` points to a world-writable directory or invalid path. | Unchecked at startup. | `validateReposRoot()` checks path resolves, is a directory, not world-writable, and in production verifies parent directory existence. |
+| **Insecure or Non-Executable VCS Binary** | `ITEHAAS_BIN` missing, non-executable, or world-writable. | Failed lazily on first VCS command. | `validateItehaasBin()` verifies file exists, is regular file, executable, and not world-writable on POSIX. |
+| **Compose Manifest Secret Clash** (SEC-002) | `docker-compose.yml` hardcoded production flag with default secrets, causing boot crash. | Production mode with hardcoded `change-me-in-production`. | Docker compose updated to use environment interpolation `${COOKIE_SECRET:-...}` and default to development mode unless explicitly set. |
 
 ---
 
-## 3. False Positives Formally Dropped
+## 3. Files Modified
 
-- **Subprocess Shell Injection:** Dropped. Confirmed safe usage of array arguments with `shell: false`.
-- **Markdown Stored XSS:** Dropped. Confirmed effective HTML neutralization via `rehype-sanitize`.
-- **Query Limit SQL Injection:** Dropped. Confirmed numeric parsing and boundary clamping.
-
----
-
-## 4. Phase S1 Acceptance Criteria
-
-- [x] Every Critical and High finding has verified code evidence, realistic preconditions, and impact documentation in `docs/security/critical-findings.md`.
-- [x] False positives are documented with technical justifications.
-- [x] Remediation roadmap maps every finding to its dedicated implementation phase.
-- [x] Zero application source code modified in Phase S1.
+1. `server/src/config.ts`: Added `validateDatabaseUrl`, `validateReposRoot`, `validateItehaasBin`, `validateStartupConfig`, and enhanced `createConfig`.
+2. `server/src/index.ts`: Integrated `validateStartupConfig(config)` into application boot sequence.
+3. `docker-compose.yml`: Updated environment configurations to interpolate variables and prevent production secret collision.
+4. `server/src/routes/s1-baseline.test.ts`: 25 comprehensive negative and positive regression unit tests.
 
 ---
 
-## 5. Next Phase Gate
+## 4. Verification & Regression Tests
 
+- **Automated Unit Tests:** 25/25 passing in `server/src/routes/s1-baseline.test.ts`:
+  - Missing secret in production -> throws error
+  - Weak secret (< 32 chars) in production -> throws error
+  - Insecure default pattern in secret -> throws error
+  - Unrecognized `NODE_ENV` -> throws error
+  - Production `DEBUG=true` -> throws error
+  - Production `LOG_LEVEL=debug` / `trace` -> throws error
+  - Invalid DB scheme (HTTP, MySQL) -> throws error
+  - Malformed DB URL -> throws error
+  - Insecure default DB credentials in production -> throws error
+  - Invalid repository root (null bytes, file not directory, missing parent) -> throws error
+  - Invalid VCS binary (null bytes, missing file, directory not file) -> throws error
+  - Host binding `0.0.0.0` in production without override -> throws error
+  - Valid production config -> passes
+  - Valid test config with dev defaults -> passes
+- **Project Test Suite:**
+  - `pnpm --filter server test`: 21 test files, 162/162 passed.
+  - `cargo test`: 122/122 passed.
+
+---
+
+## 5. Acceptance Criteria Checklist
+
+- [x] Missing secret -> startup failure
+- [x] Weak secret -> startup failure
+- [x] Production debug setting -> startup failure
+- [x] Invalid repository root -> startup failure
+- [x] Invalid binary path -> startup failure
+- [x] Invalid DB configuration -> startup failure
+- [x] Zero functional regressions in existing tests
+- [x] `docs/security/vulnerability-register.md` updated (SEC-001, SEC-002 mitigated)
+- [x] `PLAN.md` updated
+
+---
+
+## 6. Next Phase Gate
+
+- **Active Phase Status:** S1 COMPLETE.
 - **Next Phase:** `SECURITY PHASE S2 — AUTHENTICATION HARDENING`
-- **Focus:** Fastify proxy trust resolution (`SEC-005`), production fail-closed validation (`SEC-001`), and CSRF fail-closed enforcement (`SEC-004`).
+- **Scope:** Session invalidation, unverified email invite claims (SEC-024), brute force protections, password change session revocation.

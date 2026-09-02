@@ -27,6 +27,27 @@ export async function getClient() {
   return pool.connect();
 }
 
+/**
+ * S8: Fail-safe, leak-proof transaction wrapper with automatic ROLLBACK on error
+ * and guaranteed connection release in finally block.
+ */
+export async function withTransaction<T>(fn: (client: any) => Promise<T>): Promise<T> {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {}
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 export function hashStringToInt(s: string): number {
   // S15: for pg_advisory_xact_lock, need 32-bit int from UUID string
   let h = 0;

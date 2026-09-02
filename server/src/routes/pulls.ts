@@ -49,7 +49,19 @@ export async function pullRoutes(app: FastifyInstance) {
     if (!meta) return reply.status(404).send({ error: 'not found' });
     const user = await getSessionUser(req as any);
     if (!(await canRead(meta.id, user?.id ?? null, meta.visibility))) return reply.status(404).send({ error: 'not found' });
-    const res = await query(`SELECT pr.id, pr.title, pr.body, pr.source_branch, pr.target_branch, pr.status, pr.is_draft, pr.source_repo_id, pr.created_at, u.username as author FROM pull_requests pr JOIN users u ON pr.author_id=u.id WHERE pr.repo_id=$1 ORDER BY pr.updated_at DESC`, [meta.id]);
+
+    const qLimit = Math.min(Math.max(parseInt((req.query as any)?.limit ?? '50', 10) || 50, 1), 100);
+    const qOffset = Math.max(parseInt((req.query as any)?.offset ?? '0', 10) || 0, 0);
+    if (qOffset > 50000) return reply.status(400).send({ error: 'offset too large' });
+
+    const res = await query(
+      `SELECT pr.id, pr.title, pr.body, pr.source_branch, pr.target_branch, pr.status, pr.is_draft, pr.source_repo_id, pr.created_at, u.username as author
+       FROM pull_requests pr JOIN users u ON pr.author_id=u.id
+       WHERE pr.repo_id=$1
+       ORDER BY pr.updated_at DESC
+       LIMIT $2 OFFSET $3`,
+      [meta.id, qLimit, qOffset]
+    );
     // Enrich with source_repo name if needed
     for (const row of res.rows) {
       if (row.source_repo_id) {
@@ -239,9 +251,9 @@ export async function pullRoutes(app: FastifyInstance) {
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
     if (!(await canWrite(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
-    // S15: advisory lock for merge (per PR) to prevent concurrent merge race
+    // S15 / SEC-019: Repository-level advisory lock for merge operations to eliminate working tree collisions
     const { hashStringToInt: hashIntMerge } = await import('../db');
-    const mergeLockKey = hashIntMerge(meta.id + ':' + id);
+    const mergeLockKey = hashIntMerge('repo-merge:' + meta.id);
     const mergeLockRes = await query('SELECT pg_try_advisory_lock($1) as locked', [mergeLockKey]);
     if (!mergeLockRes.rows[0]?.locked) {
       return reply.status(423).send({ error: 'merge locked, retry' });
@@ -477,6 +489,16 @@ export async function pullRoutes(app: FastifyInstance) {
     const { owner, repo, id, username } = req.params as any;
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(meta.id, user.id, meta.visibility))) return reply.status(404).send({ error: 'not found' });
+
+    // SEC-012: Verify PR belongs to repository and verify caller is PR author or has write permission
+    const prRes = await query(`SELECT author_id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
+    if (prRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+
+    const isAuthor = prRes.rows[0].author_id === user.id;
+    const canW = await canWrite(meta.id, user.id);
+    if (!isAuthor && !canW) return reply.status(403).send({ error: 'forbidden' });
+
     const target = await query(`SELECT id FROM users WHERE username=$1`, [username]);
     if (target.rows.length === 0) return reply.status(404).send({ error: 'user not found' });
     const del = await query(`DELETE FROM pr_requested_reviewers WHERE pr_id=$1 AND user_id=$2`, [id, target.rows[0].id]);

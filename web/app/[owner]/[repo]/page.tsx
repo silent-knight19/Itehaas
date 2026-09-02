@@ -60,12 +60,13 @@ function RepoPageContent({ params }: Params) {
       }
       setRepoInfo(r.json.repo);
       const queryBranch = searchParams.get("branch");
-      setSelectedBranch(queryBranch || r.json.repo.default_branch || "main");
+      const activeBranch = queryBranch || r.json.repo.default_branch || "main";
+      setSelectedBranch(activeBranch);
 
       const b = await Api.listBranches(owner, repo);
       if (b.ok && b.json.branches) setBranches(b.json.branches);
 
-      const l = await Api.log(owner, repo);
+      const l = await Api.log(owner, repo, 100, activeBranch);
       if (l.ok && l.json.commits) setCommits(l.json.commits);
 
       const s = await Api.getStars(owner, repo);
@@ -87,7 +88,7 @@ function RepoPageContent({ params }: Params) {
 
   useEffect(() => {
     loadData();
-  }, [owner, repo, searchParams]);
+  }, [owner, repo, searchParams.get("branch")]);
 
   // Helper to fetch tree at path
   async function fetchTreeAtPath(rootTreeHash: string, targetPath: string): Promise<TreeEntry[] | null> {

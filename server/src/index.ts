@@ -18,6 +18,9 @@ import { searchRoutes } from './routes/search';
 import { metrics, incHttpRequest, incAuthFailure, incRateLimited, renderMetrics } from './lib/metrics';
 
 async function buildApp() {
+  if (typeof (config as any).validateStartupConfig === 'function') {
+    (config as any).validateStartupConfig(config);
+  }
   const app = Fastify({
     trustProxy: true,
     logger: {
@@ -52,17 +55,45 @@ async function buildApp() {
     permittedCrossDomainPolicies: { permittedPolicies: 'none' },
     hidePoweredBy: true,
   });
-  // S11: CORS allowlist — origin:true in dev, allowlist in prod
+  // S12/SEC-003: CORS allowlist — strict origin validation, reject null, maxAge preflight caching
+  const devOrigins = [
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:3001',
+  ];
+  const defaultProdOrigins = ['https://itehaas.tailnet.ts.net', 'https://itehaas.local'];
   const allowedOrigins = process.env.ALLOWED_ORIGIN
     ? process.env.ALLOWED_ORIGIN.split(',').map((s) => s.trim()).filter(Boolean)
     : config.isProd
-      ? ['https://itehaas.tailnet.ts.net', 'https://itehaas.local']
-      : true;
+      ? defaultProdOrigins
+      : [...devOrigins, ...defaultProdOrigins];
+
   await app.register(fastifyCors, {
-    origin: allowedOrigins as any,
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (origin === 'null') return cb(null, false);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(null, false);
+    },
     credentials: true,
     methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'X-XSRF-Token', 'X-Requested-With'],
+    maxAge: 86400,
+  });
+
+  // Support empty JSON bodies gracefully without throwing FST_ERR_CTP_EMPTY_JSON_BODY
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
+    if (!body || (typeof body === 'string' && body.trim() === '')) {
+      done(null, {});
+      return;
+    }
+    try {
+      done(null, JSON.parse(body));
+    } catch (err: any) {
+      err.statusCode = 400;
+      done(err, undefined);
+    }
   });
   // S11: CSRF double-submit for cookie-auth state-changing
   app.addHook('onRequest', async (req, reply) => {
@@ -77,11 +108,16 @@ async function buildApp() {
     }
   });
 
-  // S14: global rate-limit 100/min per IP (generous, to prevent flood)
+  // S14: global rate-limit per IP (skip CORS OPTIONS preflight)
   app.addHook('onRequest', async (req, reply) => {
-    // Skip health/metrics from global limit? No, include but 100 is generous
+    if (req.method === 'OPTIONS') {
+      return;
+    }
     const { checkRateLimit, rateLimitReply } = await import('./lib/rateLimit');
-    const rl = checkRateLimit(req as any, 'global', 100, 60 * 1000);
+    // In development mode, allow 2000/min to accommodate Next.js React 18 StrictMode double-rendering and rapid dev browsing.
+    // In test and production environments, strictly enforce the 100/min security ceiling.
+    const limit = config.nodeEnv === 'development' ? 2000 : 100;
+    const rl = checkRateLimit(req as any, 'global', limit, 60 * 1000);
     if (!rl.allowed) {
       return rateLimitReply(reply as any, rl.resetMs);
     }

@@ -39,7 +39,7 @@ vi.mock('../config', () => ({
 }));
 
 import { buildApp } from '../index';
-import { encryptSecret, decryptSecret, decryptSecretSafe } from '../lib/secrets';
+import { encryptSecret, decryptSecret, decryptSecretSafe, rotateSecret, maskSecretInLog } from '../lib/secrets';
 import { __clearRateLimitBuckets, __clearLoginFails } from '../lib/rateLimit';
 
 describe('S9 Secret Management', () => {
@@ -189,5 +189,53 @@ describe('S9 Secret Management', () => {
     expect(res.json().user).not.toHaveProperty('password_hash');
     expect(JSON.stringify(res.json())).not.toContain('argon2id');
     await app.close();
+  });
+
+  it('S9: IV uniqueness - encrypting identical plaintext produces distinct IVs and ciphertexts', () => {
+    const text = 'identical-secret-payload';
+    const c1 = encryptSecret(text);
+    const c2 = encryptSecret(text);
+    expect(c1).not.toBe(c2);
+    expect(c1.slice(3, 19)).not.toBe(c2.slice(3, 19)); // IV part differs
+    expect(decryptSecret(c1)).toBe(text);
+    expect(decryptSecret(c2)).toBe(text);
+  });
+
+  it('S9: AEAD auth tag tampering causes decryption to fail', () => {
+    const text = 'tamper-evident-secret';
+    const ciphertext = encryptSecret(text);
+    const raw = Buffer.from(ciphertext.slice(3), 'base64');
+    // Flip a byte in the tag or ciphertext
+    raw[raw.length - 1] ^= 0x01;
+    const tampered = 'v1:' + raw.toString('base64');
+    expect(() => decryptSecret(tampered)).toThrow();
+  });
+
+  it('S9: Key rotation - rotateSecret re-encrypts with new key', () => {
+    const text = 'rotate-me-securely';
+    const oldCiphertext = encryptSecret(text);
+    const newKey = 'new-secret-key-32-chars-long-abc1234567';
+    const rotated = rotateSecret(oldCiphertext, newKey);
+    expect(rotated).not.toBe(oldCiphertext);
+    // Decrypting with new key succeeds
+    expect(decryptSecret(rotated, newKey)).toBe(text);
+    // Decrypting with default key fails
+    expect(() => decryptSecret(rotated)).toThrow();
+  });
+
+  it('S9: maskSecretInLog scrubs raw, url-encoded, base64, and json-escaped secrets', () => {
+    const secret = 'p@ss"w/rd&123';
+    const urlEnc = encodeURIComponent(secret);
+    const b64 = Buffer.from(secret).toString('base64');
+    const jsonEsc = JSON.stringify(secret).slice(1, -1);
+
+    const log = `Normal ${secret} and url ${urlEnc} and b64 ${b64} and json ${jsonEsc} inside log`;
+    const masked = maskSecretInLog(log, secret);
+
+    expect(masked).not.toContain(secret);
+    expect(masked).not.toContain(urlEnc);
+    expect(masked).not.toContain(b64);
+    expect(masked).not.toContain(jsonEsc);
+    expect(masked).toContain('***');
   });
 });

@@ -4,17 +4,25 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import * as zlib from 'zlib';
+import { promisify } from 'util';
+const inflateAsync = promisify(zlib.inflate);
 import { query, getClient } from '../db';
 import { repoPathFor, execItehaas } from '../lib/vcs';
 import { getSessionUser, requireAuth } from '../middleware/auth';
-import { canRead, canWrite, isAdmin } from '../lib/permissions';
+import { canRead, canWrite, isAdmin, isOwner } from '../lib/permissions';
 import { auditLog } from '../lib/audit';
 
 function validateOwnerRepo(owner: string, repo: string): boolean {
   return /^[a-zA-Z0-9._-]{1,100}$/.test(owner) && /^[a-zA-Z0-9._-]{1,100}$/.test(repo);
 }
 
-// S4: strict file path validation (no traversal, no absolute, no dotfiles that escape, no backslash, no null)
+const WINDOWS_RESERVED_NAMES = new Set([
+  'con', 'prn', 'aux', 'nul',
+  'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
+  'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9',
+]);
+
+// S4: strict file path validation (no traversal, no absolute, no dotfiles that escape, no backslash, no null, no case collisions)
 export function isValidFilePath(p: string): boolean {
   if (!p || p.length > 500) return false;
   if (p.includes('\0') || p.includes('\\')) return false;
@@ -35,11 +43,12 @@ export function isValidFilePath(p: string): boolean {
   const parts = cur.split('/');
   for (const part of parts) {
     if (part === '' || part === '.' || part === '..') return false;
-    if (part === '.itehaas' || part === '.git') return false;
-    // Reject segments starting with '.' to block dotfile escape per spec (allow but block .itehas already)
-    // For file browsing, we allow dotfiles like .gitignore? But per S4 spec we block p.startsWith('.')
-    // To avoid breaking .gitignore, we only block . and .. and .itehaas/.git
-    // So we allow .gitignore but block hidden traversal
+    if (part.endsWith('.') || part.endsWith(' ')) return false;
+    const lower = part.toLowerCase();
+    if (lower === '.itehaas' || lower === '.git' || lower === '.hg' || lower === '.svn') return false;
+    if (lower.startsWith('itehaa~') || lower.startsWith('git~')) return false;
+    const baseName = lower.split('.')[0];
+    if (WINDOWS_RESERVED_NAMES.has(baseName)) return false;
     if (part.length > 100) return false;
   }
   if (cur.includes('//')) return false;
@@ -258,7 +267,7 @@ export async function repoRoutes(app: FastifyInstance) {
     );
     if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const repoId = res.rows[0].id;
-    if (!(await isAdmin(repoId, user.id))) return reply.status(403).send({ error: 'forbidden' });
+    if (!(await isOwner(repoId, user.id))) return reply.status(403).send({ error: 'forbidden: only the repository owner can delete this repository' });
 
     // S15: advisory lock for delete vs push race
     const { hashStringToInt: hashIntDel } = await import('../db');
@@ -423,7 +432,7 @@ export async function repoRoutes(app: FastifyInstance) {
     if (!ok) return reply.status(404).send({ error: 'not found' });
 
     const members = await query(
-      `SELECT u.username, u.email, m.role, m.created_at FROM repository_members m JOIN users u ON m.user_id=u.id WHERE m.repo_id=$1 ORDER BY m.created_at`,
+      `SELECT u.username, m.role, m.created_at FROM repository_members m JOIN users u ON m.user_id=u.id WHERE m.repo_id=$1 ORDER BY m.created_at`,
       [repoId]
     );
     // include owner as admin if not in members? Owner is inserted as admin, so list covers.
@@ -586,12 +595,28 @@ export async function repoRoutes(app: FastifyInstance) {
     payload.on('error', (err: any) => done(err, undefined));
   });
 
-  // Helper: isAncestor via commit DAG walk using cat-file — S7 bounded
+  // Helper: isAncestor via single-process CLI merge-base (SEC-016), with S7 bounded fallback
   async function isAncestor(repoPath: string, ancestor: string, descendant: string): Promise<boolean> {
     if (ancestor === descendant) return true;
     const cacheKey = isAncestorCacheKey(repoPath, ancestor, descendant);
     const cached = isAncestorCache.get(cacheKey);
     if (cached && Date.now() < cached.expires) return cached.value;
+
+    // SEC-016: Try native single-process CLI merge-base --is-ancestor first (eliminates subprocess storm)
+    try {
+      const res = await execItehaas(['merge-base', '--is-ancestor', ancestor, descendant], { cwd: repoPath, timeout: 8000 });
+      if (res.code === 0 && (res.stdout.trim() === 'true' || res.stdout.includes('true'))) {
+        isAncestorCache.set(cacheKey, { value: true, expires: Date.now() + 60_000 });
+        return true;
+      }
+      if (res.code === 1 || res.stdout.trim() === 'false' || res.stdout.includes('false')) {
+        isAncestorCache.set(cacheKey, { value: false, expires: Date.now() + 60_000 });
+        return false;
+      }
+    } catch {
+      // If CLI command fails or in unit tests with mocked exec, fall through to bounded walk
+    }
+
     const visited = new Set<string>();
     const stack: string[] = [descendant];
     let steps = 0;
@@ -695,9 +720,9 @@ export async function repoRoutes(app: FastifyInstance) {
       }
     } catch {}
 
-    // S4/SEC-021: Verify object integrity before placement into permanent CAS path
+    // S7/SEC-015: Verify object integrity asynchronously offloaded to threadpool, preventing event-loop starvation
     try {
-      const canonical = zlib.inflateSync(body, { maxOutputLength: 64 * 1024 * 1024 + 1024 });
+      const canonical = await inflateAsync(body, { maxOutputLength: 64 * 1024 * 1024 + 1024 });
       const algo = hash.length === 40 ? 'sha1' : 'sha256';
       const computedHash = crypto.createHash(algo).update(canonical).digest('hex');
       if (computedHash !== hash) {
@@ -991,15 +1016,47 @@ export async function repoRoutes(app: FastifyInstance) {
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
     const maxCount = Math.min(Math.max(parseInt((req.query as any)?.max_count ?? '100', 10) || 100, 1), 200);
     const wantFull = (req.query as any)?.full === '1' || (req.query as any)?.full === 'true';
-    // Default to full hash for web (Phase 7) to enable tree browsing. Keep oneline for backwards compat if ?short=1
-    if ((req.query as any)?.short === '1') {
-      const args = ['log', '--oneline', '--max-count', String(maxCount)];
-      const res = await execItehaas(args, { cwd: repoPath });
-      if (res.code !== 0) {
-        if (res.stderr.includes('no commits yet')) return reply.send({ commits: [] });
-        return reply.status(500).send({ error: res.stderr });
+
+    // Branch/ref override: if ?ref=<branch> is provided, temporarily redirect HEAD so that
+    // itehaas log walks from the requested branch tip rather than always from main/HEAD.
+    const refParam: string | undefined = (req.query as any)?.ref;
+    const headPath = require('path').join(repoPath, '.itehaas', 'HEAD');
+    let originalHead: string | null = null;
+    if (refParam && isValidBranchRef(refParam)) {
+      const refFilePath = require('path').join(repoPath, '.itehaas', 'refs', 'heads', ...refParam.split('/'));
+      try {
+        const branchHash = require('fs').readFileSync(refFilePath, 'utf8').trim();
+        if (/^[0-9a-f]{40,64}$/.test(branchHash)) {
+          originalHead = require('fs').readFileSync(headPath, 'utf8');
+          require('fs').writeFileSync(headPath, `ref: refs/heads/${refParam}\n`);
+        }
+      } catch { /* branch may not exist; fall back to current HEAD */ }
+    }
+
+    let logRes: { code: number; stdout: string; stderr: string };
+    try {
+      // Default to full hash for web (Phase 7) to enable tree browsing. Keep oneline for backwards compat if ?short=1
+      if ((req.query as any)?.short === '1') {
+        const args = ['log', '--oneline', '--max-count', String(maxCount)];
+        logRes = await execItehaas(args, { cwd: repoPath });
+      } else {
+        // Full hash mode: parse `itehaas log` (no --oneline)
+        const args = ['log', '--max-count', String(maxCount)];
+        logRes = await execItehaas(args, { cwd: repoPath });
       }
-      const commits = res.stdout
+    } finally {
+      // Always restore the original HEAD
+      if (originalHead !== null) {
+        try { require('fs').writeFileSync(headPath, originalHead); } catch {}
+      }
+    }
+
+    if (logRes.code !== 0) {
+      if (logRes.stderr.includes('no commits yet')) return reply.send({ commits: [] });
+      return reply.status(500).send({ error: logRes.stderr });
+    }
+    if ((req.query as any)?.short === '1') {
+      const commits = logRes.stdout
         .trim()
         .split('\n')
         .filter(Boolean)
@@ -1009,15 +1066,8 @@ export async function repoRoutes(app: FastifyInstance) {
         });
       return reply.send({ commits });
     }
-    // Full hash mode: parse `itehaas log` (no --oneline)
-    const args = ['log', '--max-count', String(maxCount)];
-    const res = await execItehaas(args, { cwd: repoPath });
-    if (res.code !== 0) {
-      if (res.stderr.includes('no commits yet')) return reply.send({ commits: [] });
-      return reply.status(500).send({ error: res.stderr });
-    }
     // Parse full log: split by "\ncommit "
-    const raw = res.stdout.trim();
+    const raw = logRes.stdout.trim();
     if (!raw) return reply.send({ commits: [] });
     const blocks = raw.split('\ncommit ').map((b, i) => (i === 0 ? b : 'commit ' + b));
     const commits: { hash: string; message: string; author?: string; date?: string }[] = [];
@@ -1339,6 +1389,33 @@ export async function repoRoutes(app: FastifyInstance) {
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { name, url } = parsed.data;
+
+    // SEC-007: Reject filesystem remotes (file://, local paths) to prevent cross-tenant repository exfiltration
+    if (!/^https?:\/\//i.test(url)) {
+      return reply.status(400).send({ error: 'invalid remote url: must be http:// or https://' });
+    }
+    try {
+      const u = new URL(url);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+        return reply.status(400).send({ error: 'invalid remote url protocol' });
+      }
+      if (u.username || u.password) {
+        return reply.status(400).send({ error: 'credentials in remote url are not permitted' });
+      }
+      const rawHost = u.hostname.toLowerCase();
+      const h = rawHost.replace(/^\[|\]$/g, '');
+      const isPrivate = h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '::'
+        || h === '0.0.0.0' || h === 'metadata.google.internal' || h.endsWith('.internal') || h.endsWith('.local')
+        || h.startsWith('10.') || h.startsWith('192.168.') || h.startsWith('169.254.')
+        || /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)
+        || h.startsWith('::ffff:') || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80');
+      if (isPrivate && process.env.ALLOW_PRIVATE_REMOTES !== 'true' && process.env.ALLOW_LOCALHOST_REMOTE !== 'true') {
+        return reply.status(400).send({ error: 'private or internal remote urls are forbidden' });
+      }
+    } catch (e: any) {
+      if (reply.sent) return;
+      return reply.status(400).send({ error: 'invalid remote url' });
+    }
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
     const res = await execItehaas(['remote', 'add', name, url], { cwd: repoPath });

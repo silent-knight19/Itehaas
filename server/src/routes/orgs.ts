@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { query, getClient } from '../db';
 import { getSessionUser, requireAuth } from '../middleware/auth';
+import { isAdmin } from '../lib/permissions';
 
 function validateOrgName(name: string): boolean {
   return /^[a-zA-Z0-9._-]{3,32}$/.test(name);
@@ -99,7 +100,7 @@ export async function orgRoutes(app: FastifyInstance) {
     if (!validateOrgName(org)) return reply.status(400).send({ error: 'invalid org name' });
     const orgRes = await query(`SELECT id FROM organizations WHERE name=$1`, [org]);
     if (orgRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
-    const members = await query(`SELECT u.username, u.email, om.role, om.created_at FROM organization_members om JOIN users u ON om.user_id=u.id WHERE om.org_id=$1 ORDER BY om.created_at`, [orgRes.rows[0].id]);
+    const members = await query(`SELECT u.username, om.role, om.created_at FROM organization_members om JOIN users u ON om.user_id=u.id WHERE om.org_id=$1 ORDER BY om.created_at`, [orgRes.rows[0].id]);
     return reply.send({ members: members.rows });
   });
 
@@ -197,7 +198,7 @@ export async function orgRoutes(app: FastifyInstance) {
     const orgId = orgRes.rows[0].id;
     const teamRes = await query(`SELECT id FROM teams WHERE org_id=$1 AND name=$2`, [orgId, team]);
     if (teamRes.rows.length === 0) return reply.status(404).send({ error: 'team not found' });
-    const members = await query(`SELECT u.username, u.email FROM team_members tm JOIN users u ON tm.user_id=u.id WHERE tm.team_id=$1`, [teamRes.rows[0].id]);
+    const members = await query(`SELECT u.username FROM team_members tm JOIN users u ON tm.user_id=u.id WHERE tm.team_id=$1`, [teamRes.rows[0].id]);
     return reply.send({ members: members.rows });
   });
 
@@ -243,6 +244,11 @@ export async function orgRoutes(app: FastifyInstance) {
     const repoRes = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (repoRes.rows.length === 0) return reply.status(404).send({ error: 'repo not found' });
     const repoId = repoRes.rows[0].id;
+
+    // SEC-006: User must be admin of the repository to attach it to an organization team
+    if (!(await isAdmin(repoId, user.id))) {
+      return reply.status(403).send({ error: 'forbidden: admin permission required on target repository' });
+    }
     try {
       await query(`INSERT INTO team_repositories (team_id, repo_id, permission) VALUES ($1,$2,$3)`, [teamRes.rows[0].id, repoId, permission]);
     } catch (e: any) {

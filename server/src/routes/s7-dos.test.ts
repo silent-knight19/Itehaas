@@ -200,4 +200,50 @@ describe('S7 Resource Exhaustion / DoS', () => {
     expect(content).toContain('Buffer.concat(chunks, totalLength)');
     expect(content).not.toMatch(/data\s*=\s*Buffer\.concat\(\[data,\s*chunk\]\)/);
   });
+
+  it('SEC-015: repos.ts uses async decompression (inflateAsync) instead of blocking inflateSync', async () => {
+    const fs = await import('fs');
+    const content = fs.readFileSync('src/routes/repos.ts', 'utf8');
+    expect(content).toContain('inflateAsync = promisify(zlib.inflate)');
+    expect(content).toContain('await inflateAsync(body');
+    expect(content).not.toContain('zlib.inflateSync');
+  });
+
+  it('SEC-021: users contributions endpoint enforces rate limiting (429 on 21st request)', async () => {
+    mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+      if (text.includes('SELECT 1')) return { rows: [{ '?column?': 1 }] };
+      if (text.includes('FROM users WHERE username')) {
+        return { rows: [{ id: 'u-target', username: 'targetuser', email: 'target@example.com' }] };
+      }
+      if (text.includes('FROM repositories r JOIN users u')) {
+        return { rows: [] };
+      }
+      if (text.includes('FROM activity')) return { rows: [] };
+      return { rows: [], rowCount: 0 };
+    });
+
+    const app = await buildApp();
+    for (let i = 0; i < 20; i++) {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/users/targetuser/contributions?year=2026&days=30&rnd=${i}`,
+      });
+      expect(res.statusCode).toBe(200);
+    }
+
+    const res21 = await app.inject({
+      method: 'GET',
+      url: `/api/users/targetuser/contributions?year=2026&days=30&rnd=21`,
+    });
+    expect(res21.statusCode).toBe(429);
+    expect(res21.json().error).toMatch(/too many requests/);
+    await app.close();
+  });
+
+  it('SEC-021: users.ts caps repositories scanned per request to 15', async () => {
+    const fs = await import('fs');
+    const content = fs.readFileSync('src/routes/users.ts', 'utf8');
+    expect(content).toContain('MAX_REPOS_TO_SCAN = 15');
+    expect(content).toContain('filteredRepos.slice(0, MAX_REPOS_TO_SCAN)');
+  });
 });

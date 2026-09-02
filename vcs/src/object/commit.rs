@@ -29,7 +29,7 @@ impl Signature {
 }
 
 fn validate_sig_field(s: &str, field: &str) -> Result<()> {
-    if s.contains('<') || s.contains('>') || s.contains('\n') {
+    if s.contains('<') || s.contains('>') || s.contains('\n') || s.contains('\r') || s.contains('\0') {
         return Err(ItehaasError::InvalidObject(format!(
             "invalid signature {field}: {s:?}"
         )));

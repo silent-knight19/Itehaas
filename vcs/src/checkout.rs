@@ -17,10 +17,10 @@ fn ensure_no_symlink_and_inside_repo(repo: &Path, abs: &Path) -> Result<()> {
     if rel_str.is_empty() {
         return Err(ItehaasError::Other("empty path".into()));
     }
-    // Reject .itehaas/.git segments
+    // Reject forbidden segments (case-insensitive control directories, 8.3 aliases, Windows reserved, traversal)
     for comp in rel.components() {
         let s = comp.as_os_str().to_string_lossy();
-        if s == ".itehaas" || s == ".git" {
+        if crate::object::tree::is_forbidden_component(&s) {
             return Err(ItehaasError::Other(format!("path contains forbidden component: {}", s)));
         }
         if s == ".." || s == "." {

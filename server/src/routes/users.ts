@@ -4,6 +4,7 @@ import { query } from '../db';
 import { getSessionUser, requireAuth } from '../middleware/auth';
 import { validateBio } from '../lib/auth';
 import { execItehaas, repoPathFor } from '../lib/vcs';
+import { checkRateLimit, rateLimitReply } from '../lib/rateLimit';
 
 const USERNAME_REGEX = /^[a-zA-Z0-9._-]{3,32}$/;
 const RESERVED = new Set(['login','register','api','health','settings','explore','_next','admin','root','owner','repo']);
@@ -65,11 +66,14 @@ export async function userRoutes(app: FastifyInstance) {
     const activityCountRes = await query(`SELECT count(*)::int as c FROM activity WHERE user_id = $1`, [user.id]);
     const activityCount = activityCountRes.rows[0].c;
 
+    const sessionUser = await getSessionUser(req as any);
+    const isSelf = sessionUser?.id === user.id;
+
     return reply.send({
       user: {
         id: user.id,
         username: user.username,
-        email: user.email,
+        email: isSelf ? user.email : undefined,
         bio: user.bio ?? '',
         avatar_url: user.avatar_url ?? null,
         created_at: user.created_at,
@@ -344,6 +348,10 @@ export async function userRoutes(app: FastifyInstance) {
 
   // GET /api/users/:username/contributions?year=2026&days=365
   app.get('/api/users/:username/contributions', async (req, reply) => {
+    // S7/SEC-021: Rate limit unauthenticated contributions endpoint to prevent remote CPU / subprocess exhaustion
+    const rl = checkRateLimit(req, 'users:contributions', 20, 60_000);
+    if (!rl.allowed) return rateLimitReply(reply, rl.resetMs);
+
     const username = getUsernameParam(req.params as any, reply);
     if (!username) return;
     const target = await getUserRow(username);
@@ -414,8 +422,8 @@ export async function userRoutes(app: FastifyInstance) {
     // Fetch activity in window
     try {
       const actRes = await query(
-        `SELECT created_at FROM activity WHERE user_id=$1 AND created_at >= now() - interval '${days} days'`,
-        [target.id]
+        `SELECT created_at FROM activity WHERE user_id=$1 AND created_at >= now() - ($2::text || ' days')::interval`,
+        [target.id, String(days)]
       );
       for (const row of actRes.rows) {
         const d = new Date(row.created_at);
@@ -471,7 +479,9 @@ export async function userRoutes(app: FastifyInstance) {
       } catch {}
     }
 
-    const queue = [...filteredRepos];
+    // S7/SEC-021: Cap maximum repositories scanned per request to 15 to prevent subprocess explosion
+    const MAX_REPOS_TO_SCAN = 15;
+    const queue = filteredRepos.slice(0, MAX_REPOS_TO_SCAN);
     const workers: Promise<void>[] = [];
     for (let w=0; w<concurrency; w++) {
       workers.push((async () => {

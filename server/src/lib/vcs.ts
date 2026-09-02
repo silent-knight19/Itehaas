@@ -34,7 +34,7 @@ const ALLOWED_FLAGS = new Set([
   '--follow', '--staged', '--cached', '--amend', '-b', '-c', '-d', '-D', '--soft', '--mixed',
   '--hard', '--staged', '--worktree', '--source', '--cached', '-n', '--dry-run', '-d', '--dirs',
   '-u', '--include-untracked', '-a', '-d', '-l', '--stage', '--others', '--ignored', '-v',
-  '--history', '--continue', '--abort', '-i', '--interactive', '--prune',
+  '--history', '--continue', '--abort', '-i', '--interactive', '--prune', '--is-ancestor',
   // generic
   '--', '-v', '--help',
 ]);

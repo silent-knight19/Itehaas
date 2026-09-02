@@ -97,3 +97,66 @@ fn test_checkout_dot_itehaas_blocked() {
     // Just check that checkout doesn't block normal file
     assert!(code == 0 || code != 0); // not strict
 }
+
+#[test]
+fn test_is_forbidden_component_blocks_case_and_aliases() {
+    use itehaas_lib::object::tree::is_forbidden_component;
+
+    // Control structures (case-insensitive)
+    assert!(is_forbidden_component(".itehaas"));
+    assert!(is_forbidden_component(".Itehaas"));
+    assert!(is_forbidden_component(".ITEHAAS"));
+    assert!(is_forbidden_component(".git"));
+    assert!(is_forbidden_component(".Git"));
+    assert!(is_forbidden_component(".GIT"));
+    assert!(is_forbidden_component(".hg"));
+    assert!(is_forbidden_component(".svn"));
+
+    // 8.3 short filename collisions
+    assert!(is_forbidden_component("itehaa~1"));
+    assert!(is_forbidden_component("ITEHAA~1"));
+    assert!(is_forbidden_component("git~1"));
+    assert!(is_forbidden_component("GIT~1"));
+
+    // Windows device names
+    assert!(is_forbidden_component("CON"));
+    assert!(is_forbidden_component("prn"));
+    assert!(is_forbidden_component("aux"));
+    assert!(is_forbidden_component("NUL"));
+    assert!(is_forbidden_component("com1"));
+    assert!(is_forbidden_component("lpt1"));
+
+    // Traversal and normalization
+    assert!(is_forbidden_component(".."));
+    assert!(is_forbidden_component("."));
+    assert!(is_forbidden_component("foo."));
+    assert!(is_forbidden_component("foo "));
+
+    // Safe names
+    assert!(!is_forbidden_component("README.md"));
+    assert!(!is_forbidden_component("main.rs"));
+    assert!(!is_forbidden_component(".gitignore"));
+    assert!(!is_forbidden_component("my_itehaas_doc.txt"));
+}
+
+#[test]
+fn test_tree_entry_creation_rejects_forbidden_names() {
+    use itehaas_lib::hash::Hash;
+    use itehaas_lib::object::TreeEntry;
+
+    let dummy_hash = Hash {
+        algo: HashAlgo::Sha256,
+        bytes: [0u8; 32].to_vec(),
+    };
+
+    // Forbidden names should fail
+    assert!(TreeEntry::new(0o100644, ".Itehaas".into(), dummy_hash.clone()).is_err());
+    assert!(TreeEntry::new(0o100644, ".ITEHAAS".into(), dummy_hash.clone()).is_err());
+    assert!(TreeEntry::new(0o100644, "itehaa~1".into(), dummy_hash.clone()).is_err());
+    assert!(TreeEntry::new(0o100644, ".git".into(), dummy_hash.clone()).is_err());
+    assert!(TreeEntry::new(0o100644, "CON".into(), dummy_hash.clone()).is_err());
+    assert!(TreeEntry::new(0o100644, "..".into(), dummy_hash.clone()).is_err());
+
+    // Legitimate name should succeed
+    assert!(TreeEntry::new(0o100644, "safe_file.rs".into(), dummy_hash).is_ok());
+}

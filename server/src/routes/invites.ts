@@ -1,17 +1,17 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { query } from '../db';
+import { query, getClient } from '../db';
 import { getSessionUser, requireAuth } from '../middleware/auth';
 import { isAdmin } from '../lib/permissions';
 
 export async function inviteRoutes(app: FastifyInstance) {
-  // List invites for current user (pending)
+  // List invites for current user (pending, scoped strictly to authenticated user ID to prevent email invite interception)
   app.get('/api/invites', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
     const res = await query(
-      `SELECT id, org_id, team_id, repo_id, role, token, status, expires_at, created_at FROM invites WHERE (invited_user_id = $1 OR email = $2) AND status = 'pending' ORDER BY created_at DESC`,
-      [user.id, user.email]
+      `SELECT id, org_id, team_id, repo_id, role, token, status, expires_at, created_at FROM invites WHERE invited_user_id = $1 AND status = 'pending' ORDER BY created_at DESC`,
+      [user.id]
     );
     return reply.send({ invites: res.rows });
   });
@@ -117,38 +117,58 @@ export async function inviteRoutes(app: FastifyInstance) {
     return reply.status(201).send({ invite: res.rows[0] });
   });
 
-  // Accept invite
+  // Accept invite with row-level transaction locking to prevent race conditions
   app.post('/api/invites/:token/accept', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
     const { token } = req.params as any;
-    const invRes = await query(`SELECT * FROM invites WHERE token=$1 AND status='pending'`, [token]);
-    if (invRes.rows.length === 0) return reply.status(404).send({ error: 'invite not found or expired' });
-    const inv = invRes.rows[0];
-    if (new Date(inv.expires_at) < new Date()) {
-      await query(`UPDATE invites SET status='expired' WHERE id=$1`, [inv.id]);
-      return reply.status(410).send({ error: 'invite expired' });
-    }
-    if (inv.invited_user_id && inv.invited_user_id !== user.id) return reply.status(403).send({ error: 'invite not for you' });
-    if (inv.email && inv.email !== user.email && !inv.invited_user_id) {
-      // allow if email matches
-      if (inv.email !== user.email) return reply.status(403).send({ error: 'email mismatch' });
-    }
-    // Apply invite
-    if (inv.org_id) {
-      await query(`INSERT INTO organization_members (org_id, user_id, role) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [inv.org_id, user.id, inv.role]);
-    } else if (inv.team_id) {
-      await query(`INSERT INTO team_members (team_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [inv.team_id, user.id]);
-      // Also ensure org membership
-      const teamOrg = await query(`SELECT org_id FROM teams WHERE id=$1`, [inv.team_id]);
-      if (teamOrg.rows.length > 0) {
-        await query(`INSERT INTO organization_members (org_id, user_id, role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`, [teamOrg.rows[0].org_id, user.id]);
+    const client = await getClient();
+    try {
+      await client.query('BEGIN');
+      const invRes = await client.query(`SELECT * FROM invites WHERE token=$1 AND status='pending' FOR UPDATE`, [token]);
+      if (invRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return reply.status(404).send({ error: 'invite not found or expired' });
       }
-    } else if (inv.repo_id) {
-      await query(`INSERT INTO repository_members (repo_id, user_id, role) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [inv.repo_id, user.id, inv.role]);
+      const inv = invRes.rows[0];
+      if (new Date(inv.expires_at) < new Date()) {
+        await client.query(`UPDATE invites SET status='expired' WHERE id=$1`, [inv.id]);
+        await client.query('COMMIT');
+        return reply.status(410).send({ error: 'invite expired' });
+      }
+      if (inv.invited_user_id && inv.invited_user_id !== user.id) {
+        await client.query('ROLLBACK');
+        return reply.status(403).send({ error: 'invite not for you' });
+      }
+      if (inv.email && inv.email !== user.email && !inv.invited_user_id) {
+        // allow if email matches
+        if (inv.email !== user.email) {
+          await client.query('ROLLBACK');
+          return reply.status(403).send({ error: 'email mismatch' });
+        }
+      }
+      // Apply invite
+      if (inv.org_id) {
+        await client.query(`INSERT INTO organization_members (org_id, user_id, role) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [inv.org_id, user.id, inv.role]);
+      } else if (inv.team_id) {
+        await client.query(`INSERT INTO team_members (team_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [inv.team_id, user.id]);
+        // Also ensure org membership
+        const teamOrg = await client.query(`SELECT org_id FROM teams WHERE id=$1`, [inv.team_id]);
+        if (teamOrg.rows.length > 0) {
+          await client.query(`INSERT INTO organization_members (org_id, user_id, role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`, [teamOrg.rows[0].org_id, user.id]);
+        }
+      } else if (inv.repo_id) {
+        await client.query(`INSERT INTO repository_members (repo_id, user_id, role) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [inv.repo_id, user.id, inv.role]);
+      }
+      await client.query(`UPDATE invites SET status='accepted' WHERE id=$1`, [inv.id]);
+      await client.query('COMMIT');
+      return reply.send({ ok: true });
+    } catch (err: any) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
     }
-    await query(`UPDATE invites SET status='accepted' WHERE id=$1`, [inv.id]);
-    return reply.send({ ok: true });
   });
 
   // Reject invite

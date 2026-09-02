@@ -26,13 +26,36 @@ fn validate_mode(mode: u32) -> Result<()> {
     }
 }
 
-fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err(ItehaasError::InvalidObject("empty tree entry name".into()));
+pub fn is_forbidden_component(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return true;
     }
-    if name.contains('/') || name.contains('\0') {
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return true;
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower == ".itehaas" || lower == ".git" || lower == ".hg" || lower == ".svn" {
+        return true;
+    }
+    if lower.starts_with("itehaa~") || lower.starts_with("git~") {
+        return true;
+    }
+    let base = lower.split('.').next().unwrap_or(&lower);
+    matches!(
+        base,
+        "con" | "prn" | "aux" | "nul"
+            | "com1" | "com2" | "com3" | "com4" | "com5" | "com6" | "com7" | "com8" | "com9"
+            | "lpt1" | "lpt2" | "lpt3" | "lpt4" | "lpt5" | "lpt6" | "lpt7" | "lpt8" | "lpt9"
+    )
+}
+
+fn validate_name(name: &str) -> Result<()> {
+    if is_forbidden_component(name) {
         return Err(ItehaasError::InvalidObject(format!(
-            "invalid tree entry name: {name:?}"
+            "invalid or forbidden tree entry name: {name:?}"
         )));
     }
     Ok(())

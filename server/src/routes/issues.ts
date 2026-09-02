@@ -34,7 +34,11 @@ export async function issueRoutes(app: FastifyInstance) {
     if (!repoMeta) return reply.status(404).send({ error: 'not found' });
     const user = await getSessionUser(req as any);
     if (!(await canRead(repoMeta.id, user?.id ?? null, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
-    const { status, label, assignee, milestone } = req.query as any;
+    const { status, label, assignee, milestone, limit, offset } = req.query as any;
+    const qLimit = Math.min(Math.max(parseInt(limit ?? '50', 10) || 50, 1), 100);
+    const qOffset = Math.max(parseInt(offset ?? '0', 10) || 0, 0);
+    if (qOffset > 50000) return reply.status(400).send({ error: 'offset too large' });
+
     let sql = `SELECT i.id, i.title, i.body, i.status, i.milestone_id, i.created_at, i.updated_at, u.username as author FROM issues i JOIN users u ON i.author_id=u.id WHERE repo_id=$1`;
     const params: any[] = [repoMeta.id];
     let idx = 2;
@@ -45,7 +49,8 @@ export async function issueRoutes(app: FastifyInstance) {
       if (m.rows.length > 0) { sql += ` AND i.milestone_id=$${idx++}`; params.push(m.rows[0].id); }
       else { sql += ` AND 1=0`; }
     }
-    sql += ` ORDER BY updated_at DESC`;
+    sql += ` ORDER BY updated_at DESC LIMIT $${idx++} OFFSET $${idx++}`;
+    params.push(qLimit, qOffset);
     const res = await query(sql, params);
     let issues = res.rows;
     // Filter by label and assignee in memory (since many-to-many)
@@ -83,8 +88,14 @@ export async function issueRoutes(app: FastifyInstance) {
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
-    if (!(await canWrite(repoMeta.id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
+    // SEC-023: Public collaboration allows read-permitted users to open issues on public repos;
+    // private repos require write permission.
+    if (repoMeta.visibility === 'private') {
+      if (!(await canWrite(repoMeta.id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
+    } else {
+      if (!(await canRead(repoMeta.id, user.id, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
+    }
+    const canW = await canWrite(repoMeta.id, user.id);
     const schema = z.object({
       title: z.string().min(1).max(200),
       body: z.string().max(5000).optional().default(''),
@@ -96,7 +107,7 @@ export async function issueRoutes(app: FastifyInstance) {
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { title, body, labels, assignees, milestone } = parsed.data;
     let milestoneId: string | null = null;
-    if (milestone) {
+    if (milestone && canW) {
       const m = await query(`SELECT id FROM milestones WHERE repo_id=$1 AND (id::text=$2 OR title=$2)`, [repoMeta.id, milestone]);
       if (m.rows.length === 0) return reply.status(400).send({ error: 'milestone not found' });
       milestoneId = m.rows[0].id;
@@ -163,7 +174,8 @@ export async function issueRoutes(app: FastifyInstance) {
     const { owner, repo, id } = req.params as any;
     const repoMeta = await getRepoId(owner, repo);
     if (!repoMeta) return reply.status(404).send({ error: 'not found' });
-    const issue = await query(`SELECT author_id, repo_id FROM issues WHERE id=$1`, [id]);
+    // SEC-011: Strict repository scoping — prevent cross-repository issue tampering
+    const issue = await query(`SELECT author_id, repo_id FROM issues WHERE id=$1 AND repo_id=$2`, [id, repoMeta.id]);
     if (issue.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const isAuthor = issue.rows[0].author_id === user.id;
     const canW = await canWrite(repoMeta.id, user.id);

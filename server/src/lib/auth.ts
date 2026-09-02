@@ -49,9 +49,21 @@ export function validateBio(bio: string): string | null {
   return null;
 }
 
+const COMMON_PASSWORDS = new Set([
+  'password',
+  'password123',
+  '12345678',
+  '123456789',
+  'qwertyuiop',
+  'admin123',
+  'itehaas123',
+  'welcome123',
+]);
+
 export function validatePassword(password: string): string | null {
   if (password.length < 8) return 'password must be at least 8 characters';
   if (password.length > 128) return 'password too long';
+  if (COMMON_PASSWORDS.has(password.toLowerCase())) return 'password is too common or weak';
   return null;
 }
 
@@ -77,15 +89,13 @@ export function validateSessionId(sid: string): boolean {
 
 // CSRF: SameSite=lax is primary defense. For state-changing API calls,
 // we also accept optional X-CSRF-Token header if client opts in.
-// Now HMAC with cookieSecret (per S2, not yet enforced — S11 will enforce header check).
+// HMAC with cookieSecret.
 export function csrfTokenForSession(sessionId: string): string {
-  // HMAC-SHA256 with cookieSecret — deterministic per session, not reversible without secret
-  // Verification in S11 preHandler will compare HMAC.
   try {
     const h = crypto.createHmac('sha256', config.cookieSecret).update(sessionId).digest('base64url');
     return h.slice(0, 32);
   } catch {
-    // Fallback during tests where config may throw in prod, but not in dev
-    return Buffer.from(sessionId).toString('base64url').slice(0, 32);
+    // Return cryptographically secure random token, never leak the session ID
+    return crypto.randomBytes(24).toString('base64url');
   }
 }
