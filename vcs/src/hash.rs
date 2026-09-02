@@ -1,4 +1,5 @@
 use crate::error::{ItehaasError, Result};
+use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest, Sha256};
 
 /// Hash algorithm. One repo = one algo (format invariant).
@@ -121,10 +122,31 @@ impl Hasher for Sha256Hasher {
     }
 }
 
-/// Factory — Phase 1 SHA-256 only; others return UnsupportedAlgo.
+pub struct Sha1Hasher;
+
+impl Hasher for Sha1Hasher {
+    fn algo(&self) -> HashAlgo {
+        HashAlgo::Sha1
+    }
+    fn hash_len(&self) -> usize {
+        20
+    }
+    fn hash(&self, data: &[u8]) -> Hash {
+        let mut h = Sha1::new();
+        h.update(data);
+        let out = h.finalize();
+        Hash::new(HashAlgo::Sha1, out.to_vec()).expect("sha1 len")
+    }
+    fn name(&self) -> &'static str {
+        "sha1"
+    }
+}
+
+/// Factory — supports SHA-256 and SHA-1 (Blake3 still stubbed)
 pub fn new_hasher(algo: HashAlgo) -> Result<Box<dyn Hasher>> {
     match algo {
         HashAlgo::Sha256 => Ok(Box::new(Sha256Hasher)),
+        HashAlgo::Sha1 => Ok(Box::new(Sha1Hasher)),
         other => Err(ItehaasError::UnsupportedAlgo(other.as_str().to_string())),
     }
 }

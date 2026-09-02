@@ -369,12 +369,250 @@ export async function repoRoutes(app: FastifyInstance) {
     return reply.send({ refs, head, hasher });
   });
 
+  // Raw octet-stream parser for push (64 MiB limit)
+  app.addContentTypeParser('application/octet-stream', function (request: any, payload: any, done: any) {
+    let data = Buffer.alloc(0);
+    payload.on('data', (chunk: Buffer) => {
+      data = Buffer.concat([data, chunk]);
+      if (data.length > 64 * 1024 * 1024 + 1024) {
+        // Too large - will be handled as 413 later, but abort early
+        (payload as any).destroy(new Error('Payload too large'));
+      }
+    });
+    payload.on('end', () => done(null, data));
+    payload.on('error', (err: any) => done(err, undefined));
+  });
+
+  // Helper: isAncestor via commit DAG walk using cat-file
+  async function isAncestor(repoPath: string, ancestor: string, descendant: string): Promise<boolean> {
+    if (ancestor === descendant) return true;
+    const visited = new Set<string>();
+    const stack: string[] = [descendant];
+    let steps = 0;
+    const MAX_STEPS = 5000;
+    while (stack.length > 0 && steps < MAX_STEPS) {
+      const cur = stack.pop()!;
+      if (cur === ancestor) return true;
+      if (visited.has(cur)) continue;
+      visited.add(cur);
+      steps++;
+      try {
+        const res = await execItehaas(['cat-file', '-p', cur], { cwd: repoPath, timeout: 8000 });
+        if (res.code !== 0) continue;
+        // Parse commit parents: lines starting with "parent "
+        for (const line of res.stdout.split('\n')) {
+          if (line.startsWith('parent ')) {
+            const h = line.slice(7).trim();
+            if (/^[0-9a-f]{64}$/.test(h) && !visited.has(h)) stack.push(h);
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
+    return false;
+  }
+
+  function appendReflog(repoPath: string, refName: string, oldHash: string | null, newHash: string, message: string) {
+    try {
+      const zero = '0'.repeat(64);
+      const old = oldHash ?? zero;
+      // read user
+      let name = 'Author';
+      let email = 'author@example.com';
+      try {
+        const cfg = fs.readFileSync(path.join(repoPath, '.itehaas', 'config'), 'utf8');
+        const inUser = cfg.includes('[user]');
+        if (inUser) {
+          const nameMatch = cfg.match(/name\s*=\s*(.+)/);
+          const emailMatch = cfg.match(/email\s*=\s*(.+)/);
+          if (nameMatch) name = nameMatch[1].trim().replace(/^["']|["']$/g, '');
+          if (emailMatch) email = emailMatch[1].trim().replace(/^["']|["']$/g, '');
+        }
+      } catch {}
+      const ts = Math.floor(Date.now() / 1000);
+      const tz = '+0000';
+      const line = `${old} ${newHash} ${name} <${email}> ${ts} ${tz}\t${message}\n`;
+      const logPath = path.join(repoPath, '.itehaas', 'logs', refName);
+      fs.mkdirSync(path.dirname(logPath), { recursive: true });
+      fs.appendFileSync(logPath, line);
+    } catch {}
+  }
+
+  // Push: upload object — POST /api/repos/:owner/:repo/objects/:hash
+  app.post('/api/repos/:owner/:repo/objects/:hash', async (req, reply) => {
+    const { owner, repo, hash } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    if (!/^[0-9a-f]+$/.test(hash) || (hash.length !== 40 && hash.length !== 64)) return reply.status(400).send({ error: 'invalid object hash' });
+    const user = await getSessionUser(req as any);
+    if (!user) return reply.status(401).send({ error: 'not authenticated' });
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canWrite(r.rows[0].id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
+    // Note: canWrite returns false for private anon, but canWrite checks isOwner or role write/admin; private push needs write, else 403
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+
+    // Enforce size via Content-Length header if present
+    const cl = (req.headers['content-length'] as string | undefined);
+    if (cl && parseInt(cl, 10) > 64 * 1024 * 1024) return reply.status(413).send({ error: 'Object too large' });
+
+    const body = (req as any).body as Buffer | undefined;
+    if (!body || !Buffer.isBuffer(body)) return reply.status(400).send({ error: 'missing body' });
+    if (body.length > 64 * 1024 * 1024) return reply.status(413).send({ error: 'Object too large' });
+    if (body.length === 0) return reply.status(400).send({ error: 'empty object' });
+
+    const prefix = hash.slice(0, 2);
+    const suffix = hash.slice(2);
+    const objectPath = path.join(repoPath, '.itehaas', 'objects', prefix, suffix);
+    const resolvedRoot = path.resolve(repoPath);
+    const resolvedObj = path.resolve(objectPath);
+    if (!resolvedObj.startsWith(resolvedRoot + path.sep)) return reply.status(400).send({ error: 'invalid hash' });
+
+    // Dedup: if exists, verify and return 200
+    try {
+      const stat = await fs.promises.stat(objectPath);
+      if (stat.isFile()) {
+        // verify? assume ok
+        return reply.send({ ok: true, hash, dedup: true });
+      }
+    } catch {}
+
+    // Atomic write via temp file
+    const dir = path.dirname(objectPath);
+    await fs.promises.mkdir(dir, { recursive: true });
+    const tmp = path.join(dir, `.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    try {
+      await fs.promises.writeFile(tmp, body);
+      // Verify via itehaas verify (reads and re-hashes)
+      // Write to final path atomically
+      try {
+        await fs.promises.rename(tmp, objectPath);
+      } catch (e: any) {
+        if (e.code === 'EEXIST') {
+          // race, dedup
+          try { await fs.promises.unlink(tmp); } catch {}
+          return reply.send({ ok: true, hash, dedup: true });
+        }
+        throw e;
+      }
+      // Verify
+      const ver = await execItehaas(['verify', hash], { cwd: repoPath });
+      if (ver.code !== 0) {
+        // Corrupt: remove file
+        try { await fs.promises.unlink(objectPath); } catch {}
+        return reply.status(400).send({ error: 'Corrupt object: hash mismatch' });
+      }
+      return reply.status(201).send({ ok: true, hash });
+    } catch (e: any) {
+      try { await fs.promises.unlink(tmp); } catch {}
+      return reply.status(500).send({ error: e.message });
+    }
+  });
+
+  // Push: update ref — POST /api/repos/:owner/:repo/refs/heads/:branch
+  app.post('/api/repos/:owner/:repo/refs/heads/*', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    const branch = (req.params as any)['*'] as string;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    if (!branch || typeof branch !== 'string') return reply.status(400).send({ error: 'branch required' });
+    if (branch.length > 100 || branch.includes('..') || branch.includes('//') || branch.startsWith('/') || branch.endsWith('/') || branch.includes('\0') || branch.includes(' ') || branch.includes('~') || branch.includes('^') || branch.includes(':') || branch.includes('?') || branch.includes('*') || branch.includes('[') || branch.includes('\\') || branch.endsWith('.lock') || branch.includes('@{')) {
+      return reply.status(400).send({ error: 'invalid branch name' });
+    }
+    // also check component starting with .
+    for (const part of branch.split('/')) {
+      if (part.startsWith('.') || part === '') return reply.status(400).send({ error: 'invalid branch name' });
+    }
+
+    const body = (req.body as any) ?? {};
+    const { hash, force } = body as { hash?: string; force?: boolean };
+    if (!hash || !/^[0-9a-f]+$/.test(hash) || (hash.length !== 40 && hash.length !== 64)) return reply.status(400).send({ error: 'invalid hash' });
+    const useForce = !!force;
+
+    const user = await getSessionUser(req as any);
+    if (!user) return reply.status(401).send({ error: 'not authenticated' });
+    const r = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canWrite(r.rows[0].id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
+
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+
+    const refPath = path.join(repoPath, '.itehaas', 'refs', 'heads', ...branch.split('/'));
+    const lockPath = refPath + '.lock';
+
+    // Acquire lock (exclusive)
+    let lockFd: fs.promises.FileHandle | null = null;
+    try {
+      // Ensure parent dir exists
+      await fs.promises.mkdir(path.dirname(refPath), { recursive: true });
+      lockFd = await fs.promises.open(lockPath, 'wx').catch(() => null) as any;
+      if (!lockFd) {
+        return reply.status(423).send({ error: 'ref locked, retry' });
+      }
+
+      // Read current hash
+      let current: string | null = null;
+      try {
+        const cur = (await fs.promises.readFile(refPath, 'utf8')).trim();
+        if (/^[0-9a-f]{64}$/.test(cur)) current = cur;
+      } catch (e: any) {
+        if (e.code !== 'ENOENT') throw e;
+      }
+
+      // Fast-forward check
+      if (!useForce && current && current !== hash) {
+        // Need to ensure object exists for both hashes
+        const curExists = fs.existsSync(path.join(repoPath, '.itehaas', 'objects', current.slice(0, 2), current.slice(2)));
+        const newExists = fs.existsSync(path.join(repoPath, '.itehaas', 'objects', hash.slice(0, 2), hash.slice(2)));
+        if (!newExists) return reply.status(400).send({ error: 'object not found on server for new hash' });
+        if (!curExists) {
+          // current missing but file existed? should not happen
+        } else {
+          const ff = await isAncestor(repoPath, current, hash);
+          if (!ff) return reply.status(409).send({ error: 'non-fast-forward push rejected (remote is not ancestor); use --force' });
+        }
+      }
+
+      // Verify new object is commit and exists
+      const ver = await execItehaas(['cat-file', '-t', hash], { cwd: repoPath });
+      if (ver.code !== 0) return reply.status(400).send({ error: 'object not found or not a commit' });
+      if (ver.stdout.trim() !== 'commit') return reply.status(400).send({ error: 'ref must point to a commit' });
+
+      // Atomic write ref
+      const tmp = refPath + `.tmp-${process.pid}-${Date.now()}`;
+      await fs.promises.writeFile(tmp, hash + '\n');
+      await fs.promises.rename(tmp, refPath);
+
+      // Append reflog
+      const msg = `push: update ${branch} ${current ? current.slice(0,7) + '..' + hash.slice(0,7) : hash.slice(0,7)}${useForce ? ' (forced)' : ''}`;
+      appendReflog(repoPath, `refs/heads/${branch}`, current, hash, msg);
+      // Also HEAD reflog if HEAD points to this branch
+      try {
+        const headContent = (await fs.promises.readFile(path.join(repoPath, '.itehaas', 'HEAD'), 'utf8')).trim();
+        if (headContent === `ref: refs/heads/${branch}`) {
+          appendReflog(repoPath, 'HEAD', current, hash, msg);
+        }
+      } catch {}
+
+      return reply.send({ ok: true, branch, hash, previous: current ?? null });
+    } catch (e: any) {
+      return reply.status(500).send({ error: e.message });
+    } finally {
+      if (lockFd) {
+        try { await lockFd.close(); } catch {}
+        try { await fs.promises.unlink(lockPath); } catch {}
+      }
+    }
+  });
+
   // Stream raw object bytes for HTTP clone (requires read, immutable, cacheable)
   // GET /api/repos/:owner/:repo/objects/:hash
   app.get('/api/repos/:owner/:repo/objects/:hash', async (req, reply) => {
     const { owner, repo, hash } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
-    if (!/^[0-9a-f]{64}$/.test(hash)) return reply.status(400).send({ error: 'invalid object hash' });
+    if (!/^[0-9a-f]+$/.test(hash) || (hash.length !== 40 && hash.length !== 64)) return reply.status(400).send({ error: 'invalid object hash' });
     const user = await getSessionUser(req as any);
     const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });

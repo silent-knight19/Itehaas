@@ -1792,6 +1792,12 @@ fn cmd_fetch(repo: &Path, remote_opt: Option<String>) -> Result<()> {
     let url = config::get_remote_url(repo, &remote_name)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .ok_or_else(|| anyhow::anyhow!("remote '{}' not found", remote_name))?;
+    if itehaas_lib::remote::is_http_url(&url) {
+        let n = itehaas_lib::remote::http::http_fetch(repo, &remote_name, &url)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        println!("Fetched {} objects from {} (http)", n, remote_name);
+        return Ok(());
+    }
     let remote_path = itehaas_lib::remote::resolve_remote_path(repo, &url)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -1831,6 +1837,25 @@ fn cmd_push(repo: &Path, remote_opt: Option<String>, branch_opt: Option<String>,
     let url = config::get_remote_url(repo, &remote_name)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .ok_or_else(|| anyhow::anyhow!("remote '{}' not found", remote_name))?;
+    if itehaas_lib::remote::is_http_url(&url) {
+        // HTTP push path
+        let branch = if let Some(b) = branch_opt {
+            b
+        } else {
+            itehaas_lib::refs::current_branch(repo)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                .ok_or_else(|| anyhow::anyhow!("cannot push detached HEAD, specify branch"))?
+        };
+        let local_ref = format!("refs/heads/{}", branch);
+        let local_hash = itehaas_lib::refs::read_ref(repo, &local_ref)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("branch '{}' has no commits", branch))?;
+        let n = itehaas_lib::remote::http::http_push(repo, &remote_name, &url, &branch, &local_hash, force)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        println!("Pushed {} to {} ({} objects, http)", branch, remote_name, n);
+        println!(" * {} -> {} {}", branch, remote_name, &local_hash.hex()[..7]);
+        return Ok(());
+    }
     let remote_path = itehaas_lib::remote::resolve_remote_path(repo, &url)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;

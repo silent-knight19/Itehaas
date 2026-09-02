@@ -57,12 +57,12 @@ impl Object {
     }
 
     /// Parse body for a given type. Used on read.
-    pub fn parse(object_type: &str, body: Vec<u8>) -> Result<Self> {
+    pub fn parse(algo: crate::hash::HashAlgo, object_type: &str, body: Vec<u8>) -> Result<Self> {
         match object_type {
             "blob" => Ok(Self::Blob(Blob::new(body))),
-            "tree" => parse_tree(body),
-            "commit" => parse_commit(body),
-            "tag" => parse_tag(body),
+            "tree" => parse_tree(algo, body),
+            "commit" => parse_commit(algo, body),
+            "tag" => parse_tag(algo, body),
             other => Err(ItehaasError::InvalidObject(format!(
                 "unknown object type: {other}"
             ))),
@@ -70,7 +70,7 @@ impl Object {
     }
 }
 
-fn parse_tree(body: Vec<u8>) -> Result<Object> {
+fn parse_tree(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
     let mut entries = Vec::new();
     let mut pos = 0usize;
     while pos < body.len() {
@@ -98,23 +98,15 @@ fn parse_tree(body: Vec<u8>) -> Result<Object> {
             )));
         }
         pos += nul + 1;
-        // Hash raw bytes: we don't know algo yet. For Phase 1 we infer from remaining.
-        // Actual hash length will be validated by store against repo algo.
-        // Here we take 32 bytes if at least 32 remain, else error.
-        // We need algo info; store will re-validate length. For now assume 32.
-        // To allow algo-agnostic parsing, we store bytes and algo will be injected by store.
-        // As a compromise, parse as 32B and store will replace algo if needed.
-        // For correctness, we require at least 32 bytes remain.
-        if body.len() - pos < 32 {
+        let hash_len = algo.hash_len();
+        if body.len() - pos < hash_len {
             return Err(ItehaasError::InvalidObject(
                 "tree: truncated hash".into(),
             ));
         }
-        // We don't know HashAlgo at this layer; create with Sha256 placeholder.
-        // Store layer will validate and re-tag if needed (but Phase 1 is SHA-256 only, so ok).
-        let hash_bytes = body[pos..pos + 32].to_vec();
-        let hash = Hash::new(crate::hash::HashAlgo::Sha256, hash_bytes)?;
-        pos += 32;
+        let hash_bytes = body[pos..pos + hash_len].to_vec();
+        let hash = Hash::new(algo, hash_bytes)?;
+        pos += hash_len;
         entries.push(TreeEntry { mode, name, hash });
     }
     // Validate sorted & dedup? Tree::new does it. But we need to allow unsorted input to detect?
@@ -137,8 +129,7 @@ fn parse_tree(body: Vec<u8>) -> Result<Object> {
     Ok(Object::Tree(Tree { entries }))
 }
 
-fn parse_commit(body: Vec<u8>) -> Result<Object> {
-    use crate::hash::HashAlgo;
+fn parse_commit(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
     let text = String::from_utf8(body).map_err(|_| ItehaasError::InvalidObject("commit: invalid utf8".into()))?;
     let lines: Vec<&str> = text.split('\n').collect();
     let mut idx = 0usize;
@@ -152,13 +143,13 @@ fn parse_commit(body: Vec<u8>) -> Result<Object> {
         return Err(ItehaasError::InvalidObject("commit: missing tree".into()));
     }
     let tree_hex = lines[idx].strip_prefix("tree ").unwrap().trim();
-    tree = Some(Hash::from_hex(HashAlgo::Sha256, tree_hex)?);
+    tree = Some(Hash::from_hex(algo, tree_hex)?);
     idx += 1;
 
     // parents
     while idx < lines.len() && lines[idx].starts_with("parent ") {
         let h = lines[idx].strip_prefix("parent ").unwrap().trim();
-        parents.push(Hash::from_hex(HashAlgo::Sha256, h)?);
+        parents.push(Hash::from_hex(algo, h)?);
         idx += 1;
     }
 
@@ -200,8 +191,7 @@ fn parse_commit(body: Vec<u8>) -> Result<Object> {
     }))
 }
 
-fn parse_tag(body: Vec<u8>) -> Result<Object> {
-    use crate::hash::HashAlgo;
+fn parse_tag(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
     let text = String::from_utf8(body).map_err(|_| ItehaasError::InvalidObject("tag: invalid utf8".into()))?;
     let lines: Vec<&str> = text.split('\n').collect();
     let mut idx = 0;
@@ -209,7 +199,7 @@ fn parse_tag(body: Vec<u8>) -> Result<Object> {
         return Err(ItehaasError::InvalidObject("tag: missing object".into()));
     }
     let object_hex = lines[idx].strip_prefix("object ").unwrap().trim();
-    let object = Hash::from_hex(HashAlgo::Sha256, object_hex)?;
+    let object = Hash::from_hex(algo, object_hex)?;
     idx += 1;
     if idx >= lines.len() || !lines[idx].starts_with("type ") {
         return Err(ItehaasError::InvalidObject("tag: missing type".into()));

@@ -232,7 +232,7 @@ fn test_hash_algo_mismatch() {
 #[test]
 fn test_unsupported_algo() {
     let res = new_hasher(HashAlgo::Sha1);
-    assert!(res.is_err());
+    assert!(res.is_ok()); // Sha1 now supported as of Phase 12
     let res2 = new_hasher(HashAlgo::Blake3);
     assert!(res2.is_err());
 }

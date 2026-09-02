@@ -22,18 +22,18 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ### Last Completed
 
-- Phase 8 complete: `database/migrations/002_collaboration.sql` (issues, prs, stars, notifications, activity) + `server/src/routes/issues.ts` + `pulls.ts` (diff via `execItehaas diff`, merge via `execItehaas merge`/`vcs/src/merge.rs`) + `stars.ts` (stars/notifications/activity), web issues/pulls + repo star toggle
 - Phase 9 complete: `database/migrations/003_ci.sql` (pipelines, jobs, secrets) + `server/src/routes/ci.ts` queue `install→test→build` + `simulateRun` via `execItehaas log` + logs/status, `web/app/[owner]/[repo]/ci` + `docker-compose.yml` server/web + `server/web Dockerfiles`
 - Phase 10 complete: `vcs/src/pack.rs` `pack` + `verify_pack` + `list_packs`, `vcs/src/gc.rs` reachable BFS + prune, `vcs/src/fsck.rs` `fsck` + `count_objects`, CLI `fsck|gc|pack|count-objects` (`vcs/src/main.rs:520`), `vcs/tests/phase10_tests.rs` 4 tests (fsck ok, gc unreachable, pack verify, count), `docs/vcs-advanced.md` + `docs/ci.md` + `docs/collaboration.md`
 - Phase 11 complete: `vcs/src/reflog.rs` (logs/HEAD + logs/refs/heads/*, record on commit/checkout/reset), `vcs/src/reset.rs` (--soft/--mixed/--hard + paths), `vcs/src/restore.rs` (--staged/--worktree/--source), `vcs/src/ignore.rs` (.itehaasignore+.gitignore, `*`/`?`/`**`/`!`/`/`), `vcs/src/stash.rs` (refs/stash + stash_list, push/pop/apply/list/show/clear/drop), tag CLI (lightweight/annotated), branch -a/-r/-m, rm/mv/clean, `itehaas reflog`, 10 tests `phase11_tests.rs`, `cargo test` 75+2
+- Phase 12 (partial) complete: `docs/remote-protocol.md` (refs discovery, negotiation, object/pack, auth, FF, lock), `vcs/src/remote/http.rs` (`http_fetch` incremental, `upload_object_http`, `http_push` missing-set, `update_remote_ref_http` 409/423), `server/src/routes/repos.ts` (POST /objects/:hash 64M + verify, POST /refs/heads/* atomic CAS + isAncestor + 423 lock + reflog), HTTP clone+fetch+push+pull verified (`http-test` private repo), SHA-1 mode local (`Sha1Hasher` + `hash.rs`, `object/mod.rs` algo-aware, `init --algo sha1`), 4 tests `phase12_tests.rs`
 
 ### Currently Working On
 
-- Phase 12 design (`docs/remote-protocol.md`) + HTTP fetch/push negotiation
+- Phase 12 remaining: pack streaming (`POST /pack`), thin-pack negotiation, Git interop test suite
 
 ### Next
 
-- Phase 12 — Remote Transport & Git Interop (HTTP fetch/push/pull, pack streaming, SHA-1 mode)
+- Phase 13 — History & Code Archaeology (log --all/--graph/-p, show, blame, grep, ls-files, bisect, amend, cherry-pick, revert, rebase)
 
 ## Phase Status Table
 
@@ -51,6 +51,7 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 9 | CI/CD | ✅ Complete |
 | 10 | Advanced VCS / Git Interop | ✅ Complete |
 | 11 | VCS Recovery & Daily-Use | ✅ Complete |
+| 12 | Remote Transport & Git Interop | 🟡 In Progress (HTTP fetch/push/pull + SHA-1 local) |
 
 Status icons: ✅ Complete · 🟡 In Progress · ⬜ Not Started · 🔴 Blocked · ⏸️ Deferred
 
@@ -499,6 +500,33 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Recovery scenarios (hard reset, reflog) tested — manual `reset --hard` + `reflog` — 2026-09-02
 - [x] Regression 65→75 Rust tests green, manual `cargo test` + `itehaas --help` — 2026-09-02
 - [x] docs updated — this file + `vcs/src/ignore.rs`+`reflog.rs`+`reset.rs`+`restore.rs`+`stash.rs`
+
+## Phase 12 — Remote Transport & Git Interop
+
+### Scope
+
+- [x] Remote protocol design — `docs/remote-protocol.md` (refs discovery, object negotiation, pack, auth, FF, lock) — 2026-09-02
+- [x] HTTP fetch — incremental `GET /refs` + `GET /objects/:hash` reuse (`vcs/src/remote/http.rs:340` `http_fetch` visited dedup, `vcs/src/main.rs:1790` dispatch) — 2026-09-02
+- [x] HTTP push — object upload `POST /objects/:hash` (64M, verify, dedup) + ref CAS `POST /refs/heads/:branch` (409 non-ff, 423 lock, isAncestor walk, reflog) (`server/src/routes/repos.ts:442` + `vcs/src/remote/http.rs:460` `http_push`) — 2026-09-02
+- [x] HTTP pull — `fetch_http` + `merge` (FF/3-way, already_up_to_date) (`vcs/src/main.rs:1915` via `cmd_fetch`+`merge`) — 2026-09-02
+- [x] SHA-1 repo mode — `vcs/src/hash.rs:30` `Sha1Hasher` via `sha1 0.10`, `init --algo sha1`, `object/mod.rs:73` algo-aware parse (`hash_len`), `store.rs:118` `hasher.algo()` parse, `server/src/lib/vcs.ts:11` `HASH_REGEX` 40|64, `remote/http.rs` 40/64 — 2026-09-02
+- [ ] Pack streaming (`POST /pack` ITEHAAS PACK v1 streaming, thin-pack, delta) — deferred (per-object upload sufficient <10k)
+- [ ] Negotiation `want/have/ACK` (`POST /refs/negotiate`) — deferred (client dedup sufficient)
+- [ ] Git interop suite (`git` oracle) — deferred
+
+### Dependencies
+
+- Depends on: Phase 11 reflog/branch, Phase 5 remote, Phase 10 pack — met
+
+### Definition of Done — Phase 12 (initial)
+
+- [x] HTTP fetch works (private repo via `ITEHAAS_TOKEN`, incremental 0 vs 6 objects) — manual `http-test` clone/fetch/pull — 2026-09-02
+- [x] HTTP push works (3 objects, FF, non-ff 409, --force) — manual `push` + `push --force` — 2026-09-02
+- [x] HTTP pull = fetch+merge (fast-forward + 3-way) — manual `pull` — 2026-09-02
+- [x] Concurrent push race handled (`.lock` + 423, retry) — `repos.ts:542` — 2026-09-02
+- [x] SHA-1 `init --algo sha1` + commit + cat-file 40 hex — `phase12_tests.rs:7` — 2026-09-02
+- [x] Tests `phase12_tests` 4 (sha1, http base, hash factory, incremental) — 2026-09-02
+- [ ] Pack streaming + Git oracle — deferred to Phase 12.5
 
 ## Security Hardening
 

@@ -116,8 +116,8 @@ pub fn read_object(repo: &Path, hash: &Hash, hasher: &dyn Hasher) -> Result<Obje
         });
     }
 
-    let obj = Object::parse(obj_type, body.to_vec())?;
-    // For tree, we parsed hashes as Sha256 placeholder; ensure each entry hash len matches hasher
+    let obj = Object::parse(hasher.algo(), obj_type, body.to_vec())?;
+    // For tree, ensure each entry hash len matches hasher
     if let Object::Tree(tree) = &obj {
         for e in &tree.entries {
             if e.hash.bytes.len() != hasher.hash_len() {

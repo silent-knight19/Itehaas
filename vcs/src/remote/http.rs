@@ -167,7 +167,10 @@ pub fn fetch_refs_http(base_url: &str) -> Result<HttpRefs> {
         if !name.starts_with("refs/heads/") {
             anyhow::bail!("invalid ref name: {}", name);
         }
-        if !hash.chars().all(|c| c.is_ascii_hexdigit()) || hash.len() != 64 {
+        let expected_len = crate::hash::HashAlgo::from_str(&hasher)
+            .map(|a| a.hex_len())
+            .unwrap_or(64);
+        if !hash.chars().all(|c| c.is_ascii_hexdigit()) || hash.len() != expected_len {
             anyhow::bail!("invalid hash in refs: {}", &hash[..8.min(hash.len())]);
         }
         // Branch name validation
@@ -217,7 +220,7 @@ pub fn fetch_object_http(
     let base = validate_http_base(base_url)?;
     let hex = hash.hex();
     // Hash already validated via Hash type, but double-check
-    if !hex.chars().all(|c| c.is_ascii_hexdigit()) || hex.len() != 64 {
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) || (hex.len() != 64 && hex.len() != 40) {
         anyhow::bail!("invalid hash for http fetch");
     }
     let dest_path = store::object_path(repo, hash);
@@ -384,4 +387,243 @@ pub fn download_recursive_http(
 /// Helper to write transfer stats for UI
 pub fn path_for_hash(repo: &Path, hash: &Hash) -> PathBuf {
     store::object_path(repo, hash)
+}
+
+/// Incremental HTTP fetch: update refs/remotes/<remote>/* with missing objects
+/// Returns number of objects fetched (visited len)
+pub fn http_fetch(repo: &Path, remote_name: &str, base_url: &str) -> Result<usize> {
+    let http_refs = fetch_refs_http(base_url)?;
+    let local_algo = crate::config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let remote_algo = crate::hash::HashAlgo::from_str(&http_refs.hasher)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if local_algo != remote_algo {
+        anyhow::bail!(
+            "hash algorithm mismatch: local {} vs remote {}",
+            local_algo,
+            remote_algo
+        );
+    }
+    if http_refs.refs.is_empty() {
+        return Ok(0);
+    }
+    let mut visited: HashSet<String> = HashSet::new();
+    // Pre-populate visited with locally existing reachable? Not needed; download_recursive will skip existing via object_path.exists()
+    // But to avoid re-fetching already visited hashes across multiple refs, we share visited.
+
+    for (ref_name, hash_hex) in &http_refs.refs {
+        let remote_ref = ref_name.replacen("refs/heads/", &format!("refs/remotes/{}/", remote_name), 1);
+        // Check if local remote ref already equals this hash; if so, we may still need to ensure objects present, but we can skip download if objects already present
+        // Quick check: if local remote ref exists and equals hash and object exists locally, skip download but still ensure visited dedup
+        if let Ok(Some(local_hash)) = crate::refs::read_ref(repo, &remote_ref) {
+            if local_hash.hex() == *hash_hex {
+                // Already up to date; still need to ensure we have objects? If object exists locally, skip
+                // We can check if object file exists
+                let h = crate::hash::Hash::from_hex(local_algo, hash_hex).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if store::object_path(repo, &h).exists() {
+                    continue;
+                }
+                // else fall through to download
+            }
+        }
+        let hash = crate::hash::Hash::from_hex(local_algo, hash_hex).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        download_recursive_http(base_url, repo, &hash, &mut visited, 0)?;
+        crate::refs::write_ref(repo, &remote_ref, &hash)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    }
+    Ok(visited.len())
+}
+
+/// Upload a single object via HTTP POST {base}/objects/{hash}
+pub fn upload_object_http(
+    base_url: &str,
+    repo: &Path,
+    hash: &Hash,
+) -> Result<bool> {
+    let base = validate_http_base(base_url)?;
+    let hex = hash.hex();
+    let obj_path = store::object_path(repo, hash);
+    if !obj_path.exists() {
+        anyhow::bail!("local object {} not found", &hex[..7]);
+    }
+    let data = fs::read(&obj_path).context("reading local object for upload")?;
+    if data.len() > HTTP_OBJECT_LIMIT {
+        anyhow::bail!("object {} too large", &hex[..7]);
+    }
+    let url = format!("{}/objects/{}", base, hex);
+    let token = token_from_env();
+    let ag = agent();
+    let req = ag.post(&url);
+    let req = apply_auth(req, &token);
+    let req = req.set("Content-Type", "application/octet-stream");
+    let resp = req
+        .send_bytes(&data)
+        .map_err(|e| match e {
+            ureq::Error::Status(401, _) | ureq::Error::Status(403, _) => {
+                anyhow::anyhow!("push: authentication required (401/403); set ITEHAAS_TOKEN")
+            }
+            ureq::Error::Status(409, _) => anyhow::anyhow!("push: remote rejected (conflict)"),
+            ureq::Error::Status(code, _) => anyhow::anyhow!("push: http {} uploading object {}", code, &hex[..7]),
+            ureq::Error::Transport(t) => anyhow::anyhow!("network error uploading object {}: {}", &hex[..7], t),
+        })?;
+    if resp.status() != 200 && resp.status() != 201 {
+        anyhow::bail!("unexpected status {} uploading object {}", resp.status(), &hex[..7]);
+    }
+    // dedup is okay: server returns 200/201 both success
+    Ok(resp.status() == 201)
+}
+
+/// Update remote ref via HTTP POST {base}/refs/heads/{branch}
+pub fn update_remote_ref_http(
+    base_url: &str,
+    branch: &str,
+    hash_hex: &str,
+    force: bool,
+) -> Result<()> {
+    let base = validate_http_base(base_url)?;
+    // Validate branch name
+    if !is_valid_branch_name(branch) {
+        anyhow::bail!("invalid branch name: {}", branch);
+    }
+    if !hash_hex.chars().all(|c| c.is_ascii_hexdigit()) || (hash_hex.len() != 64 && hash_hex.len() != 40) {
+        anyhow::bail!("invalid hash for push");
+    }
+    let url = format!("{}/refs/heads/{}", base, branch);
+    let token = token_from_env();
+    let ag = agent();
+    let body = serde_json::json!({ "hash": hash_hex, "force": force });
+    let req = ag.post(&url);
+    let req = apply_auth(req, &token);
+    let req = req.set("Content-Type", "application/json");
+    let resp = req
+        .send_json(body)
+        .map_err(|e| match e {
+            ureq::Error::Status(401, _) | ureq::Error::Status(403, _) => {
+                anyhow::anyhow!("push: authentication required (403) for refs/heads/{}; need write permission", branch)
+            }
+            ureq::Error::Status(409, resp) => {
+                // Try to read error body for non-fast-forward
+                let msg = resp
+                    .into_string()
+                    .unwrap_or_else(|_| "non-fast-forward push rejected".into());
+                if msg.contains("non-fast-forward") || msg.contains("fast-forward") {
+                    return anyhow::anyhow!("non-fast-forward push rejected (remote is not ancestor); use --force");
+                }
+                anyhow::anyhow!("push rejected: {}", msg)
+            }
+            ureq::Error::Status(423, _) => anyhow::anyhow!("push: remote ref locked (concurrent push); retry"),
+            ureq::Error::Status(code, resp) => {
+                let msg = resp.into_string().unwrap_or_default();
+                anyhow::anyhow!("push http {} for ref {}: {}", code, branch, msg)
+            }
+            ureq::Error::Transport(t) => anyhow::anyhow!("network error updating ref {}: {}", branch, t),
+        })?;
+    if resp.status() != 200 && resp.status() != 201 {
+        anyhow::bail!("unexpected status {} updating ref", resp.status());
+    }
+    Ok(())
+}
+
+/// High-level HTTP push: transfer missing objects then update remote ref atomically
+pub fn http_push(
+    repo: &Path,
+    remote_name: &str,
+    base_url: &str,
+    branch: &str,
+    local_hash: &Hash,
+    force: bool,
+) -> Result<usize> {
+    // Fetch remote refs to get current remote hash for FF check
+    let http_refs = fetch_refs_http(base_url)?;
+    let remote_algo = crate::hash::HashAlgo::from_str(&http_refs.hasher)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let local_algo = crate::config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if local_algo != remote_algo {
+        anyhow::bail!(
+            "hash algorithm mismatch: local {} vs remote {}",
+            local_algo,
+            remote_algo
+        );
+    }
+    let remote_hash_hex = http_refs
+        .refs
+        .iter()
+        .find(|(n, _)| n == &format!("refs/heads/{}", branch))
+        .map(|(_, h)| h.clone());
+    if let Some(rh) = &remote_hash_hex {
+        if rh == &local_hash.hex() {
+            // already up to date
+            return Ok(0);
+        }
+        if !force {
+            let remote_hash = crate::hash::Hash::from_hex(local_algo, rh)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let is_ff = crate::merge::is_ancestor(repo, &remote_hash, local_hash)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if !is_ff {
+                anyhow::bail!("non-fast-forward push rejected (remote is not ancestor); use --force");
+            }
+        }
+    }
+    // Collect reachable objects from local_hash
+    let hasher = crate::hash::new_hasher(local_algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut local_visited: HashSet<String> = HashSet::new();
+    let mut local_objs: Vec<Hash> = Vec::new();
+    crate::remote::collect_reachable_objects(
+        repo,
+        local_hash,
+        hasher.as_ref(),
+        &mut local_visited,
+        &mut local_objs,
+    )
+    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    // Remove those already reachable from remote_hash (if exists)
+    let mut to_upload: Vec<Hash> = Vec::new();
+    if let Some(rh) = remote_hash_hex {
+        let remote_hash = crate::hash::Hash::from_hex(local_algo, &rh)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let mut remote_visited: HashSet<String> = HashSet::new();
+        let mut remote_objs: Vec<Hash> = Vec::new();
+        // If remote object missing locally (should not), ignore error
+        let _ = crate::remote::collect_reachable_objects(
+            repo,
+            &remote_hash,
+            hasher.as_ref(),
+            &mut remote_visited,
+            &mut remote_objs,
+        );
+        for h in local_objs {
+            if !remote_visited.contains(&h.hex()) {
+                to_upload.push(h);
+            }
+        }
+    } else {
+        to_upload = local_objs;
+    }
+
+    // Sort for deterministic upload order (parents before children? collect order is BFS parent first, so we keep)
+    // Upload each
+    let mut uploaded = 0;
+    for h in &to_upload {
+        // Check local object exists
+        let path = crate::object::store::object_path(repo, h);
+        if !path.exists() {
+            continue;
+        }
+        upload_object_http(base_url, repo, h)?;
+        uploaded += 1;
+        if uploaded > MAX_OBJECTS {
+            anyhow::bail!("too many objects to push");
+        }
+    }
+
+    // Update remote ref atomically
+    update_remote_ref_http(base_url, branch, &local_hash.hex(), force)?;
+
+    // Update local remote-tracking ref on success
+    let remote_tracking = format!("refs/remotes/{}/{}", remote_name, branch);
+    crate::refs::write_ref(repo, &remote_tracking, local_hash)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    Ok(uploaded)
 }

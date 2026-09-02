@@ -8,7 +8,7 @@ export interface VcsResult {
   code: number | null;
 }
 
-const HASH_REGEX = /^[0-9a-f]{64}$/;
+const HASH_REGEX = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const TIMEOUT_MS = 30_000;
 const MAX_OUTPUT = 1 << 20; // 1 MiB cap per stream
 
@@ -150,7 +150,7 @@ export async function listTree(repoPath: string, hash: string): Promise<{ mode: 
   for (const line of out.trim().split('\n')) {
     if (!line.trim()) continue;
     // Format: "100644 <hash> <name>" (pretty) or raw? Use regex
-    const m = line.trim().match(/^(\d{5,6})\s+([0-9a-f]{64})\s+(.+)$/);
+    const m = line.trim().match(/^(\d{5,6})\s+([0-9a-f]{40,64})\s+(.+)$/);
     if (!m) continue;
     const [, mode, h, name] = m;
     if (!['100644', '100755', '40000'].includes(mode)) continue;
