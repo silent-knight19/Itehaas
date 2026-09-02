@@ -59,7 +59,6 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 15 | Review & Developer Workflow | ✅ Complete |
 | 16 | Code Browser, Search & Notifications | 🟡 In Progress |
 | 17 | Real CI/CD | ⬜ Not Started |
-| 15 | Review & Developer Workflow | ✅ Complete |
 
 Status icons: ✅ Complete · 🟡 In Progress · ⬜ Not Started · 🔴 Blocked · ⏸️ Deferred
 
@@ -641,7 +640,8 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Watch — `server/src/routes/repos.ts:215` `POST /watch` (INSERT watches 409 dedup) + `DELETE /watch` + `GET /watch` (watching?) + `GET /watchers` (list) — 2026-09-02
 - [ ] Notifications inbox UI — `GET /api/notifications` already exists (`stars.ts`), needs `watch` + `mention` + `pr_open` filtering, frontend bell
 - [ ] Mentions — `@user` regex in `issue_comments`/`pr_comments`/`review_comments` → `notifications` (already in `issues.ts` and `pulls.ts` for comments, needs `pr_review_comments` and `issue` body)
-- [ ] Web: recursive `FileTree` `?path=` + `FileViewer` `raw`/`history`/`blame` + `CommandPalette` search + `AppShell` inbox
+- [x] Web: recursive `FileTree` `?path=` + `FileViewer` `raw` + breadcrumb — `web/app/[owner]/[repo]/page.tsx:28` (`?path=` + `?branch=` via `FileTree currentPath/onNavigate` + `FileViewer filePath/owner/repo/branch` + `Api.getFile` tree walk), `web/components/FileTree.tsx:20` `currentPath/onNavigate`, `web/components/FileViewer.tsx:6` `filePath/owner/repo/branch`, `web/lib/api.ts:78` `getFile/getFileHistory/getBlame/search/watch` — 2026-09-02
+- [ ] Web: `FileViewer` `history`/`blame` tabs + `CommandPalette` search + `AppShell` inbox bell (deferred)
 
 ### Dependencies
 
@@ -655,7 +655,8 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Search `GET /api/search?q=hello&type=repos` (repositories/issues/pulls/users, visibility, limit/offset) — manual `curl /api/search` — 2026-09-02
 - [x] Watch `POST /watch` (watches 409, `GET /watch` + `GET /watchers`) — manual `watch` via curl — 2026-09-02
 - [ ] Notifications inbox `GET /api/notifications` already exists but needs `watch` + `mention` filtering + frontend bell
-- [ ] Web recursive `FileTree` + `FileViewer` raw/history/blame + search palette
+- [x] Web recursive `FileTree` + `FileViewer` raw + breadcrumb `?path=` — `web/app/[owner]/[repo]/page.tsx` 49.7kB, `FileTree currentPath/onNavigate`, `FileViewer filePath` — 2026-09-02
+- [ ] Web `FileViewer` history/blame tabs + search palette inbox
 - [ ] Tests `phase16_tests` (file browsing, history, search, watch) — deferred
 
 ## Phase 17 — Real CI/CD

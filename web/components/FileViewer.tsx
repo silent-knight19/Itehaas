@@ -7,9 +7,13 @@ interface FileViewerProps {
   fileName: string;
   content: string;
   onClose?: () => void;
+  filePath?: string;
+  owner?: string;
+  repo?: string;
+  branch?: string;
 }
 
-export function FileViewer({ fileName, content, onClose }: FileViewerProps) {
+export function FileViewer({ fileName, content, onClose, filePath, owner, repo, branch }: FileViewerProps) {
   const lines = content.split("\n");
   const sizeBytes = new Blob([content]).size;
   const { toast } = useToast();

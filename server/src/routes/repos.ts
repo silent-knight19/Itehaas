@@ -975,7 +975,7 @@ export async function repoRoutes(app: FastifyInstance) {
     try { commitHash = require('fs').readFileSync(refPath, 'utf8').trim(); } catch {
       // Try via resolve HEAD if branch == HEAD
       if (branch === 'HEAD') {
-        try { commitHash = require('fs').readFileSync(require('path').join(repoPath, '.itehaas', 'HEAD'), 'utf8').trim(); if (commitHash.startsWith('ref: ')) { const rp = commitHash.slice(5).trim(); commitHash = require('fs').readFileSync(require('path').join(repoPath, '.itehaas', rp), 'utf8').trim(); } } catch {}
+        try { let headContent = require('fs').readFileSync(require('path').join(repoPath, '.itehaas', 'HEAD'), 'utf8').trim(); if (headContent.startsWith('ref: ')) { const rp = headContent.slice(5).trim(); headContent = require('fs').readFileSync(require('path').join(repoPath, '.itehaas', rp), 'utf8').trim(); } commitHash = headContent; } catch {}
       }
     }
     if (!commitHash || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commitHash)) return reply.status(404).send({ error: 'branch not found' });

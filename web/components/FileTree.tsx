@@ -22,6 +22,8 @@ interface FileTreeProps {
   onSelectFile: (hash: string, name: string) => void;
   selectedFileName?: string | null;
   latestCommit?: { hash: string; message: string; author?: string; date?: string } | null;
+  currentPath?: string;
+  onNavigate?: (path: string) => void;
 }
 
 function getFileIcon(name: string, mode: string) {
@@ -54,6 +56,8 @@ export function FileTree({
   onSelectFile,
   selectedFileName,
   latestCommit,
+  currentPath,
+  onNavigate,
 }: FileTreeProps) {
   return (
     <div className="border border-border-subtle rounded-sm overflow-hidden bg-surface">

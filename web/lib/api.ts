@@ -62,12 +62,43 @@ export const Api = {
   deleteRepo: (owner: string, repo: string) =>
     api(`/api/repos/${owner}/${repo}`, { method: 'DELETE' }),
 
+  // Forks & Network
+  forkRepo: (owner: string, repo: string) =>
+    api(`/api/repos/${owner}/${repo}/fork`, { method: 'POST' }),
+  getForks: (owner: string, repo: string) => api(`/api/repos/${owner}/${repo}/forks`),
+  getNetwork: (owner: string, repo: string) => api(`/api/repos/${owner}/${repo}/network`),
+
   // Branches & VCS History
   listBranches: (owner: string, repo: string) => api(`/api/repos/${owner}/${repo}/branches`),
   log: (owner: string, repo: string, maxCount = 100) =>
     api(`/api/repos/${owner}/${repo}/log?max_count=${maxCount}&full=1`),
   tree: (owner: string, repo: string, hash: string) =>
     api(`/api/repos/${owner}/${repo}/tree/${hash}`),
+  // File browsing (recursive ?path)
+  getFile: (owner: string, repo: string, filePath: string, ref?: string) => {
+    const enc = filePath.split('/').map(encodeURIComponent).join('/');
+    const q = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+    return api(`/api/repos/${owner}/${repo}/file/${enc}${q}`);
+  },
+  getFileHistory: (owner: string, repo: string, filePath: string, ref?: string) => {
+    const enc = filePath.split('/').map(encodeURIComponent).join('/');
+    const q = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+    return api(`/api/repos/${owner}/${repo}/history/${enc}${q}`);
+  },
+  getBlame: (owner: string, repo: string, filePath: string, ref?: string) => {
+    const enc = filePath.split('/').map(encodeURIComponent).join('/');
+    const q = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+    return api(`/api/repos/${owner}/${repo}/blame/${enc}${q}`);
+  },
+
+  // Search
+  search: (q: string, type?: string, limit?: number, offset?: number) => {
+    const params = new URLSearchParams({ q });
+    if (type) params.set('type', type);
+    if (limit) params.set('limit', String(limit));
+    if (offset) params.set('offset', String(offset));
+    return api(`/api/search?${params.toString()}`);
+  },
 
   // Stars
   getStars: (owner: string, repo: string) => api(`/api/repos/${owner}/${repo}/stars`),
@@ -76,27 +107,59 @@ export const Api = {
   unstarRepo: (owner: string, repo: string) =>
     api(`/api/repos/${owner}/${repo}/star`, { method: 'DELETE' }),
 
-  // Issues
-  listIssues: (owner: string, repo: string, status?: 'open' | 'closed') =>
-    api(`/api/repos/${owner}/${repo}/issues${status ? `?status=${status}` : ''}`),
-  createIssue: (owner: string, repo: string, payload: { title: string; body?: string }) =>
+  // Watch
+  getWatch: (owner: string, repo: string) => api(`/api/repos/${owner}/${repo}/watch`),
+  watchRepo: (owner: string, repo: string) =>
+    api(`/api/repos/${owner}/${repo}/watch`, { method: 'POST' }),
+  unwatchRepo: (owner: string, repo: string) =>
+    api(`/api/repos/${owner}/${repo}/watch`, { method: 'DELETE' }),
+  getWatchers: (owner: string, repo: string) => api(`/api/repos/${owner}/${repo}/watchers`),
+
+  // Notifications
+  getNotifications: () => api('/api/notifications'),
+  markNotificationRead: (id: string) => api(`/api/notifications/${id}/read`, { method: 'POST' }),
+
+  // Issues (with labels/assignees/milestone)
+  listIssues: (owner: string, repo: string, status?: 'open' | 'closed', extra?: { label?: string; assignee?: string; milestone?: string }) => {
+    const params = new URLSearchParams();
+    if (status) params.set('status', status);
+    if (extra?.label) params.set('label', extra.label);
+    if (extra?.assignee) params.set('assignee', extra.assignee);
+    if (extra?.milestone) params.set('milestone', extra.milestone);
+    const q = params.toString();
+    return api(`/api/repos/${owner}/${repo}/issues${q ? `?${q}` : ''}`);
+  },
+  createIssue: (owner: string, repo: string, payload: { title: string; body?: string; labels?: string[]; assignees?: string[]; milestone?: string }) =>
     api(`/api/repos/${owner}/${repo}/issues`, { method: 'POST', body: JSON.stringify(payload) }),
   getIssue: (owner: string, repo: string, id: string) =>
     api(`/api/repos/${owner}/${repo}/issues/${id}`),
-  updateIssue: (owner: string, repo: string, id: string, payload: { title?: string; body?: string; status?: 'open' | 'closed' }) =>
+  updateIssue: (owner: string, repo: string, id: string, payload: { title?: string; body?: string; status?: 'open' | 'closed'; labels?: string[]; assignees?: string[]; milestone?: string | null }) =>
     api(`/api/repos/${owner}/${repo}/issues/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   getIssueComments: (owner: string, repo: string, id: string) =>
     api(`/api/repos/${owner}/${repo}/issues/${id}/comments`),
   addIssueComment: (owner: string, repo: string, id: string, body: string) =>
     api(`/api/repos/${owner}/${repo}/issues/${id}/comments`, { method: 'POST', body: JSON.stringify({ body }) }),
+  // Labels & Milestones
+  listLabels: (owner: string, repo: string) => api(`/api/repos/${owner}/${repo}/labels`),
+  createLabel: (owner: string, repo: string, payload: { name: string; color?: string; description?: string }) =>
+    api(`/api/repos/${owner}/${repo}/labels`, { method: 'POST', body: JSON.stringify(payload) }),
+  deleteLabel: (owner: string, repo: string, id: string) =>
+    api(`/api/repos/${owner}/${repo}/labels/${id}`, { method: 'DELETE' }),
+  listMilestones: (owner: string, repo: string) => api(`/api/repos/${owner}/${repo}/milestones`),
+  createMilestone: (owner: string, repo: string, payload: { title: string; description?: string; due_date?: string }) =>
+    api(`/api/repos/${owner}/${repo}/milestones`, { method: 'POST', body: JSON.stringify(payload) }),
 
-  // Pull Requests
+  // Pull Requests (draft, reviewers, approvals, line-comments, CODEOWNERS, close keywords)
   listPulls: (owner: string, repo: string) =>
     api(`/api/repos/${owner}/${repo}/pulls`),
-  createPull: (owner: string, repo: string, payload: { title: string; body?: string; source_branch: string; target_branch?: string }) =>
+  createPull: (owner: string, repo: string, payload: { title: string; body?: string; source_branch: string; target_branch?: string; source_repo?: string; draft?: boolean }) =>
     api(`/api/repos/${owner}/${repo}/pulls`, { method: 'POST', body: JSON.stringify(payload) }),
   getPull: (owner: string, repo: string, id: string) =>
     api(`/api/repos/${owner}/${repo}/pulls/${id}`),
+  updatePull: (owner: string, repo: string, id: string, payload: { title?: string; body?: string; is_draft?: boolean }) =>
+    api(`/api/repos/${owner}/${repo}/pulls/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  markPullReady: (owner: string, repo: string, id: string) =>
+    api(`/api/repos/${owner}/${repo}/pulls/${id}/ready`, { method: 'POST' }),
   getPullDiff: (owner: string, repo: string, id: string) =>
     api(`/api/repos/${owner}/${repo}/pulls/${id}/diff`),
   mergePull: (owner: string, repo: string, id: string) =>
@@ -105,6 +168,22 @@ export const Api = {
     api(`/api/repos/${owner}/${repo}/pulls/${id}/comments`),
   addPullComment: (owner: string, repo: string, id: string, body: string) =>
     api(`/api/repos/${owner}/${repo}/pulls/${id}/comments`, { method: 'POST', body: JSON.stringify({ body }) }),
+  // Reviewers & Reviews
+  getReviewers: (owner: string, repo: string, id: string) =>
+    api(`/api/repos/${owner}/${repo}/pulls/${id}/reviewers`),
+  requestReviewers: (owner: string, repo: string, id: string, username: string) =>
+    api(`/api/repos/${owner}/${repo}/pulls/${id}/reviewers`, { method: 'POST', body: JSON.stringify({ username }) }),
+  removeReviewer: (owner: string, repo: string, id: string, username: string) =>
+    api(`/api/repos/${owner}/${repo}/pulls/${id}/reviewers/${username}`, { method: 'DELETE' }),
+  getReviews: (owner: string, repo: string, id: string) =>
+    api(`/api/repos/${owner}/${repo}/pulls/${id}/reviews`),
+  addReview: (owner: string, repo: string, id: string, payload: { decision: 'approved' | 'changes_requested' | 'commented'; body?: string }) =>
+    api(`/api/repos/${owner}/${repo}/pulls/${id}/reviews`, { method: 'POST', body: JSON.stringify(payload) }),
+  // Line-level review comments
+  getReviewComments: (owner: string, repo: string, id: string) =>
+    api(`/api/repos/${owner}/${repo}/pulls/${id}/review_comments`),
+  addReviewComment: (owner: string, repo: string, id: string, payload: { body: string; path: string; line?: number; side?: 'LEFT' | 'RIGHT' | 'UNIFIED'; commit_hash?: string }) =>
+    api(`/api/repos/${owner}/${repo}/pulls/${id}/review_comments`, { method: 'POST', body: JSON.stringify(payload) }),
 
   // CI / CD
   listPipelines: (owner: string, repo: string) =>
@@ -125,6 +204,33 @@ export const Api = {
   // Members
   listMembers: (owner: string, repo: string) =>
     api(`/api/repos/${owner}/${repo}/members`),
+
+  // Orgs & Teams
+  listOrgs: () => api('/api/orgs'),
+  createOrg: (payload: { name: string; display_name?: string; description?: string }) =>
+    api('/api/orgs', { method: 'POST', body: JSON.stringify(payload) }),
+  getOrg: (name: string) => api(`/api/orgs/${name}`),
+  listOrgMembers: (org: string) => api(`/api/orgs/${org}/members`),
+  addOrgMember: (org: string, payload: { username: string; role?: string }) =>
+    api(`/api/orgs/${org}/members`, { method: 'POST', body: JSON.stringify(payload) }),
+  listTeams: (org: string) => api(`/api/orgs/${org}/teams`),
+  createTeam: (org: string, payload: { name: string; description?: string }) =>
+    api(`/api/orgs/${org}/teams`, { method: 'POST', body: JSON.stringify(payload) }),
+  listTeamMembers: (org: string, team: string) => api(`/api/orgs/${org}/teams/${team}/members`),
+  addTeamMember: (org: string, team: string, username: string) =>
+    api(`/api/orgs/${org}/teams/${team}/members`, { method: 'POST', body: JSON.stringify({ username }) }),
+  listTeamRepos: (org: string, team: string) => api(`/api/orgs/${org}/teams/${team}/repos`),
+  addTeamRepo: (org: string, team: string, payload: { owner: string; repo: string; permission?: string }) =>
+    api(`/api/orgs/${org}/teams/${team}/repos`, { method: 'POST', body: JSON.stringify(payload) }),
+
+  // Invites
+  listInvites: () => api('/api/invites'),
+  acceptInvite: (token: string) => api(`/api/invites/${token}/accept`, { method: 'POST' }),
+  rejectInvite: (token: string) => api(`/api/invites/${token}/reject`, { method: 'POST' }),
+  createOrgInvite: (org: string, payload: { username?: string; email?: string; role?: string }) =>
+    api(`/api/orgs/${org}/invites`, { method: 'POST', body: JSON.stringify(payload) }),
+  createRepoInvite: (owner: string, repo: string, payload: { username?: string; email?: string; role?: string }) =>
+    api(`/api/repos/${owner}/${repo}/invites`, { method: 'POST', body: JSON.stringify(payload) }),
 
   // Profile
   getUser: (username: string) => api(`/api/users/${username}`),
