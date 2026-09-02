@@ -5,12 +5,17 @@ pub mod error;
 pub mod fsck;
 pub mod gc;
 pub mod hash;
+pub mod ignore;
 pub mod index;
 pub mod merge;
 pub mod object;
 pub mod pack;
+pub mod reflog;
 pub mod refs;
 pub mod remote;
+pub mod reset;
+pub mod restore;
+pub mod stash;
 pub mod status;
 pub mod tree_builder;
 
@@ -55,6 +60,7 @@ pub fn init(repo_path: &Path, algo: HashAlgo) -> Result<PathBuf> {
     fs::create_dir_all(itehaas_dir.join("refs").join("heads"))?;
     fs::create_dir_all(itehaas_dir.join("refs").join("tags"))?;
     fs::create_dir_all(itehaas_dir.join("refs").join("remotes"))?;
+    fs::create_dir_all(itehaas_dir.join("logs").join("refs").join("heads"))?;
 
     config::init_config(&repo, algo)?;
 
@@ -62,6 +68,15 @@ pub fn init(repo_path: &Path, algo: HashAlgo) -> Result<PathBuf> {
     fs::write(itehaas_dir.join("HEAD"), "ref: refs/heads/main\n")?;
     // index empty
     fs::write(itehaas_dir.join("index"), b"")?;
+    // init reflog for HEAD (zeros)
+    {
+        let algo = config::read_hasher(&repo).unwrap_or(HashAlgo::Sha256);
+        let zero = "0".repeat(algo.hex_len());
+        let _ = fs::create_dir_all(itehaas_dir.join("logs").join("refs").join("heads"));
+        // No initial log entry needed until first commit; HEAD points to unborn.
+        // We do not write entry to avoid noisy reflog.
+        let _ = zero;
+    }
 
     Ok(repo.canonicalize().unwrap_or(repo))
 }

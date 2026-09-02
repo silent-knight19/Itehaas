@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{ItehaasError, Result};
 use crate::hash::{Hash, HashAlgo};
+use crate::reflog;
 
 /// HEAD can be symbolic ref or detached hash or unborn
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,22 @@ pub fn write_head_ref(repo: &Path, ref_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write HEAD as symbolic ref with reflog log for HEAD
+pub fn write_head_ref_with_log(repo: &Path, ref_name: &str, message: &str) -> Result<()> {
+    // Capture old HEAD resolved hash for log
+    let old = resolve_head(repo).unwrap_or(None);
+    let new = read_ref(repo, ref_name).unwrap_or(None);
+    write_head_ref(repo, ref_name)?;
+    // For HEAD reflog when moving symbolic pointer, log with new hash (branch tip)
+    if let Some(new_hash) = new {
+        let _ = reflog::append_reflog(repo, "HEAD", old.as_ref(), Some(&new_hash), message);
+    } else {
+        // unborn -> just log with zero new
+        let _ = reflog::append_reflog(repo, "HEAD", old.as_ref(), None, message);
+    }
+    Ok(())
+}
+
 /// Write HEAD detached
 pub fn write_head_detached(repo: &Path, hash: &Hash) -> Result<()> {
     let head_path = repo.join(".itehaas").join("HEAD");
@@ -86,6 +103,18 @@ pub fn write_head_detached(repo: &Path, hash: &Hash) -> Result<()> {
     tmp.write_all(content.as_bytes())?;
     tmp.flush()?;
     tmp.persist(&head_path).map_err(|e| ItehaasError::Io(e.error))?;
+    Ok(())
+}
+
+/// Write HEAD detached with reflog
+pub fn write_head_detached_with_log(
+    repo: &Path,
+    hash: &Hash,
+    message: &str,
+) -> Result<()> {
+    let old = resolve_head(repo).unwrap_or(None);
+    write_head_detached(repo, hash)?;
+    let _ = reflog::append_reflog(repo, "HEAD", old.as_ref(), Some(hash), message);
     Ok(())
 }
 
@@ -117,6 +146,32 @@ pub fn write_ref(repo: &Path, ref_name: &str, hash: &Hash) -> Result<()> {
     tmp.write_all(content.as_bytes())?;
     tmp.flush()?;
     tmp.persist(&ref_path).map_err(|e| ItehaasError::Io(e.error))?;
+    Ok(())
+}
+
+/// Write ref with reflog entry (branch + HEAD if HEAD points to this ref)
+pub fn write_ref_with_log(
+    repo: &Path,
+    ref_name: &str,
+    hash: &Hash,
+    message: &str,
+) -> Result<()> {
+    let old = read_ref(repo, ref_name)?.clone();
+    write_ref(repo, ref_name, hash)?;
+    // branch log
+    let _ = reflog::append_reflog(repo, ref_name, old.as_ref(), Some(hash), message);
+    // HEAD log if HEAD is symbolic to this ref
+    if let Ok(head) = read_head(repo) {
+        match head {
+            Head::Ref(r) if r == ref_name => {
+                let _ = reflog::append_reflog(repo, "HEAD", old.as_ref(), Some(hash), message);
+            }
+            Head::Unborn(r) if r == ref_name => {
+                let _ = reflog::append_reflog(repo, "HEAD", old.as_ref(), Some(hash), message);
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 

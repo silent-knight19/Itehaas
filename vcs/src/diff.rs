@@ -160,7 +160,7 @@ pub fn diff_working_vs_index(repo: &Path) -> Result<Vec<DiffEntry>> {
     let mut wt_map = BTreeMap::new();
     for entry in walkdir::WalkDir::new(repo).min_depth(1).into_iter().filter_entry(|e| {
         let rel = e.path().strip_prefix(repo).unwrap_or(e.path());
-        !crate::index::should_ignore(rel)
+        !crate::index::should_ignore(rel) && !crate::ignore::is_ignored(repo, rel, e.path().is_dir())
     }) {
         let entry = entry.map_err(|e| crate::error::ItehaasError::Other(e.to_string()))?;
         let path = entry.path();
@@ -168,7 +168,7 @@ pub fn diff_working_vs_index(repo: &Path) -> Result<Vec<DiffEntry>> {
             continue;
         }
         let rel = path.strip_prefix(repo).unwrap();
-        if crate::index::should_ignore(rel) {
+        if crate::index::should_ignore(rel) || crate::ignore::is_ignored(repo, rel, false) {
             continue;
         }
         let rel_str = crate::index::path_to_string(rel);

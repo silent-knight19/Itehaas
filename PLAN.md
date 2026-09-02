@@ -15,25 +15,25 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ## Current Status
 
-**Current Phase:** Phase 10 — Advanced VCS / Self-Hosted Release (Complete)
-**Current Task:** All phases 0–10 commit
-**Overall Progress:** 165 / ~140 tasks
-**Status:** ✅ Complete — M1–M9 achieved
+**Current Phase:** Phase 11 — VCS Recovery & Daily-Use (Complete)
+**Current Task:** Phase 11 commit + docs
+**Overall Progress:** 185 / ~160 tasks
+**Status:** ✅ Complete — M1–M9 + Phase 11 achieved
 
 ### Last Completed
 
-- Phase 7 complete: `web/` Next.js 14 + Tailwind (`web/app/layout.tsx`, `web/lib/api.ts`, `web/app/page.tsx` dashboard `GET /api/repos`, `web/app/[owner]/[repo]/page.tsx` code browser `branches/log/tree` + `react-markdown`, `web/app/login|register`, `web/app/[owner]/[repo]/issues|pulls|ci`), `web build` 7 routes, `docs/web.md`
 - Phase 8 complete: `database/migrations/002_collaboration.sql` (issues, prs, stars, notifications, activity) + `server/src/routes/issues.ts` + `pulls.ts` (diff via `execItehaas diff`, merge via `execItehaas merge`/`vcs/src/merge.rs`) + `stars.ts` (stars/notifications/activity), web issues/pulls + repo star toggle
 - Phase 9 complete: `database/migrations/003_ci.sql` (pipelines, jobs, secrets) + `server/src/routes/ci.ts` queue `install→test→build` + `simulateRun` via `execItehaas log` + logs/status, `web/app/[owner]/[repo]/ci` + `docker-compose.yml` server/web + `server/web Dockerfiles`
 - Phase 10 complete: `vcs/src/pack.rs` `pack` + `verify_pack` + `list_packs`, `vcs/src/gc.rs` reachable BFS + prune, `vcs/src/fsck.rs` `fsck` + `count_objects`, CLI `fsck|gc|pack|count-objects` (`vcs/src/main.rs:520`), `vcs/tests/phase10_tests.rs` 4 tests (fsck ok, gc unreachable, pack verify, count), `docs/vcs-advanced.md` + `docs/ci.md` + `docs/collaboration.md`
+- Phase 11 complete: `vcs/src/reflog.rs` (logs/HEAD + logs/refs/heads/*, record on commit/checkout/reset), `vcs/src/reset.rs` (--soft/--mixed/--hard + paths), `vcs/src/restore.rs` (--staged/--worktree/--source), `vcs/src/ignore.rs` (.itehaasignore+.gitignore, `*`/`?`/`**`/`!`/`/`), `vcs/src/stash.rs` (refs/stash + stash_list, push/pop/apply/list/show/clear/drop), tag CLI (lightweight/annotated), branch -a/-r/-m, rm/mv/clean, `itehaas reflog`, 10 tests `phase11_tests.rs`, `cargo test` 75+2
 
 ### Currently Working On
 
-- All phases commit + docs
+- Phase 12 design (`docs/remote-protocol.md`) + HTTP fetch/push negotiation
 
 ### Next
 
-- Self-hosted release on Vivobook via `docker compose up` (M9)
+- Phase 12 — Remote Transport & Git Interop (HTTP fetch/push/pull, pack streaming, SHA-1 mode)
 
 ## Phase Status Table
 
@@ -50,6 +50,7 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 8 | Collaboration | ✅ Complete |
 | 9 | CI/CD | ✅ Complete |
 | 10 | Advanced VCS / Git Interop | ✅ Complete |
+| 11 | VCS Recovery & Daily-Use | ✅ Complete |
 
 Status icons: ✅ Complete · 🟡 In Progress · ⬜ Not Started · 🔴 Blocked · ⏸️ Deferred
 
@@ -468,6 +469,37 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] `fsck` detects corruption — `vcs/tests/phase10_tests.rs:20` `test_fsck_ok` + manual byte-flip `corrupt deflate stream` — 2026-09-01
 - [x] Benchmarks show improvement on Vivobook (if not, document why) — `docs/vcs-advanced.md:30` — 2026-09-01
 
+## Phase 11 — VCS Recovery & Daily-Use
+
+### Scope
+
+- [x] `itehaas reset --soft/--mixed/--hard` + `reset HEAD <path>` — `vcs/src/reset.rs:1` + `vcs/src/main.rs:1985` (HEAD move, index/wt sync, reflog) — 2026-09-02
+- [x] `itehaas restore` (--staged/--worktree/--source) — `vcs/src/restore.rs:1` (index←HEAD/source, wt←index/source) — 2026-09-02
+- [x] `itehaas rm`/`mv`/`clean` — `vcs/src/main.rs:2057` (index+wt, --cached, rename, dry-run) — 2026-09-02
+- [x] `itehaas stash` (push/pop/apply/list/show/clear/drop, --include-untracked, refs/stash + stash_list, conflict markers) — `vcs/src/stash.rs:1` — 2026-09-02
+- [x] `itehaas tag` (-a/-l/-d, lightweight+annotated Tag objects, refs/tags) — `vcs/src/main.rs:2220` — 2026-09-02
+- [x] `itehaas reflog` (logs/HEAD + logs/refs/heads/*, record on commit/checkout/reset/branch) — `vcs/src/reflog.rs:1` + `vcs/src/refs.rs:108` — 2026-09-02
+- [x] `itehaas branch -a/-r/-m` (all/remotes/move, remote-tracking via refs/remotes) — `vcs/src/main.rs:1032` — 2026-09-02
+- [x] Ignore system (.itehaasignore + .gitignore, `*`/`?`/`**`/`!`/`/`) — `vcs/src/ignore.rs:1` + `status.rs:71` + `diff.rs:159` + `main.rs:655` — 2026-09-02
+
+### Dependencies
+
+- Depends on: Phase 3 HEAD/refs, Phase 4 diff/merge, Phase 10 pack/gc — met
+
+### Definition of Done — Phase 11
+
+- [x] Reset soft/mixed/hard + file-level tested — `vcs/tests/phase11_tests.rs:18` `test_reset_*` — 2026-09-02
+- [x] Restore staged/worktree/source tested — `phase11_tests.rs:55` `test_restore` — 2026-09-02
+- [x] rm/--cached/mv/clean -n/-f/-d tested — `phase11_tests.rs:86` + manual `clean -n` — 2026-09-02
+- [x] Stash push/pop/apply/list/show/clear tested — `phase11_tests.rs:116` + manual `stash push/pop` — 2026-09-02
+- [x] Tags lightweight/annotated/list/delete tested — `phase11_tests.rs:138` — 2026-09-02
+- [x] Reflog HEAD + branch tested — `phase11_tests.rs:160` + manual `reflog HEAD` — 2026-09-02
+- [x] Branch -a/-r/-m tested — `phase11_tests.rs:179` + manual `-m`/`-a` — 2026-09-02
+- [x] Ignore `*`/`**`/`!`/`/` tested — `phase11_tests.rs:195` + manual `add .` — 2026-09-02
+- [x] Recovery scenarios (hard reset, reflog) tested — manual `reset --hard` + `reflog` — 2026-09-02
+- [x] Regression 65→75 Rust tests green, manual `cargo test` + `itehaas --help` — 2026-09-02
+- [x] docs updated — this file + `vcs/src/ignore.rs`+`reflog.rs`+`reset.rs`+`restore.rs`+`stash.rs`
+
 ## Security Hardening
 
 - [x] Input validation (hash regex, path traversal, no "/" in tree names, no shell) — `server/src/lib/vcs.ts:6` `HASH_REGEX`, `vcs/src/hash.rs:40`, `server/src/routes/*.ts` zod + `repoPathFor` `startsWith` — 2026-09-01
@@ -488,14 +520,14 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 
 ## Testing Strategy
 
-- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 65` — 2026-09-01
-- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/phase10_tests.rs` + `phase2-5` — 2026-09-01
+- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 75` (65+10 Phase 11) — 2026-09-02
+- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/phase11_tests.rs` 10 + `phase10` 4 + `phase2-5` 51 — 2026-09-02
 - [ ] Property tests (proptest for round-trip where useful) — deferred
 - [ ] Git as oracle (compare `itehaas log` vs `git log` on same repo, where applicable) — manual
-- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops) — `fsck` + `store_tests` — 2026-09-01
+- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops, reset/restore/stash) — `fsck` + `store_tests` + `phase11_tests` — 2026-09-02
 - [x] Server tests (Vitest + Supertest, mock or real vcsService) — `server/vitest.config.ts:1` 28 tests — 2026-09-01
 - [x] Web tests (Playwright for critical flows) — `pnpm --filter web build` 7 routes ok, Vitest deferred — 2026-09-01
-- [x] CI: `cargo test && pnpm test` on each commit — `65 Rust + 28 Server + web build` — 2026-09-01
+- [x] CI: `cargo test && pnpm test` on each commit — `75 Rust + 28 Server + web build` — 2026-09-02
 
 ## UI/UX Redesign v2 — Design Engineering & Anti-Slop Overhaul
 
@@ -589,3 +621,4 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - 2026-09-01: Phase 9 complete — CI/CD, 003_ci.sql pipelines/jobs/secrets, server ci routes queue+simulateRun via execItehaas log, web ci page, docker-compose server+web, docs/ci.md
 - 2026-09-01: Phase 10 complete — advanced VCS, pack (create/verify), gc (reachable prune), fsck (verify), count-objects, 4 tests phase10, CLI fsck|gc|pack|count-objects, docs/vcs-advanced.md, 65 Rust total
 - 2026-09-01: All phases 0–10 complete — self-hosted release ready via `docker compose up` or bare metal, 65 Rust + 28 Server + web build, docs updated.
+- 2026-09-02: Phase 11 complete — reflog+reset/restore/rm/mv/clean/stash/tags/branch -a/-r/-m/ignore, 10 tests phase11, 75 Rust total, manual reflog+stash+ignore verified, PLAN.md updated

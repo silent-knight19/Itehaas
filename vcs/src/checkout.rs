@@ -98,18 +98,25 @@ pub fn checkout(
 
     // Update index to match target
     let mut index = Index::new();
-    for (path, (hash, mode)) in target_map {
+    for (path, (hash, mode)) in target_map.clone() {
         let entry = IndexEntry::new(path, hash, mode);
         index.add_or_update(entry);
     }
     index.save(repo)?;
 
-    // Update HEAD
+    // Update HEAD with reflog
+    // Capture old HEAD for message
+    let old_head = crate::refs::resolve_head(repo).unwrap_or(None);
+    let old_branch = crate::refs::current_branch(repo).unwrap_or(None).unwrap_or_else(|| "HEAD".to_string());
     if detached {
         crate::refs::write_head_detached(repo, target_hash)?;
+        let msg = format!("checkout: moving from {} to {}", old_branch, target_hash.hex()[..7].to_string());
+        let _ = crate::reflog::append_reflog(repo, "HEAD", old_head.as_ref(), Some(target_hash), &msg);
     } else if let Some(branch) = branch_name {
         let ref_name = format!("refs/heads/{}", branch);
         crate::refs::write_head_ref(repo, &ref_name)?;
+        let msg = format!("checkout: moving from {} to {}", old_branch, branch);
+        let _ = crate::reflog::append_reflog(repo, "HEAD", old_head.as_ref(), Some(target_hash), &msg);
     } else {
         // Should not happen
         return Err(ItehaasError::Other("checkout: no branch or detached".into()));
@@ -206,16 +213,23 @@ pub fn checkout_forced(
         }
     }
     let mut index = Index::new();
-    for (path, (hash, mode)) in target_map {
+    for (path, (hash, mode)) in target_map.clone() {
         let entry = IndexEntry::new(path, hash, mode);
         index.add_or_update(entry);
     }
     index.save(repo)?;
+    // reflog for forced checkout as well
+    let old_head = crate::refs::resolve_head(repo).unwrap_or(None);
+    let old_branch = crate::refs::current_branch(repo).unwrap_or(None).unwrap_or_else(|| "HEAD".to_string());
     if detached {
         crate::refs::write_head_detached(repo, target_hash)?;
+        let msg = format!("checkout: moving from {} to {}", old_branch, target_hash.hex()[..7].to_string());
+        let _ = crate::reflog::append_reflog(repo, "HEAD", old_head.as_ref(), Some(target_hash), &msg);
     } else if let Some(branch) = branch_name {
         let ref_name = format!("refs/heads/{}", branch);
         crate::refs::write_head_ref(repo, &ref_name)?;
+        let msg = format!("checkout: moving from {} to {}", old_branch, branch);
+        let _ = crate::reflog::append_reflog(repo, "HEAD", old_head.as_ref(), Some(target_hash), &msg);
     }
     Ok(())
 }
