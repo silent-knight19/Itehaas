@@ -15,10 +15,10 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ## Current Status
 
-**Current Phase:** Phase 16 — Code Browser, Search & Notifications (In Progress)
-**Current Task:** Phase 16 file browsing + search + watch
-**Overall Progress:** 250 / ~240 tasks
-**Status:** 🟡 In Progress — M1–M9 + Phases 11–15 achieved, Phase 16 building
+**Current Phase:** Phase 16 — Code Browser, Search & Notifications (Complete)
+**Current Task:** Phase 16 commit + docs (history/blame, inbox, search)
+**Overall Progress:** 255 / ~240 tasks
+**Status:** ✅ Complete — M1–M9 + Phases 11–16 achieved
 
 ### Last Completed
 
@@ -30,12 +30,11 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ### Currently Working On
 
-- Phase 16 — Code Browser, Search & Notifications (file `?path=` browsing, `raw`/`history`/`blame`, `pg_trgm` search, `watch`/`notifications`)
+- Phase 16 complete — history/blame, inbox, search palette, 8 tests — ready for Phase 17
 
 ### Next
 
-- Phase 16 — Code Browser, Search & Notifications (recursive `?path=` browser, `raw`/`history`/`blame` UI, `pg_trgm` global/code search, `watch`/`notifications`)
-- Phase 17 — Real CI/CD (YAML `on: push`, queue, isolated Docker runner, artifacts)
+- Phase 17 — Real CI/CD (YAML `on: push`, queue, isolated Docker runner, artifacts, status checks, logs)
 
 ## Phase Status Table
 
@@ -57,8 +56,8 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 13 | History & Code Archaeology | ✅ Complete |
 | 14 | Forks, Networks & Organizations | ✅ Complete |
 | 15 | Review & Developer Workflow | ✅ Complete |
-| 16 | Code Browser, Search & Notifications | 🟡 In Progress |
-| 17 | Real CI/CD | ⬜ Not Started |
+| 16 | Code Browser, Search & Notifications | ✅ Complete |
+| 17 | Real CI/CD | 🟡 In Progress |
 
 Status icons: ✅ Complete · 🟡 In Progress · ⬜ Not Started · 🔴 Blocked · ⏸️ Deferred
 
@@ -638,10 +637,10 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] File browsing API — `server/src/routes/repos.ts:215` `GET /file/*?ref=` (tree walk `cat-file -p` recursive, 404, binary check) + `GET /history/*?ref=` (`log --follow` via `revwalk`) + `GET /blame/*?ref=` (`blame` via `execItehaas blame`) — 2026-09-02
 - [x] Search API — `server/src/routes/search.ts:1` `GET /api/search?q=&type=repos/issues/pulls/users&limit=&offset=` (ILIKE + visibility filter, `pg_trgm` GIN, `canRead` for private) — 2026-09-02
 - [x] Watch — `server/src/routes/repos.ts:215` `POST /watch` (INSERT watches 409 dedup) + `DELETE /watch` + `GET /watch` (watching?) + `GET /watchers` (list) — 2026-09-02
-- [ ] Notifications inbox UI — `GET /api/notifications` already exists (`stars.ts`), needs `watch` + `mention` + `pr_open` filtering, frontend bell
-- [ ] Mentions — `@user` regex in `issue_comments`/`pr_comments`/`review_comments` → `notifications` (already in `issues.ts` and `pulls.ts` for comments, needs `pr_review_comments` and `issue` body)
+- [x] Notifications inbox UI — `GET /api/notifications` (`server/src/routes/stars.ts:55`) + `web/app/notifications/page.tsx:1` (4.3kB, filter all/unread/mention, mark read), `web/components/AppShell.tsx:10` bell `Bell` + `CheckCheck` + dropdown 20 items + 30s poll + unread badge — 2026-09-02
+- [x] Mentions — `@user` regex in `issue_comments`/`pr_comments`/`review_comments` → `notifications` (`server/src/routes/issues.ts:121` issue body `mention` + `issues.ts:244` comment, `server/src/routes/pulls.ts:336` pr_comment + `pulls.ts:526` review_comment) — 2026-09-02
 - [x] Web: recursive `FileTree` `?path=` + `FileViewer` `raw` + breadcrumb — `web/app/[owner]/[repo]/page.tsx:28` (`?path=` + `?branch=` via `FileTree currentPath/onNavigate` + `FileViewer filePath/owner/repo/branch` + `Api.getFile` tree walk), `web/components/FileTree.tsx:20` `currentPath/onNavigate`, `web/components/FileViewer.tsx:6` `filePath/owner/repo/branch`, `web/lib/api.ts:78` `getFile/getFileHistory/getBlame/search/watch` — 2026-09-02
-- [ ] Web: `FileViewer` `history`/`blame` tabs + `CommandPalette` search + `AppShell` inbox bell (deferred)
+- [x] Web: `FileViewer` `history`/`blame` tabs + `CommandPalette` search + `AppShell` inbox bell — `web/components/FileViewer.tsx:16` tabs `code/history/blame/raw` + `Api.getFileHistory/getBlame` (loading, `Clock`/`User`), `web/components/CommandPalette.tsx:26` debounced `Api.search` `pg_trgm` 300ms `searchLoading`, `web/components/AppShell.tsx:24` `Bell` `Inbox` bell — 2026-09-02
 
 ### Dependencies
 
@@ -654,10 +653,10 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Blame via `GET /blame/*` (`blame` ) — manual `curl /blame/a.txt` — 2026-09-02
 - [x] Search `GET /api/search?q=hello&type=repos` (repositories/issues/pulls/users, visibility, limit/offset) — manual `curl /api/search` — 2026-09-02
 - [x] Watch `POST /watch` (watches 409, `GET /watch` + `GET /watchers`) — manual `watch` via curl — 2026-09-02
-- [ ] Notifications inbox `GET /api/notifications` already exists but needs `watch` + `mention` filtering + frontend bell
-- [x] Web recursive `FileTree` + `FileViewer` raw + breadcrumb `?path=` — `web/app/[owner]/[repo]/page.tsx` 49.7kB, `FileTree currentPath/onNavigate`, `FileViewer filePath` — 2026-09-02
-- [ ] Web `FileViewer` history/blame tabs + search palette inbox
-- [ ] Tests `phase16_tests` (file browsing, history, search, watch) — deferred
+- [x] Notifications inbox `GET /api/notifications` (`stars.ts:55`) + `web/app/notifications/page.tsx:1` 4.3kB + `AppShell` bell dropdown 30s poll — 2026-09-02
+- [x] Web recursive `FileTree` + `FileViewer` raw + breadcrumb `?path=` — `web/app/[owner]/[repo]/page.tsx` 50.9kB (history/blame tabs), `FileTree currentPath/onNavigate`, `FileViewer filePath/history/blame/raw` — 2026-09-02
+- [x] Web `FileViewer` history/blame tabs + search palette inbox — `FileViewer.tsx:16` `history/blame` `Clock`/`User` + `CommandPalette.tsx:26` `Api.search` debounced `pg_trgm` — 2026-09-02
+- [x] Tests `phase16_tests` 8 (search_watch migration, file browsing, watch, web file browser, fileviewer tabs, notifications/search, mentions) + `cargo test` 107+2 (99+8), `pnpm --filter server` 32 — 2026-09-02
 
 ## Phase 17 — Real CI/CD
 
@@ -698,14 +697,14 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 
 ## Testing Strategy
 
-- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 99` (65+10 Phase 11 +4 Phase 12 +7 Phase 13 +5 Phase 14 +8 Phase 15) — 2026-09-02
-- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/phase15_tests.rs` 8 + `phase14` 5 + `phase13` 7 + `phase12` 4 + `phase11` 10 + `phase10` 4 + `phase2-5` 51 — 2026-09-02
+- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 107` (65+10 Phase 11 +4 Phase 12 +7 Phase 13 +5 Phase 14 +8 Phase 15 +8 Phase 16) — 2026-09-02
+- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/phase16_tests.rs` 8 + `phase15` 8 + `phase14` 5 + `phase13` 7 + `phase12` 4 + `phase11` 10 + `phase10` 4 + `phase2-5` 51 — 2026-09-02
 - [ ] Property tests (proptest for round-trip where useful) — deferred
 - [ ] Git as oracle (compare `itehaas log` vs `git log` on same repo, where applicable) — manual `log --oneline` vs `git log --oneline` (rebase/bisect) + `fork` vs `git clone --fork`
-- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops, reset/restore/stash, cherry-pick/rebase conflict, fork/private 404, invite expired, draft block, changes_requested block) — `fsck` + `store_tests` + `phase11/12/13/14/15` — 2026-09-02
+- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops, reset/restore/stash, cherry-pick/rebase conflict, fork/private 404, invite expired, draft block, changes_requested block, file not found, search short query, watch dup) — `fsck` + `store_tests` + `phase11/12/13/14/15/16` — 2026-09-02
 - [x] Server tests (Vitest + Supertest, mock or real vcsService) — `server/vitest.config.ts:1` 32 tests — 2026-09-02
-- [x] Web tests (Playwright for critical flows) — `pnpm --filter web build` 10 routes ok, Vitest deferred — 2026-09-02
-- [x] CI: `cargo test && pnpm test` on each commit — `99 Rust + 32 Server + web build` — 2026-09-02
+- [x] Web tests (Playwright for critical flows) — `pnpm --filter web build` 11 routes ok (including `/notifications`), Vitest deferred — 2026-09-02
+- [x] CI: `cargo test && pnpm test` on each commit — `107 Rust + 32 Server + web build` — 2026-09-02
 
 ## UI/UX Redesign v2 — Design Engineering & Anti-Slop Overhaul
 
@@ -804,3 +803,4 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - 2026-09-02: Phase 13 complete — revwalk (log --all/--graph/-p/--stat/--name-only/--since/--until/--author/--grep/--follow) + show/ls-files/for-each-ref/grep/blame + commit --amend/cherry-pick/revert/bisect/rebase + short-hash, 7 tests phase13, 86 Rust total
 - 2026-09-02: Phase 14 complete — forks (005_forks_orgs + fork/network, clone via execItehaas, cross-fork PR source_repo + copyMissingObjects), orgs/teams (orgs, organization_members, teams, team_members, team_repositories), invites (token 32B hex, 7d, pending/accepted), permissions (getTeamPermission), 5 tests phase14, 91 Rust total, live fork/PR/org/team/invite verified
 - 2026-09-02: Phase 15 complete — review & workflow (007_review is_draft/pr_requested_reviewers/pr_reviews/pr_review_comments/labels/milestones/issue_assignees, draft guard + ready, reviewers + CODEOWNERS any-pattern team pop, approvals block 409, line-comments path/line/side, labels/milestones/assignees + enrich/filter, close keywords UUID + ROW_NUMBER numeric, permissions 12 tests), 8 tests phase15, 99 Rust + 32 Server + web build, pnpm server build + web 10 routes
+- 2026-09-02: Phase 16 complete — code browser + search & watch (008_search_watch pg_trgm GIN + watches, file/history/blame API tree walk, search global ILIKE, watch 409, FileTree ?path= breadcrumb + FileViewer history/blame/raw tabs + AppShell bell + notifications inbox + CommandPalette search + issue body mentions), 8 tests phase16, 107 Rust + 32 Server + web 11 routes

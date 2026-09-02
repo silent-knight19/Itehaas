@@ -119,6 +119,22 @@ export async function issueRoutes(app: FastifyInstance) {
       try { await query(`INSERT INTO notifications (user_id, type, payload) VALUES ($1,'issue_assigned',$2)`, [u.rows[0].id, JSON.stringify({ repo: `${owner}/${repo}`, issue_id: issueId, title })]); } catch {}
     }
     await query(`INSERT INTO activity (repo_id, user_id, action, payload) VALUES ($1,$2,'issue_open', $3)`, [repoMeta.id, user.id, JSON.stringify({ issue_id: issueId, title })]);
+    // Mentions in title/body
+    try {
+      const text = `${title} ${body}`;
+      const mentionRegex = /@([a-zA-Z0-9._-]{3,32})/g;
+      const seen = new Set<string>();
+      let m: RegExpExecArray | null;
+      while ((m = mentionRegex.exec(text)) !== null) {
+        const uname = m[1];
+        if (uname === user.username || seen.has(uname)) continue;
+        seen.add(uname);
+        const u = await query(`SELECT id FROM users WHERE username=$1`, [uname]);
+        if (u.rows.length > 0) {
+          try { await query(`INSERT INTO notifications (user_id, type, payload) VALUES ($1,'mention',$2)`, [u.rows[0].id, JSON.stringify({ repo: `${owner}/${repo}`, issue_id: issueId, by: user.username })]); } catch {}
+        }
+      }
+    } catch {}
     const enriched = await enrichIssue(res.rows[0]);
     return reply.status(201).send({ issue: enriched });
   });

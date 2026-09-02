@@ -14,6 +14,8 @@ import {
   X,
   Compass,
   Layers,
+  Bell,
+  CheckCheck,
 } from "lucide-react";
 import { Api } from "../lib/api";
 import { CommandPalette } from "./CommandPalette";
@@ -25,6 +27,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
   const [cmdOpen, setCmdOpen] = useState(false);
+  const [notifications, setNotifications] = useState<any[]>([]);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [notifLoading, setNotifLoading] = useState(false);
 
   const pathname = usePathname();
   const router = useRouter();
@@ -53,6 +58,28 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     loadState();
   }, [pathname]);
+
+  async function loadNotifications() {
+    if (!user) { setNotifications([]); return; }
+    setNotifLoading(true);
+    try {
+      const res = await Api.getNotifications();
+      if (res.ok && res.json?.notifications) setNotifications(res.json.notifications);
+    } catch {}
+    finally { setNotifLoading(false); }
+  }
+
+  useEffect(() => {
+    if (user) loadNotifications();
+    else setNotifications([]);
+  }, [user?.id, pathname]);
+
+  // Poll notifications every 30s when logged in
+  useEffect(() => {
+    if (!user) return;
+    const id = setInterval(loadNotifications, 30000);
+    return () => clearInterval(id);
+  }, [user?.id]);
 
   // Global ⌘K keyboard shortcut
   useEffect(() => {
@@ -285,6 +312,74 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
           {/* Right Header Controls */}
           <div className="flex items-center gap-2.5">
+            {user && (
+              <div className="relative">
+                <button
+                  onClick={() => { setNotifOpen(!notifOpen); if (!notifOpen) loadNotifications(); }}
+                  className="relative flex items-center gap-1.5 rounded-sm border border-border-default bg-surface px-2 py-1 text-xs text-fg-muted hover:border-border-emphasis hover:text-fg transition-colors"
+                  title="Notifications"
+                >
+                  <Bell className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline text-[11px]">Inbox</span>
+                  {notifications.filter((n:any)=>!n.is_read).length > 0 && (
+                    <span className="absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full bg-accent text-[10px] font-mono text-white">
+                      {notifications.filter((n:any)=>!n.is_read).length}
+                    </span>
+                  )}
+                </button>
+                {notifOpen && (
+                  <>
+                    <div className="fixed inset-0 z-30" onClick={() => setNotifOpen(false)} />
+                    <div className="absolute right-0 top-full mt-1.5 z-40 w-80 rounded-sm border border-border-default bg-surface-overlay shadow-xl overflow-hidden animate-fast">
+                      <div className="flex items-center justify-between border-b border-border-subtle px-3 py-2">
+                        <span className="text-xs font-medium text-fg">Notifications</span>
+                        <span className="text-[11px] font-mono text-fg-muted">{notifications.filter((n:any)=>!n.is_read).length} unread</span>
+                      </div>
+                      <div className="max-h-[320px] overflow-y-auto divide-y divide-border-subtle">
+                        {notifLoading ? (
+                          <div className="p-6 text-center text-xs text-fg-muted animate-pulse">Loading…</div>
+                        ) : notifications.length === 0 ? (
+                          <div className="p-6 text-center text-xs text-fg-muted">No notifications</div>
+                        ) : (
+                          notifications.slice(0, 20).map((n:any) => {
+                            let payload: any = {};
+                            try { payload = typeof n.payload === 'string' ? JSON.parse(n.payload) : n.payload; } catch {}
+                            const title = n.type === 'mention' ? `Mentioned by @${payload.by || '?'}` :
+                                         n.type === 'pr_open' ? `PR opened: ${payload.title || ''}` :
+                                         n.type === 'pr_review_requested' ? `Review requested by @${payload.requested_by || '?'}` :
+                                         n.type === 'issue_assigned' ? `Assigned: ${payload.title || ''}` :
+                                         n.type;
+                            const repo = payload.repo || payload.repo_owner || "";
+                            return (
+                              <div key={n.id} className={`px-3 py-2 hover:bg-surface-hover/50 ${!n.is_read ? "bg-accent-subtle/30" : ""}`}>
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="min-w-0">
+                                    <div className="text-xs text-fg truncate">{title}</div>
+                                    <div className="text-[11px] text-fg-muted font-mono truncate">{repo} • {new Date(n.created_at).toLocaleDateString()}</div>
+                                  </div>
+                                  {!n.is_read && (
+                                    <button
+                                      onClick={async () => { await Api.markNotificationRead(n.id); setNotifications(prev=>prev.map(x=>x.id===n.id?{...x,is_read:true}:x)); }}
+                                      className="rounded-xs border border-border-subtle bg-surface px-1.5 py-0.5 text-[10px] text-fg-muted hover:text-fg"
+                                      title="Mark read"
+                                    >
+                                      <CheckCheck className="h-3 w-3" />
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                      <div className="border-t border-border-subtle bg-bg-subtle px-3 py-1.5 text-center">
+                        <Link href="/notifications" onClick={()=>setNotifOpen(false)} className="text-xs text-fg-muted hover:text-fg">View all →</Link>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
             <button
               onClick={() => setCmdOpen(true)}
               className="flex items-center gap-2 rounded-sm border border-border-default bg-surface px-2 py-1 text-xs text-fg-muted hover:border-border-emphasis hover:text-fg transition-colors"

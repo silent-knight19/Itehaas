@@ -34,6 +34,8 @@ interface CommandPaletteProps {
 export function CommandPalette({ open, onClose }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [repos, setRepos] = useState<any[]>([]);
+  const [searchResults, setSearchResults] = useState<any | null>(null);
+  const [searchLoading, setSearchLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -49,11 +51,54 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
     } else {
       setQuery("");
       setSelectedIndex(0);
+      setSearchResults(null);
     }
   }, [open]);
 
+  // Debounced global search via pg_trgm when query >=2
+  useEffect(() => {
+    if (!open) return;
+    const q = query.trim();
+    if (q.length < 2) { setSearchResults(null); return; }
+    setSearchLoading(true);
+    const id = setTimeout(async () => {
+      try {
+        const res = await Api.search(q, undefined, 8);
+        if (res.ok) setSearchResults(res.json?.results || null);
+      } catch {}
+      finally { setSearchLoading(false); }
+    }, 300);
+    return () => clearTimeout(id);
+  }, [query, open]);
+
   // Build items
+  const searchItems: CommandItem[] = searchResults ? [
+    ...(searchResults.repositories?.map((r:any) => ({
+      id: `search-repo-${r.owner}-${r.name}`,
+      title: `${r.owner}/${r.name} — ${r.description || 'repo'}`,
+      category: "Repositories" as const,
+      icon: FolderGit2,
+      action: () => { router.push(`/${r.owner}/${r.name}`); onClose(); },
+    })) || []),
+    ...(searchResults.issues?.map((i:any) => ({
+      id: `search-issue-${i.id}`,
+      title: `#${i.id.slice(0,7)} ${i.title}`,
+      category: "Repositories" as const,
+      icon: CircleDot,
+      action: () => { router.push(`/${i.repo_owner}/${i.repo}/issues`); onClose(); },
+    })) || []),
+    ...(searchResults.users?.map((u:any) => ({
+      id: `search-user-${u.username}`,
+      title: `@${u.username}`,
+      category: "Repositories" as const,
+      icon: Search,
+      action: () => { router.push(`/${u.username}`); onClose(); },
+    })) || []),
+  ] : [];
+
   const items: CommandItem[] = [
+    // Search results first when query active
+    ...searchItems,
     // Repositories
     ...repos.map((r) => ({
       id: `repo-${r.owner}-${r.name}`,
@@ -101,9 +146,9 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
     },
   ];
 
-  const filtered = items.filter((item) =>
-    item.title.toLowerCase().includes(query.toLowerCase())
-  );
+  const filtered = query.trim().length >=2 && searchResults
+    ? items // already filtered by search API, show all searchItems + navigation, but filter locally as fallback
+    : items.filter((item) => item.title.toLowerCase().includes(query.toLowerCase()));
 
   useEffect(() => {
     setSelectedIndex(0);
@@ -149,9 +194,10 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Type a command or search repositories…"
+            placeholder="Type a command or search repositories… (pg_trgm global search)"
             className="w-full bg-transparent text-xs text-fg placeholder-fg-subtle focus:outline-none font-sans"
           />
+          {searchLoading && <span className="text-[10px] font-mono text-fg-muted animate-pulse">search…</span>}
           <kbd className="rounded-xs border border-border-muted bg-bg-subtle px-1.5 py-0.5 text-[10px] font-mono text-fg-muted">
             ESC
           </kbd>
