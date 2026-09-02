@@ -3,13 +3,21 @@ import { query } from '../db';
 import { getSessionUser } from '../middleware/auth';
 
 export async function searchRoutes(app: FastifyInstance) {
-  // Global search: GET /api/search?q=hello&type=repos|issues|pulls|users&limit=20
+  // Global search: GET /api/search?q=hello&type=repos|issues|pulls|users&limit=20 — S7 bounded, S14 rate-limited
   app.get('/api/search', async (req, reply) => {
+    // S14: 30/min per IP
+    const { checkRateLimit, rateLimitReply } = await import('../lib/rateLimit');
+    const rl = checkRateLimit(req as any, 'search', 30, 60 * 1000);
+    if (!rl.allowed) return rateLimitReply(reply as any, rl.resetMs);
     const { q, type, limit, offset } = req.query as any;
     if (!q || typeof q !== 'string' || q.trim().length < 2) return reply.status(400).send({ error: 'query too short (min 2 chars)' });
+    if (q.trim().length > 100) return reply.status(400).send({ error: 'query too long (max 100 chars)' });
     const search = `%${q.trim()}%`;
-    const lim = Math.min(Math.max(parseInt(limit ?? '20', 10) || 20, 1), 50);
+    const lim = Math.min(Math.max(parseInt(limit ?? '20', 10) || 20, 1), 20); // S7: cap 20 not 50
     const off = Math.max(parseInt(offset ?? '0', 10) || 0, 0);
+    if (off > 10000) return reply.status(400).send({ error: 'offset too large' });
+    // S7: set statement timeout 5s to prevent long ILIKE scans
+    try { await query('SET statement_timeout = 5000'); } catch {}
     const t = (type as string | undefined)?.toLowerCase();
     const user = await getSessionUser(req as any);
     const userId = user?.id ?? null;

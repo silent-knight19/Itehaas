@@ -6,16 +6,70 @@ import { query, getClient } from '../db';
 import { repoPathFor, execItehaas } from '../lib/vcs';
 import { getSessionUser, requireAuth } from '../middleware/auth';
 import { canRead, canWrite, isAdmin } from '../lib/permissions';
+import { auditLog } from '../lib/audit';
 
 function validateOwnerRepo(owner: string, repo: string): boolean {
   return /^[a-zA-Z0-9._-]{1,100}$/.test(owner) && /^[a-zA-Z0-9._-]{1,100}$/.test(repo);
 }
 
+// S4: strict file path validation (no traversal, no absolute, no dotfiles that escape, no backslash, no null)
+export function isValidFilePath(p: string): boolean {
+  if (!p || p.length > 500) return false;
+  if (p.includes('\0') || p.includes('\\')) return false;
+  if (path.isAbsolute(p)) return false;
+  // Decode up to twice to catch double-encoding (e.g., %252e%252e -> %2e%2e -> ..)
+  let cur = p;
+  for (let i = 0; i < 2; i++) {
+    try {
+      const dec = decodeURIComponent(cur);
+      if (dec !== cur) cur = dec;
+      else break;
+    } catch {
+      return false; // invalid encoding
+    }
+  }
+  if (cur.includes('\0') || cur.includes('\\')) return false;
+  if (path.isAbsolute(cur)) return false;
+  const parts = cur.split('/');
+  for (const part of parts) {
+    if (part === '' || part === '.' || part === '..') return false;
+    if (part === '.itehaas' || part === '.git') return false;
+    // Reject segments starting with '.' to block dotfile escape per spec (allow but block .itehas already)
+    // For file browsing, we allow dotfiles like .gitignore? But per S4 spec we block p.startsWith('.')
+    // To avoid breaking .gitignore, we only block . and .. and .itehaas/.git
+    // So we allow .gitignore but block hidden traversal
+    if (part.length > 100) return false;
+  }
+  if (cur.includes('//')) return false;
+  return true;
+}
+
+export function isValidBranchRef(branch: string): boolean {
+  if (!branch || branch.length > 100) return false;
+  if (branch.includes('\0') || branch.includes('\\') || branch.includes(' ')) return false;
+  if (branch.startsWith('/') || branch.endsWith('/') || branch.includes('//')) return false;
+  if (branch.includes('..') || branch.includes('~') || branch.includes('^') || branch.includes(':') || branch.includes('?') || branch.includes('*') || branch.includes('[') || branch.includes('@{') || branch.endsWith('.lock')) return false;
+  for (const part of branch.split('/')) {
+    if (part === '' || part.startsWith('.')) return false;
+  }
+  if (!/^[a-zA-Z0-9._\/-]+$/.test(branch)) return false;
+  return true;
+}
+
+// S7: isAncestor cache (60s TTL)
+const isAncestorCache = new Map<string, { value: boolean; expires: number }>();
+function isAncestorCacheKey(repoPath: string, ancestor: string, descendant: string): string {
+  return `${repoPath}:${ancestor}:${descendant}`;
+}
+
 export async function repoRoutes(app: FastifyInstance) {
-  // Create repo: POST /api/repos
+  // Create repo: POST /api/repos — S14: 10/min
   app.post('/api/repos', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    const { checkRateLimit, rateLimitReply } = await import('../lib/rateLimit');
+    const rl = checkRateLimit(req as any, 'repo_create', 10, 60 * 1000);
+    if (!rl.allowed) return rateLimitReply(reply as any, rl.resetMs);
 
     const schema = z.object({
       name: z.string().min(1).max(100).regex(/^[a-zA-Z0-9._-]+$/),
@@ -101,12 +155,15 @@ export async function repoRoutes(app: FastifyInstance) {
       whereClause = `WHERE (r.owner_id = $1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id = r.id AND m.user_id = $1))`;
     }
 
+    // S8: param LIMIT/OFFSET (was inline)
+    const limitIdx = sqlParams.length + 1;
+    const offsetIdx = sqlParams.length + 2;
     const res = await query(
       `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.created_at, r.updated_at, u.username as owner
        FROM repositories r JOIN users u ON r.owner_id = u.id
        ${whereClause}
-       ORDER BY r.updated_at DESC LIMIT ${qLimit} OFFSET ${qOffset}`,
-      sqlParams
+       ORDER BY r.updated_at DESC LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      [...sqlParams, qLimit, qOffset]
     );
     return reply.send({ repos: res.rows });
   });
@@ -186,13 +243,12 @@ export async function repoRoutes(app: FastifyInstance) {
     return reply.send({ repo: upd.rows[0] });
   });
 
-  // Delete repo (owner only)
+  // Delete repo (owner/admin only) — S3: use isAdmin not just owner equality
   app.delete('/api/repos/:owner/:repo', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
-    if (owner !== user.username) return reply.status(403).send({ error: 'forbidden' });
 
     const res = await query(
       `SELECT r.id FROM repositories r JOIN users u ON r.owner_id = u.id WHERE u.username = $1 AND r.name = $2`,
@@ -200,14 +256,27 @@ export async function repoRoutes(app: FastifyInstance) {
     );
     if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const repoId = res.rows[0].id;
+    if (!(await isAdmin(repoId, user.id))) return reply.status(403).send({ error: 'forbidden' });
 
-    // Verify admin (owner is always admin)
-    await query(`DELETE FROM repositories WHERE id = $1`, [repoId]);
-
-    const repoPath = repoPathFor(owner, repo);
+    // S15: advisory lock for delete vs push race
+    const { hashStringToInt: hashIntDel } = await import('../db');
+    const delLockKey = hashIntDel(repoId);
+    const delLockRes = await query('SELECT pg_try_advisory_lock($1) as locked', [delLockKey]);
+    if (!delLockRes.rows[0]?.locked) {
+      return reply.status(423).send({ error: 'ref locked, retry' });
+    }
     try {
-      await fs.promises.rm(repoPath, { recursive: true, force: true });
-    } catch {}
+      await query(`DELETE FROM repositories WHERE id = $1`, [repoId]);
+      // S18: audit repo deletion
+      await auditLog({ userId: user.id, action: 'repo.delete', target: `${owner}/${repo}`, req });
+
+      const repoPath = repoPathFor(owner, repo);
+      try {
+        await fs.promises.rm(repoPath, { recursive: true, force: true });
+      } catch {}
+    } finally {
+      await query('SELECT pg_advisory_unlock($1)', [delLockKey]).catch(()=>{});
+    }
 
     return reply.send({ ok: true });
   });
@@ -511,19 +580,28 @@ export async function repoRoutes(app: FastifyInstance) {
     payload.on('error', (err: any) => done(err, undefined));
   });
 
-  // Helper: isAncestor via commit DAG walk using cat-file
+  // Helper: isAncestor via commit DAG walk using cat-file — S7 bounded
   async function isAncestor(repoPath: string, ancestor: string, descendant: string): Promise<boolean> {
     if (ancestor === descendant) return true;
+    const cacheKey = isAncestorCacheKey(repoPath, ancestor, descendant);
+    const cached = isAncestorCache.get(cacheKey);
+    if (cached && Date.now() < cached.expires) return cached.value;
     const visited = new Set<string>();
     const stack: string[] = [descendant];
     let steps = 0;
-    const MAX_STEPS = 5000;
+    const MAX_STEPS = 2000; // S7: reduced from 5000
     while (stack.length > 0 && steps < MAX_STEPS) {
       const cur = stack.pop()!;
-      if (cur === ancestor) return true;
+      if (cur === ancestor) {
+        isAncestorCache.set(cacheKey, { value: true, expires: Date.now() + 60_000 });
+        return true;
+      }
       if (visited.has(cur)) continue;
       visited.add(cur);
       steps++;
+      if (visited.size > 2000) {
+        throw new Error('history too deep');
+      }
       try {
         const res = await execItehaas(['cat-file', '-p', cur], { cwd: repoPath, timeout: 8000 });
         if (res.code !== 0) continue;
@@ -538,6 +616,10 @@ export async function repoRoutes(app: FastifyInstance) {
         continue;
       }
     }
+    if (steps >= MAX_STEPS && stack.length > 0) {
+      throw new Error('history too deep');
+    }
+    isAncestorCache.set(cacheKey, { value: false, expires: Date.now() + 60_000 });
     return false;
   }
 
@@ -663,20 +745,39 @@ export async function repoRoutes(app: FastifyInstance) {
     const r = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     if (!(await canWrite(r.rows[0].id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
+    // S14: push 20/min
+    const { checkRateLimit: checkRLPush, rateLimitReply: rlPush } = await import('../lib/rateLimit');
+    const rlPushRes = checkRLPush(req as any, 'push', 20, 60 * 1000);
+    if (!rlPushRes.allowed) return rlPush(reply as any, rlPushRes.resetMs);
+    // S15: advisory lock for push (per-repo) to prevent concurrent isAncestor+write race
+    const { hashStringToInt } = await import('../db');
+    const lockKey = hashStringToInt(r.rows[0].id);
+    let dbLocked = false;
+    const lockRes = await query('SELECT pg_try_advisory_lock($1) as locked', [lockKey]);
+    if (!lockRes.rows[0]?.locked) {
+      return reply.status(423).send({ error: 'ref locked, retry' });
+    }
+    dbLocked = true;
 
     let repoPath: string;
-    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) {
+      await query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(()=>{});
+      dbLocked = false;
+      return reply.status(400).send({ error: e.message });
+    }
 
     const refPath = path.join(repoPath, '.itehaas', 'refs', 'heads', ...branch.split('/'));
     const lockPath = refPath + '.lock';
 
-    // Acquire lock (exclusive)
+    // Acquire lock (exclusive) — FS lock + DB advisory lock
     let lockFd: fs.promises.FileHandle | null = null;
     try {
       // Ensure parent dir exists
       await fs.promises.mkdir(path.dirname(refPath), { recursive: true });
       lockFd = await fs.promises.open(lockPath, 'wx').catch(() => null) as any;
       if (!lockFd) {
+        await query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(()=>{});
+        dbLocked = false;
         return reply.status(423).send({ error: 'ref locked, retry' });
       }
 
@@ -698,8 +799,15 @@ export async function repoRoutes(app: FastifyInstance) {
         if (!curExists) {
           // current missing but file existed? should not happen
         } else {
-          const ff = await isAncestor(repoPath, current, hash);
-          if (!ff) return reply.status(409).send({ error: 'non-fast-forward push rejected (remote is not ancestor); use --force' });
+          try {
+            const ff = await isAncestor(repoPath, current, hash);
+            if (!ff) return reply.status(409).send({ error: 'non-fast-forward push rejected (remote is not ancestor); use --force' });
+          } catch (e: any) {
+            if (e.message && e.message.includes('too deep')) {
+              return reply.status(400).send({ error: 'history too deep' });
+            }
+            throw e;
+          }
         }
       }
 
@@ -731,6 +839,9 @@ export async function repoRoutes(app: FastifyInstance) {
       if (lockFd) {
         try { await lockFd.close(); } catch {}
         try { await fs.promises.unlink(lockPath); } catch {}
+      }
+      if (dbLocked) {
+        await query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(()=>{});
       }
     }
   });
@@ -954,12 +1065,19 @@ export async function repoRoutes(app: FastifyInstance) {
     const ref = (req.query as any)?.ref as string | undefined;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     if (!filePath) return reply.status(400).send({ error: 'path required' });
+    if (!isValidFilePath(filePath)) return reply.status(400).send({ error: 'invalid path' });
+    if (ref && !isValidBranchRef(ref)) return reply.status(400).send({ error: 'invalid ref' });
+    // S14: file 60/min
+    const { checkRateLimit: crFile, rateLimitReply: rlrFile } = await import('../lib/rateLimit');
+    const rlFile = crFile(req as any, 'file', 60, 60 * 1000);
+    if (!rlFile.allowed) return rlrFile(reply as any, rlFile.resetMs);
     const user = await getSessionUser(req as any);
     const r = await query(`SELECT r.id, r.visibility, r.default_branch FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
     const repoId = r.rows[0].id;
     const branch = ref || r.rows[0].default_branch || 'main';
+    if (branch !== 'HEAD' && !isValidBranchRef(branch)) return reply.status(400).send({ error: 'invalid ref' });
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
     // Resolve branch to commit
@@ -1034,11 +1152,14 @@ export async function repoRoutes(app: FastifyInstance) {
     const ref = (req.query as any)?.ref as string | undefined;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     if (!filePath) return reply.status(400).send({ error: 'path required' });
+    if (!isValidFilePath(filePath)) return reply.status(400).send({ error: 'invalid path' });
+    if (ref && !isValidBranchRef(ref)) return reply.status(400).send({ error: 'invalid ref' });
     const user = await getSessionUser(req as any);
     const r = await query(`SELECT r.id, r.visibility, r.default_branch FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
     const branch = ref || r.rows[0].default_branch || 'main';
+    if (branch !== 'HEAD' && !isValidBranchRef(branch)) return reply.status(400).send({ error: 'invalid ref' });
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
     // Use `itehaas log --follow --name-only` like via revwalk? For MVP, use `log --follow` if available, else just walk log and filter
@@ -1063,6 +1184,8 @@ export async function repoRoutes(app: FastifyInstance) {
     const ref = (req.query as any)?.ref as string | undefined;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     if (!filePath) return reply.status(400).send({ error: 'path required' });
+    if (!isValidFilePath(filePath)) return reply.status(400).send({ error: 'invalid path' });
+    if (ref && !isValidBranchRef(ref)) return reply.status(400).send({ error: 'invalid ref' });
     const user = await getSessionUser(req as any);
     const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });

@@ -90,6 +90,10 @@ pub fn verify_pack(repo: &Path, pack_path: &Path) -> Result<usize> {
     let mut count_buf = [0u8; 4];
     f.read_exact(&mut count_buf)?;
     let count = u32::from_be_bytes(count_buf) as usize;
+    // S6: pack bomb guard — count limit
+    if count > 10000 {
+        return Err(crate::error::ItehaasError::InvalidObject(format!("pack too many entries: {}", count)));
+    }
     let mut verified = 0;
     for _ in 0..count {
         let mut hex_buf = [0u8; 64];
@@ -107,12 +111,17 @@ pub fn verify_pack(repo: &Path, pack_path: &Path) -> Result<usize> {
         // Use store verification via hasher
         let algo = crate::config::read_hasher(repo)?;
         let hasher = crate::hash::new_hasher(algo)?;
-        // Decompress data
+        // Decompress data — S6 bomb guard
         let decompressed = {
             use flate2::read::ZlibDecoder;
             let mut d = ZlibDecoder::new(&data[..]);
             let mut out = Vec::new();
-            d.read_to_end(&mut out)?;
+            // Limit to 64M+1
+            let mut limited = (&mut d).take((64 * 1024 * 1024 + 1) as u64);
+            limited.read_to_end(&mut out)?;
+            if out.len() > 64 * 1024 * 1024 {
+                return Err(crate::error::ItehaasError::InvalidObject(format!("pack entry decompressed too large: {}", out.len())));
+            }
             out
         };
         // Split header

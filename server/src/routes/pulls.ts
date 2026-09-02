@@ -60,15 +60,18 @@ export async function pullRoutes(app: FastifyInstance) {
     return reply.send({ pulls: res.rows });
   });
 
-  // Create PR
+  // Create PR — S14: 20/min
   app.post('/api/repos/:owner/:repo/pulls', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    const { checkRateLimit: cr, rateLimitReply: rlr } = await import('../lib/rateLimit');
+    const rl = cr(req as any, 'pulls', 20, 60 * 1000);
+    if (!rl.allowed) return rlr(reply as any, rl.resetMs);
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid' });
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
-    if (!(await canRead(meta.id, user.id, meta.visibility))) return reply.status(404).send({ error: 'not found' });
+    if (!(await canWrite(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
     const schema = z.object({
       title: z.string().min(1).max(200),
       body: z.string().max(5000).optional().default(''),
@@ -228,6 +231,15 @@ export async function pullRoutes(app: FastifyInstance) {
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
     if (!(await canWrite(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
+    // S15: advisory lock for merge (per PR) to prevent concurrent merge race
+    const { hashStringToInt: hashIntMerge } = await import('../db');
+    const mergeLockKey = hashIntMerge(meta.id + ':' + id);
+    const mergeLockRes = await query('SELECT pg_try_advisory_lock($1) as locked', [mergeLockKey]);
+    if (!mergeLockRes.rows[0]?.locked) {
+      return reply.status(423).send({ error: 'merge locked, retry' });
+    }
+    let mergeLockHeld = true;
+    try {
     const prRes = await query(`SELECT source_branch, target_branch, status, is_draft, title, body FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
     if (prRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     if (prRes.rows[0].status !== 'open') return reply.status(400).send({ error: `pr is ${prRes.rows[0].status}` });
@@ -315,6 +327,11 @@ export async function pullRoutes(app: FastifyInstance) {
       }
     } catch {}
     return reply.send({ ok: true, output: mergeRes.stdout });
+    } finally {
+      if (mergeLockHeld) {
+        await query('SELECT pg_advisory_unlock($1)', [mergeLockKey]).catch(()=>{});
+      }
+    }
   });
 
   // Comments
@@ -331,6 +348,9 @@ export async function pullRoutes(app: FastifyInstance) {
   app.post('/api/repos/:owner/:repo/pulls/:id/comments', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    const { checkRateLimit: crCom2, rateLimitReply: rlrCom2 } = await import('../lib/rateLimit');
+    const rlCom2 = crCom2(req as any, 'comments', 30, 60 * 1000);
+    if (!rlCom2.allowed) return rlrCom2(reply as any, rlCom2.resetMs);
     const { owner, repo, id } = req.params as any;
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });

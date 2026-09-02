@@ -1,12 +1,77 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{ItehaasError, Result};
 use crate::hash::Hash;
 use crate::index::{file_mode, path_to_string, Index, IndexEntry};
 use crate::object::store;
 use crate::tree_builder;
+
+/// S4: ensure path inside repo and no symlink in parent chain
+fn ensure_no_symlink_and_inside_repo(repo: &Path, abs: &Path) -> Result<()> {
+    // Must be inside repo via canonical or starts_with after join
+    // Check for .itehaas escape
+    let rel = abs.strip_prefix(repo).map_err(|_| ItehaasError::Other(format!("path escapes repository: {}", abs.display())))?;
+    let rel_str = path_to_string(rel);
+    if rel_str.is_empty() {
+        return Err(ItehaasError::Other("empty path".into()));
+    }
+    // Reject .itehaas/.git segments
+    for comp in rel.components() {
+        let s = comp.as_os_str().to_string_lossy();
+        if s == ".itehaas" || s == ".git" {
+            return Err(ItehaasError::Other(format!("path contains forbidden component: {}", s)));
+        }
+        if s == ".." || s == "." {
+            return Err(ItehaasError::Other(format!("path contains traversal: {}", rel_str)));
+        }
+    }
+    // Check each ancestor from repo to parent of abs for symlink
+    if let Some(parent) = abs.parent() {
+        let mut cur: PathBuf = parent.to_path_buf();
+        // Walk up to repo (exclusive)
+        while cur != *repo && cur.starts_with(repo) {
+            match fs::symlink_metadata(&cur) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(ItehaasError::Other(format!("refusing to traverse symlink: {}", cur.display())));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(ItehaasError::Io(e)),
+            }
+            if let Some(p) = cur.parent() {
+                let pbuf = p.to_path_buf();
+                if pbuf == cur {
+                    break;
+                }
+                cur = pbuf;
+            } else {
+                break;
+            }
+        }
+        // Also check abs itself if it exists and is symlink (should not overwrite symlink)
+        if let Ok(m) = fs::symlink_metadata(abs) {
+            if m.file_type().is_symlink() {
+                return Err(ItehaasError::Other(format!("refusing to overwrite symlink: {}", abs.display())));
+            }
+        }
+    }
+    // Canonical containment if parent exists
+    if let Some(parent) = abs.parent() {
+        if parent.exists() {
+            // Use canonicalize for existing parent to ensure not escaping via symlink mount
+            if let Ok(canon_parent) = parent.canonicalize() {
+                if let Ok(canon_repo) = repo.canonicalize() {
+                    if !canon_parent.starts_with(&canon_repo) {
+                        return Err(ItehaasError::Other(format!("path escapes repository (canonical): {}", abs.display())));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Update working tree and index to match target commit's tree.
 /// Also updates HEAD (symbolic or detached) as requested.
@@ -76,11 +141,28 @@ pub fn checkout(
         }
     }
 
-    // Write target files
+    // Write target files — S4 hardened
     for (path, (hash, mode)) in &target_map {
         let abs = repo.join(path);
+        ensure_no_symlink_and_inside_repo(repo, &abs)?;
         if let Some(parent) = abs.parent() {
+            // Ensure parent chain has no symlink before creating
+            ensure_no_symlink_and_inside_repo(repo, &parent.join("_placeholder"))?;
             fs::create_dir_all(parent)?;
+            // Re-check after creation to ensure not raced to symlink
+            let mut cur = parent.to_path_buf();
+            while cur != *repo && cur.starts_with(repo) {
+                if let Ok(m) = fs::symlink_metadata(&cur) {
+                    if m.file_type().is_symlink() {
+                        return Err(ItehaasError::Other(format!("refusing to traverse symlink after mkdir: {}", cur.display())));
+                    }
+                }
+                if let Some(p) = cur.parent() {
+                    cur = p.to_path_buf();
+                } else {
+                    break;
+                }
+            }
         }
         let obj = store::read_object(repo, hash, hasher.as_ref())?;
         let content = match obj {
@@ -196,8 +278,23 @@ pub fn checkout_forced(
     }
     for (path, (hash, mode)) in &target_map {
         let abs = repo.join(path);
+        ensure_no_symlink_and_inside_repo(repo, &abs)?;
         if let Some(parent) = abs.parent() {
+            ensure_no_symlink_and_inside_repo(repo, &parent.join("_placeholder"))?;
             fs::create_dir_all(parent)?;
+            let mut cur = parent.to_path_buf();
+            while cur != *repo && cur.starts_with(repo) {
+                if let Ok(m) = fs::symlink_metadata(&cur) {
+                    if m.file_type().is_symlink() {
+                        return Err(ItehaasError::Other(format!("refusing to traverse symlink after mkdir: {}", cur.display())));
+                    }
+                }
+                if let Some(p) = cur.parent() {
+                    cur = p.to_path_buf();
+                } else {
+                    break;
+                }
+            }
         }
         let obj = store::read_object(repo, hash, hasher.as_ref())?;
         let content = match obj {

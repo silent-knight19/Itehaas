@@ -34,7 +34,12 @@ pub fn build_tree_from_index(
         entries: &[&IndexEntry],
         prefix: &str, // "" for root, else "src" or "src/lib"
         hasher: &dyn Hasher,
+        depth: usize,
     ) -> Result<Hash> {
+        // S6: depth limit to prevent stack overflow via deep nesting
+        if depth > 100 {
+            return Err(crate::error::ItehaasError::InvalidObject(format!("tree depth too deep: {}", depth)));
+        }
         // Collect direct files and subdirs at this prefix
         let mut direct_files: Vec<&IndexEntry> = Vec::new();
         let mut subdirs: BTreeMap<String, Vec<&IndexEntry>> = BTreeMap::new();
@@ -91,9 +96,14 @@ pub fn build_tree_from_index(
             } else {
                 format!("{}/{}", prefix, dir_name)
             };
-            let sub_hash = build_dir(repo, &sub_entries, &sub_prefix, hasher)?;
+            let sub_hash = build_dir(repo, &sub_entries, &sub_prefix, hasher, depth + 1)?;
             let entry = TreeEntry::new(0o040000, dir_name, sub_hash)?;
             tree_entries.push(entry);
+        }
+
+        // S6: tree entries limit
+        if tree_entries.len() > 10000 {
+            return Err(crate::error::ItehaasError::InvalidObject(format!("tree too large: {}", tree_entries.len())));
         }
 
         // Now build tree for this directory
@@ -111,7 +121,7 @@ pub fn build_tree_from_index(
         return Ok(hash);
     }
 
-    build_dir(repo, entries, "", hasher)
+    build_dir(repo, entries, "", hasher, 0)
 }
 
 /// Flatten a tree recursively into path -> hash map.
@@ -122,7 +132,12 @@ pub fn flatten_tree(
     hasher: &dyn Hasher,
     prefix: &str,
     out: &mut BTreeMap<String, (Hash, u32)>,
+    depth: usize,
 ) -> Result<()> {
+    // S6: depth limit
+    if depth > 100 {
+        return Err(crate::error::ItehaasError::InvalidObject(format!("tree depth too deep: {}", depth)));
+    }
     let obj = crate::object::store::read_object(repo, tree_hash, hasher)?;
     let tree = match obj {
         crate::object::Object::Tree(t) => t,
@@ -141,7 +156,7 @@ pub fn flatten_tree(
         };
         if e.mode == 0o040000 {
             // Subdirectory — recurse
-            flatten_tree(repo, &e.hash, hasher, &full_path, out)?;
+            flatten_tree(repo, &e.hash, hasher, &full_path, out, depth + 1)?;
         } else {
             out.insert(full_path, (e.hash, e.mode));
         }
@@ -156,6 +171,6 @@ pub fn flatten_tree_root(
     hasher: &dyn Hasher,
 ) -> Result<BTreeMap<String, (Hash, u32)>> {
     let mut map = BTreeMap::new();
-    flatten_tree(repo, tree_hash, hasher, "", &mut map)?;
+    flatten_tree(repo, tree_hash, hasher, "", &mut map, 0)?;
     Ok(map)
 }

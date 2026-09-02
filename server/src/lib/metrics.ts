@@ -2,6 +2,9 @@ export const metrics = {
   httpRequestsTotal: 0,
   httpRequestsByStatus: new Map<string, number>(),
   ciPipelinesTotal: 0,
+  auditLogsTotal: 0,
+  authFailuresTotal: 0,
+  rateLimitedTotal: 0,
   startTime: Date.now(),
 };
 
@@ -13,6 +16,18 @@ export function incHttpRequest(method: string, code: number) {
 
 export function incCIPipelines() {
   metrics.ciPipelinesTotal++;
+}
+
+export function incAuditLog() {
+  metrics.auditLogsTotal++;
+}
+
+export function incAuthFailure() {
+  metrics.authFailuresTotal++;
+}
+
+export function incRateLimited() {
+  metrics.rateLimitedTotal++;
 }
 
 export function renderMetrics(): string {
@@ -27,6 +42,15 @@ export function renderMetrics(): string {
   out += '# HELP itehaas_ci_pipelines_total Total CI pipelines queued\n';
   out += '# TYPE itehaas_ci_pipelines_total counter\n';
   out += `itehaas_ci_pipelines_total ${metrics.ciPipelinesTotal}\n`;
+  out += '# HELP itehaas_audit_logs_total Total audit log entries\n';
+  out += '# TYPE itehaas_audit_logs_total counter\n';
+  out += `itehaas_audit_logs_total ${metrics.auditLogsTotal}\n`;
+  out += '# HELP itehaas_auth_failures_total Total authentication failures (401/403)\n';
+  out += '# TYPE itehaas_auth_failures_total counter\n';
+  out += `itehaas_auth_failures_total ${metrics.authFailuresTotal}\n`;
+  out += '# HELP itehaas_rate_limited_total Total rate-limited requests (429)\n';
+  out += '# TYPE itehaas_rate_limited_total counter\n';
+  out += `itehaas_rate_limited_total ${metrics.rateLimitedTotal}\n`;
   out += '# HELP itehaas_http_requests_by_status HTTP requests by method and status\n';
   out += '# TYPE itehaas_http_requests_by_status counter\n';
   for (const [k, v] of metrics.httpRequestsByStatus.entries()) {

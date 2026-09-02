@@ -71,9 +71,17 @@ impl Object {
 }
 
 fn parse_tree(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
+    // S6: body limit
+    if body.len() > 64 * 1024 * 1024 {
+        return Err(ItehaasError::ObjectTooLarge { size: body.len(), limit: 64 * 1024 * 1024 });
+    }
     let mut entries = Vec::new();
     let mut pos = 0usize;
     while pos < body.len() {
+        // S6: entries count limit to prevent DoS
+        if entries.len() >= 10000 {
+            return Err(ItehaasError::InvalidObject("tree too large: too many entries".into()));
+        }
         // Find space (mode end)
         let space = body[pos..]
             .iter()
@@ -83,6 +91,10 @@ fn parse_tree(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
             .map_err(|_| ItehaasError::InvalidObject("tree: invalid mode utf8".into()))?;
         let mode = u32::from_str_radix(mode_str, 8)
             .map_err(|_| ItehaasError::InvalidObject(format!("tree: invalid mode {mode_str}")))?;
+        // S6: validate mode
+        if !matches!(mode, 0o100644 | 0o100755 | 0o040000) {
+            return Err(ItehaasError::InvalidObject(format!("invalid tree mode: {mode:o}")));
+        }
         pos += space + 1;
         // Find null (name end)
         let nul = body[pos..]
@@ -130,6 +142,10 @@ fn parse_tree(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
 }
 
 fn parse_commit(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
+    // S6: body size limit
+    if body.len() > 64 * 1024 * 1024 {
+        return Err(ItehaasError::ObjectTooLarge { size: body.len(), limit: 64 * 1024 * 1024 });
+    }
     let text = String::from_utf8(body).map_err(|_| ItehaasError::InvalidObject("commit: invalid utf8".into()))?;
     let lines: Vec<&str> = text.split('\n').collect();
     let mut idx = 0usize;
@@ -146,8 +162,11 @@ fn parse_commit(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
     tree = Some(Hash::from_hex(algo, tree_hex)?);
     idx += 1;
 
-    // parents
+    // parents — S6: limit
     while idx < lines.len() && lines[idx].starts_with("parent ") {
+        if parents.len() >= 100 {
+            return Err(ItehaasError::InvalidObject("commit: too many parents".into()));
+        }
         let h = lines[idx].strip_prefix("parent ").unwrap().trim();
         parents.push(Hash::from_hex(algo, h)?);
         idx += 1;
@@ -181,6 +200,10 @@ fn parse_commit(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
     } else {
         String::new()
     };
+    // S6: message limit 1M
+    if message.len() > 1_000_000 {
+        return Err(ItehaasError::InvalidObject(format!("commit message too large: {}", message.len())));
+    }
 
     Ok(Object::Commit(Commit {
         tree: tree.unwrap(),
@@ -192,6 +215,10 @@ fn parse_commit(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
 }
 
 fn parse_tag(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
+    // S6: body limit
+    if body.len() > 64 * 1024 * 1024 {
+        return Err(ItehaasError::ObjectTooLarge { size: body.len(), limit: 64 * 1024 * 1024 });
+    }
     let text = String::from_utf8(body).map_err(|_| ItehaasError::InvalidObject("tag: invalid utf8".into()))?;
     let lines: Vec<&str> = text.split('\n').collect();
     let mut idx = 0;
@@ -232,6 +259,10 @@ fn parse_tag(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
     } else {
         String::new()
     };
+    // S6: tag message limit
+    if message.len() > 1_000_000 {
+        return Err(ItehaasError::InvalidObject(format!("tag message too large: {}", message.len())));
+    }
     Ok(Object::Tag(Tag {
         object,
         object_type,

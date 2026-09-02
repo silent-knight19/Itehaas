@@ -1,8 +1,15 @@
 import * as argon2 from 'argon2';
 import { v4 as uuid } from 'uuid';
+import * as crypto from 'crypto';
+import { config } from '../config';
 
 export async function hashPassword(password: string): Promise<string> {
-  return argon2.hash(password, { type: argon2.argon2id });
+  return argon2.hash(password, {
+    type: argon2.argon2id,
+    memoryCost: 65536, // 64 MiB — Vivobook 3500U ~300ms, vs brute-force 100× harder than default 4 MiB
+    timeCost: 3,
+    parallelism: 1,
+  });
 }
 
 export async function verifyPassword(hash: string, password: string): Promise<boolean> {
@@ -70,9 +77,15 @@ export function validateSessionId(sid: string): boolean {
 
 // CSRF: SameSite=lax is primary defense. For state-changing API calls,
 // we also accept optional X-CSRF-Token header if client opts in.
-// Token is not required in Phase 6 (web not yet), but helper is provided.
+// Now HMAC with cookieSecret (per S2, not yet enforced — S11 will enforce header check).
 export function csrfTokenForSession(sessionId: string): string {
-  // Simple HMAC-like: not cryptographically strong, but deterministic per session for Phase 6
-  // In production, replace with signed token via cookieSecret.
-  return Buffer.from(sessionId).toString('base64url').slice(0, 32);
+  // HMAC-SHA256 with cookieSecret — deterministic per session, not reversible without secret
+  // Verification in S11 preHandler will compare HMAC.
+  try {
+    const h = crypto.createHmac('sha256', config.cookieSecret).update(sessionId).digest('base64url');
+    return h.slice(0, 32);
+  } catch {
+    // Fallback during tests where config may throw in prod, but not in dev
+    return Buffer.from(sessionId).toString('base64url').slice(0, 32);
+  }
 }

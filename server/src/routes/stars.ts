@@ -31,18 +31,20 @@ export async function starRoutes(app: FastifyInstance) {
     const user = await requireAuth(req, reply);
     if (!user) return;
     const { owner, repo } = req.params as any;
-    const meta = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    const meta = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (meta.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(meta.rows[0].id, user.id, meta.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
     await query(`DELETE FROM stars WHERE user_id=$1 AND repo_id=$2`, [user.id, meta.rows[0].id]);
     return reply.send({ ok: true, starred: false });
   });
 
   app.get('/api/repos/:owner/:repo/stars', async (req, reply) => {
     const { owner, repo } = req.params as any;
-    const meta = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    const meta = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (meta.rows.length === 0) return reply.status(404).send({ error: 'not found' });
-    const countRes = await query(`SELECT count(*)::int as count FROM stars WHERE repo_id=$1`, [meta.rows[0].id]);
     const user = await getSessionUser(req as any);
+    if (!(await canRead(meta.rows[0].id, user?.id ?? null, meta.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+    const countRes = await query(`SELECT count(*)::int as count FROM stars WHERE repo_id=$1`, [meta.rows[0].id]);
     let starred = false;
     if (user) {
       const s = await query(`SELECT 1 FROM stars WHERE user_id=$1 AND repo_id=$2`, [user.id, meta.rows[0].id]);

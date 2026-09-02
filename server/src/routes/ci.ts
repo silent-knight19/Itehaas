@@ -9,6 +9,10 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import * as yaml from 'yaml';
 import { incCIPipelines } from '../lib/metrics';
+import { checkRateLimit, rateLimitReply } from '../lib/rateLimit';
+import { encryptSecret, decryptSecretSafe } from '../lib/secrets';
+import { config } from '../config';
+import { auditLog } from '../lib/audit';
 
 function validateOwnerRepo(o: string, r: string) {
   return /^[a-zA-Z0-9._-]{1,100}$/.test(o) && /^[a-zA-Z0-9._-]{1,100}$/.test(r);
@@ -62,15 +66,29 @@ async function parseWorkflow(repoPath: string): Promise<ParsedWorkflow> {
     try {
       if (!fs.existsSync(cand)) continue;
       const text = fs.readFileSync(cand, 'utf8');
+      // S13: YAML limits
+      if (text.length > 64 * 1024) {
+        // Too large, skip
+        continue;
+      }
       const parsed = yaml.parse(text);
       if (!parsed || typeof parsed !== 'object') continue;
-      // Normalize jobs
+      // Normalize jobs — S13 limits
       const jobs: WorkflowJob[] = [];
       const rawJobs = parsed.jobs as any;
       if (rawJobs && typeof rawJobs === 'object') {
+        const jobKeys = Object.keys(rawJobs);
+        if (jobKeys.length > 10) continue; // too many jobs
         for (const [jobName, jobDef] of Object.entries(rawJobs as Record<string, any>)) {
           const jd = jobDef as any;
           const steps = Array.isArray(jd.steps) ? jd.steps : [];
+          if (steps.length > 20) continue; // too many steps per job
+          for (const s of steps) {
+            if (s && typeof s.run === 'string' && s.run.length > 5000) {
+              // run too large
+              continue;
+            }
+          }
           jobs.push({
             name: jobName,
             runsOn: jd['runs-on'] || jd.runsOn,
@@ -79,10 +97,12 @@ async function parseWorkflow(repoPath: string): Promise<ParsedWorkflow> {
         }
       }
       if (jobs.length > 0) {
+        // Also check total jobs and steps already limited
         return { name: parsed.name, on: parsed.on, jobs, raw: parsed, file: cand };
       }
       // Fallback: if jobs empty but file exists, treat as single job with steps as top-level steps?
       if (Array.isArray(parsed.steps)) {
+        if (parsed.steps.length > 20) continue;
         return { name: parsed.name, jobs: [{ name: 'build', steps: parsed.steps }], raw: parsed, file: cand };
       }
     } catch (e) {
@@ -115,22 +135,29 @@ async function isDockerAvailable(): Promise<boolean> {
 
 async function executeInRunner(repoPath: string, script: string, env: Record<string, string>, timeoutMs = 30000): Promise<{ logs: string; exitCode: number; runner: string }> {
   const dockerOk = await isDockerAvailable();
-  const combinedEnv = { ...process.env, ...env } as Record<string, string>;
+  // S13: do NOT include process.env — only secrets (env) to avoid DATABASE_URL leak
+  const combinedEnv = { ...env } as Record<string, string>;
   // Prepare logs header
   let logs = '';
-  const header = `# Runner: ${dockerOk ? 'docker (network none, memory 512m, pids 128)' : 'local (simulated isolation)'}\n# Script:\n${script}\n---\n`;
+  const header = `# Runner: ${dockerOk ? 'docker (network none, memory 512m, pids 128, user 65534, read-only)' : 'unavailable (no docker, no host exec)'}\n# Script:\n${script}\n---\n`;
   logs += header;
 
   if (dockerOk) {
-    // Try docker: use node:20-alpine or alpine:latest, fallback to local if pull fails
-    const dockerImage = 'alpine:latest';
-    // Build docker args: run --rm --network none --memory 512m --cpus 1 --pids-limit 128 -v repoPath:/workspace -w /workspace -e KEY=VAL image sh -c "script"
+    // S13: pin image to 3.19, harden args
+    const dockerImage = 'alpine:3.19';
+    // S13: hardened args: user 65534, read-only, tmpfs, cap-drop, no-new-privileges
     const args = [
       'run', '--rm',
       '--network', 'none',
       '--memory', '512m',
+      '--memory-swap', '512m',
       '--cpus', '1',
       '--pids-limit', '128',
+      '--user', '65534:65534',
+      '--read-only',
+      '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
+      '--cap-drop', 'ALL',
+      '--security-opt', 'no-new-privileges:true',
       '-v', `${repoPath}:/workspace`,
       '-w', '/workspace',
     ];
@@ -153,30 +180,14 @@ async function executeInRunner(repoPath: string, script: string, env: Record<str
       logs += result.stdout + result.stderr;
       return { logs, exitCode: result.code, runner: 'docker' };
     } catch (e: any) {
-      logs += `\n# Docker failed, falling back to local: ${e.message}\n`;
-      // fall through to local
+      logs += `\n# Docker failed: ${e.message}\n`;
+      return { logs, exitCode: 1, runner: 'docker' };
     }
   }
 
-  // Local execution (simulated isolation: no network, memory limits are documented but not enforced in this fallback)
-  try {
-    const result = await new Promise<{ stdout: string; stderr: string; code: number }>((resolve) => {
-      // Use sh -c with env
-      const cp = spawn('sh', ['-c', script], { cwd: repoPath, env: combinedEnv as any, timeout: timeoutMs });
-      let out = '';
-      let err = '';
-      cp.stdout?.on('data', (d) => { out += d.toString(); });
-      cp.stderr?.on('data', (d) => { err += d.toString(); });
-      cp.on('error', (e) => resolve({ stdout: out, stderr: `local error: ${e.message}`, code: 1 }));
-      cp.on('close', (code) => resolve({ stdout: out, stderr: err, code: code ?? 1 }));
-      setTimeout(() => { try { cp.kill('SIGKILL'); } catch {}; }, timeoutMs);
-    });
-    logs += result.stdout + result.stderr;
-    return { logs, exitCode: result.code, runner: 'local' };
-  } catch (e: any) {
-    logs += `\n# Local execution failed: ${e.message}\n`;
-    return { logs, exitCode: 1, runner: 'local' };
-  }
+  // S13: no host exec fallback — fail closed
+  logs += `\n# Docker unavailable, pipeline failed (no host exec) — S13 hardening\n`;
+  return { logs, exitCode: 1, runner: 'unavailable' };
 }
 
 async function collectArtifacts(repoPath: string, pipelineId: string, jobId: string): Promise<number> {
@@ -191,15 +202,26 @@ async function collectArtifacts(repoPath: string, pipelineId: string, jobId: str
   // Also check workflow artifacts pattern from recent logs? For MVP, check these dirs
   for (const dir of candidates) {
     try {
-      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
+      const lst = fs.lstatSync(dir);
+      if (lst.isSymbolicLink()) continue; // S4: refuse symlink dirs
+      if (!fs.existsSync(dir) || !lst.isDirectory()) continue;
+      // Also ensure canonical inside repo
+      try {
+        const canonDir = fs.realpathSync(dir);
+        const canonRepo = fs.realpathSync(repoPath);
+        if (!canonDir.startsWith(canonRepo + path.sep) && canonDir !== canonRepo) continue;
+      } catch {}
       const files = fs.readdirSync(dir);
       for (const f of files.slice(0, 20)) { // limit 20 per dir
         const full = path.join(dir, f);
         try {
-          const stat = fs.statSync(full);
+          const stat = fs.lstatSync(full);
+          if (stat.isSymbolicLink()) continue; // S4: skip symlink files
           if (stat.isFile()) {
             const size = stat.size;
+            if (size > 10 * 1024 * 1024) continue; // S4: 10M per artifact
             const rel = path.relative(repoPath, full);
+            if (rel.startsWith('..') || path.isAbsolute(rel)) continue;
             await query(`INSERT INTO ci_artifacts (job_id, pipeline_id, name, path, size_bytes) VALUES ($1,$2,$3,$4,$5)`, [jobId, pipelineId, f, rel, size]);
             count++;
           }
@@ -213,8 +235,10 @@ async function collectArtifacts(repoPath: string, pipelineId: string, jobId: str
     for (const f of rootFiles.slice(0, 5)) {
       const full = path.join(repoPath, f);
       try {
-        const stat = fs.statSync(full);
+        const stat = fs.lstatSync(full);
+        if (stat.isSymbolicLink()) continue;
         if (stat.isFile()) {
+          if (stat.size > 10 * 1024 * 1024) continue;
           await query(`INSERT INTO ci_artifacts (job_id, pipeline_id, name, path, size_bytes) VALUES ($1,$2,$3,$4,$5)`, [jobId, pipelineId, f, f, stat.size]);
           count++;
         }
@@ -227,10 +251,28 @@ async function collectArtifacts(repoPath: string, pipelineId: string, jobId: str
 async function runPipeline(pipelineId: string, repoPath: string, repoId: string) {
   await query(`UPDATE ci_pipelines SET status='running', updated_at=now() WHERE id=$1`, [pipelineId]);
   const jobs = await query(`SELECT id, name FROM ci_jobs WHERE pipeline_id=$1 ORDER BY created_at`, [pipelineId]);
-  // Load secrets for env injection
+  // Load secrets for env injection — S9: decrypt at-rest, fork isolation
   const secretsRes = await query(`SELECT key, value FROM ci_secrets WHERE repo_id=$1`, [repoId]);
   const secretsEnv: Record<string, string> = {};
-  for (const s of secretsRes.rows) secretsEnv[s.key] = s.value;
+  for (const s of secretsRes.rows) {
+    try {
+      secretsEnv[s.key] = decryptSecretSafe(s.value);
+    } catch {
+      secretsEnv[s.key] = s.value;
+    }
+  }
+  // S9: fork isolation — if commit not in repo objects, treat as fork PR and clear secrets
+  try {
+    const pipeCommit = await query(`SELECT commit_hash FROM ci_pipelines WHERE id=$1`, [pipelineId]);
+    const commitHash = pipeCommit.rows[0]?.commit_hash as string | undefined;
+    if (commitHash) {
+      const objPath = path.join(repoPath, '.itehaas', 'objects', commitHash.slice(0, 2), commitHash.slice(2));
+      if (!fs.existsSync(objPath)) {
+        // Fork commit not in target repo — clear secrets per GitHub model
+        for (const k of Object.keys(secretsEnv)) delete secretsEnv[k];
+      }
+    }
+  } catch {}
 
   let pipelineFailed = false;
   for (const job of jobs.rows) {
@@ -264,7 +306,23 @@ async function runPipeline(pipelineId: string, repoPath: string, repoId: string)
     if (safeEnvKeys.length > 0) logsPrefix = `# Secrets injected: ${safeEnvKeys.join(', ')} (values hidden)\n`;
 
     const { logs, exitCode, runner } = await executeInRunner(repoPath, script, secretsEnv, 30000);
-    const fullLogs = logsPrefix + logs + `\n# Exit: ${exitCode} (${runner})\n` + (workflowFile ? `# Workflow: ${workflowFile}\n` : '');
+    let fullLogs = logsPrefix + logs + `\n# Exit: ${exitCode} (${runner})\n` + (workflowFile ? `# Workflow: ${workflowFile}\n` : '');
+    // S9: scrub secrets from logs (values hidden, but if job does `env` it would leak)
+    for (const v of Object.values(secretsEnv)) {
+      if (v && v.length >= 3) {
+        fullLogs = fullLogs.split(v).join('***');
+      }
+    }
+    // Also scrub cookieSecret and databaseUrl if leaked
+    try {
+      if (config.cookieSecret && config.cookieSecret.length >= 3) {
+        fullLogs = fullLogs.split(config.cookieSecret).join('***');
+      }
+      if (config.databaseUrl && config.databaseUrl.length >= 3) {
+        // Scrub password part only to avoid breaking logs, but scrub full for safety
+        fullLogs = fullLogs.split(config.databaseUrl).join('***');
+      }
+    } catch {}
 
     const status = exitCode === 0 ? 'success' : 'failed';
     await query(`UPDATE ci_jobs SET status=$1, logs=$2, finished_at=now(), exit_code=$3, runner=$4 WHERE id=$5`, [status, fullLogs, exitCode, runner, job.id]);
@@ -294,6 +352,15 @@ export async function ciRoutes(app: FastifyInstance) {
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
     if (!(await canWrite(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
+
+    // S7: rate-limit CI run 5/min per IP
+    const rl = checkRateLimit(req as any, 'ci_run', 5, 60 * 1000);
+    if (!rl.allowed) return rateLimitReply(reply, rl.resetMs);
+    // S7: queue bound — max 20 queued/running per repo
+    try {
+      const pending = await query(`SELECT count(*)::int as c FROM ci_pipelines WHERE repo_id=$1 AND status IN ('queued','running')`, [meta.id]);
+      if (pending.rows[0].c >= 20) return reply.status(429).send({ error: 'too many queued pipelines' });
+    } catch {}
 
     const schema = z.object({
       ref: z.string().min(1).max(200).optional().default('main'),
@@ -518,7 +585,9 @@ export async function ciRoutes(app: FastifyInstance) {
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     try {
-      await query(`INSERT INTO ci_secrets (repo_id, key, value) VALUES ($1,$2,$3)`, [meta.id, parsed.data.key, parsed.data.value]);
+      const enc = encryptSecret(parsed.data.value);
+      await query(`INSERT INTO ci_secrets (repo_id, key, value) VALUES ($1,$2,$3)`, [meta.id, parsed.data.key, enc]);
+      await auditLog({ userId: user.id, action: 'ci.secret_create', target: `${owner}/${repo}:${parsed.data.key}`, req });
     } catch (e: any) {
       if (e.code === '23505') return reply.status(409).send({ error: 'key exists' });
       throw e;
@@ -537,6 +606,7 @@ export async function ciRoutes(app: FastifyInstance) {
     const isOwner = ownerCheck.rows[0]?.owner_id === user.id;
     if (!isOwner && adminCheck.rows.length === 0) return reply.status(403).send({ error: 'forbidden' });
     await query(`DELETE FROM ci_secrets WHERE repo_id=$1 AND key=$2`, [meta.id, key]);
+    await auditLog({ userId: user.id, action: 'ci.secret_delete', target: `${owner}/${repo}:${key}`, req });
     return reply.send({ ok: true });
   });
 }

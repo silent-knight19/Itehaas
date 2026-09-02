@@ -8,14 +8,18 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const mockQuery = vi.fn();
 const mockExec = vi.fn();
 
-vi.mock('../db', () => ({
+vi.mock('../db', async (importOriginal) => {
+  const actual: any = await importOriginal();
+  return {
+    ...actual,
   query: (...args: any[]) => mockQuery(...args),
   getClient: async () => ({
     query: (...args: any[]) => mockQuery(...args),
     release: () => {},
   }),
   pool: { on: vi.fn() },
-}));
+  };
+});
 
 vi.mock('../lib/vcs', async (importOriginal) => {
   const actual: any = await importOriginal();
@@ -77,10 +81,11 @@ describe('API', () => {
   });
 
   it('POST /api/auth/register success 201', async () => {
-    // cleanupExpiredSessions (DELETE) -> then INSERT users -> then INSERT sessions
+    // cleanupExpiredSessions (DELETE) -> then INSERT users -> then INSERT audit_logs -> then INSERT sessions
     mockQuery
       .mockResolvedValueOnce({ rows: [], rowCount: 0 }) // cleanup
       .mockResolvedValueOnce({ rows: [{ id: 'u1', username: 'alice', email: 'alice@example.com', created_at: new Date().toISOString() }] }) // insert user
+      .mockResolvedValueOnce({ rows: [{ id: 'audit1' }] }) // audit_logs (S18)
       .mockResolvedValueOnce({ rows: [{ id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }] }); // insert session
     const app = await buildApp();
     const res = await app.inject({

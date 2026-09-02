@@ -158,6 +158,10 @@ pub fn walk_log(repo: &Path, opts: &LogOptions) -> Result<Vec<LogEntry>> {
     let mut all_entries: Vec<LogEntry> = Vec::new();
 
     while let Some(cur) = queue.pop_front() {
+        // S7: bound visited and queue to prevent DoS via huge history
+        if visited.len() > 10000 || all_entries.len() > 10000 {
+            break;
+        }
         if visited.contains(&cur.hex()) {
             continue;
         }

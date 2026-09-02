@@ -2,11 +2,15 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const mockQuery = vi.fn();
 
-vi.mock('../db', () => ({
+vi.mock('../db', async (importOriginal) => {
+  const actual: any = await importOriginal();
+  return {
+    ...actual,
   query: (...args: any[]) => mockQuery(...args),
   getClient: vi.fn(),
   pool: { on: vi.fn() },
-}));
+  };
+});
 
 import { canRead, canWrite, isAdmin } from './permissions';
 

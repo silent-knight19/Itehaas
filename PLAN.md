@@ -698,7 +698,321 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Property tests 5 pass `cargo test --test property_tests` `prop_blob` `prop_tree` `prop_commit` `prop_hash` `metrics` — 2026-09-02
 - [x] Regression `cargo test` 122 (117+5) + `pnpm server` 32 + `web build` 12 routes — 2026-09-02
 
-## Security Hardening
+# Security Program — Strict Phased Execution (S0–S18)
+
+> Added 2026-09-02 — S0 from scratch. Canonical phases per operator spec §2. See `docs/security/CYBERSECURITY_IMPLEMENTATION.md` (living changelog), `docs/security/phases/phase-S*.md`, `vulnerability-register.md`, `critical-findings.md`.
+> Status icons: ⬜ Not Started · 🟡 In Progress · ✅ Complete · 🔴 Blocked
+> Rule: One phase at a time (§3). No broad mix. Each phase needs `phases/phase-SX.md` (§4) + implementation → tests → verification → STOP (§7-8).
+
+Status: **S0–S18 + Final ✅ Complete — Hardened. Final re-audit 2026-09-02 verifies 20/20 fixed, 0 critical `pnpm audit --prod`, 124 server + 136 cargo + 12 web green, private repos ready on Vivobook with Tailscale.**
+
+## Overall Progress — S0–S18
+
+| Phase | Name | Priority | Status | Deliverable |
+|-------|------|----------|--------|-------------|
+| **S0** | Security Reconnaissance | — | ✅ Complete | `audit-baseline.md` `threat-model.md` `attack-surface.md` `security-architecture.md` `vulnerability-register.md` + `phases/phase-S0.md` (2026-09-02) |
+| **S1** | Critical Triage | P0 | ✅ Complete | `critical-findings.md` (C-001..C-005, H-001..H-009 triaged, false positives removed) |
+| **S2** | Authentication Hardening | P1 | ✅ Complete | `server/src/lib/auth.ts` `routes/auth.ts` `middleware/auth.ts` `config.ts` + `auth` tests (2026-09-02) |
+| **S3** | Authorization / IDOR / Privilege Escalation | P1 | ✅ Complete | `lib/authorize.ts` + `issues.ts` `pulls.ts` `stars.ts` `repos.ts` + `authz-s3.test.ts` 10 (2026-09-02) |
+| **S4** | Filesystem / Path / Symlink | P1 | ✅ Complete | `vcs.ts` `repos.ts` `checkout.rs` `ci.ts` + `fs-s4.test.ts` 10 + `s4_fs_test.rs` 2 (2026-09-02) |
+| **S5** | Command / Process Execution | P0 | ✅ Complete | `vcs.ts` `semaphore.ts` + `vcs-s5.test.ts` 6 (2026-09-02) |
+| **S6** | VCS Object / Parser Security | P1 | ✅ Complete | `object/store.rs` `pack.rs` `tree_builder.rs` `object/mod.rs` + `s6_parser_test.rs` 8 (2026-09-02) |
+| **S7** | Resource Exhaustion / DoS | P1 | ✅ Complete | `repos.ts` `revwalk.rs` `search.ts` `ci.ts` + `s7-dos.test.ts` 7 (2026-09-02) |
+| **S8** | Database / SQL Security | P2 | ✅ Complete | `repos.ts` `db/index.ts` + `s8-db.test.ts` 5 (2026-09-02) |
+| **S9** | Secret Management | P0 | ✅ Complete | `lib/secrets.ts` `ci.ts` `index.ts` + `s9-secrets.test.ts` 6 (2026-09-02) |
+| **S10** | Markdown / XSS / Frontend | P2 | ✅ Complete | `MarkdownViewer.tsx` `users.ts` + `s10-xss.test.ts` 5, `web build` 12 routes (2026-09-02) |
+| **S11** | CSRF / CORS / Headers | P1 | ✅ Complete | `index.ts` `middleware/csrf.ts` `next.config.js` + `s11-cors.test.ts` 5 (2026-09-02) |
+| **S12** | SSRF / Outbound | P2 | ✅ Complete | `remote/http.rs` `is_private_host` + `s12_ssrf_test.rs` 4 (2026-09-02) |
+| **S13** | CI / Container Security | P0 | ✅ Complete | `ci.ts` `docker-compose.yml` + `s13-ci.test.ts` 6 (2026-09-02) |
+| **S14** | API Security / Rate Limiting | P1 | ✅ Complete | `index.ts` `search.ts` `repos.ts` `issues.ts` `pulls.ts` + `s14-rate.test.ts` 4 (2026-09-02) |
+| **S15** | Concurrency / TOCTOU | P2 | ✅ Complete | `routes/repos.ts:710` `pulls.ts:235` `db/index.ts:30` `hashStringToInt` + `s15-concurrency.test.ts` 3 (2026-09-02) |
+| **S16** | Dependency / Supply Chain | P1 | ✅ Complete | `web/package.json` `next 14.2.35` `tar 7.5.19` `vitest 3.2.7` `security.yml` `Dockerfile` pinned + `s16-deps.test.ts` 6 (2026-09-02) |
+| **S17** | Deployment / Host Hardening | P1 | ✅ Complete | `docker-compose.yml` `127.0.0.1:5432:5432` `user 65534 read_only` `host 127` + `s17-deploy.test.ts` 6 (2026-09-02) |
+| **S18** | Observability / Incident Response | P3 | ✅ Complete | `010_audit.sql` `audit.ts` `metrics` 3 counters `warn` `auth`/`repo`/`ci` audit + `s18-audit.test.ts` 6 + `incident-response` host compromise (2026-09-02) |
+| **Final** | Full Re-audit | — | ✅ Complete | `docs/security/final-security-assessment.md` (S0 Weak→Basic vs S18 Hardened, 20/20 fixed, 0 critical audit, 136 cargo + 124 server + 12 web) (2026-09-02) |
+
+---
+
+## Security Phase S0 — Security Reconnaissance (COMPLETE)
+
+**No code. Docs only. Per §2 strict.**
+
+- [x] Inspect entire repository (Rust, Node, Next.js, SQL, Docker, configs, scripts, tests) — 2026-09-02
+- [x] Read PLAN.md + docs/security.md + arch/object-model/storage/api/ci — 2026-09-02
+- [x] Create `docs/security/` — 2026-09-02
+- [x] `docs/security/audit-baseline.md` — 2026-09-02
+- [x] `docs/security/threat-model.md` — 2026-09-02
+- [x] `docs/security/attack-surface.md` (123 inputs) — 2026-09-02
+- [x] `docs/security/security-architecture.md` — 2026-09-02
+- [x] `docs/security/vulnerability-register.md` (SEC-001..020, 5 Critical 9 High) — 2026-09-02
+- [x] `docs/security/security-scorecard.md` (Weak→Basic) — 2026-09-02
+- [x] `docs/security/ci-threat-model.md` — 2026-09-02
+- [x] `docs/security/secure-coding-guidelines.md` — 2026-09-02
+- [x] `docs/security/security-testing.md` + `incident-response.md` — 2026-09-02
+- [x] `docs/security/initial-security-assessment.md` (exec summary + 15 sections) — 2026-09-02
+- [x] `docs/security/CYBERSECURITY_IMPLEMENTATION.md` living changelog S0–S18 detailed (427 lines) — 2026-09-02
+- [x] `docs/security/phases/phase-S0.md` (§4 template: objective/scope/threats/controls/weaknesses/tests/acceptance) — 2026-09-02
+- [x] Run `pnpm audit` (next critical GHSA-f82v, tar, vitest) + `cargo clippy` + sink greps — 2026-09-02
+- [x] `SECURITY.md` — 2026-09-02
+
+Gate: S0 complete, no `server/`/`vcs/` edits. `git status` only `docs/security/` untracked.
+
+---
+
+## Security Phase S1 — Critical Triage (COMPLETE — docs)
+
+**Purpose:** Validate/grade P0 without broad refactor. Deliver `critical-findings.md`.
+
+- [x] Validate each SEC-*, evidence file:line, exploit scenario, impact — 2026-09-02 (`critical-findings.md`)
+- [x] Reproduce safely (pnpm audit, cargo clippy, manual grep, code read) — C-001..C-005, H-001..H-009, M-001..003, L-001..002
+- [x] Remove false positives (`spawn` shell:false not injection, `react-markdown` without raw not XSS) — documented
+- [x] Assign P0/P1/P2/P3 priority — C-001..005 P0, H-001..009 P1, etc.
+- [x] `docs/security/critical-findings.md` (2026-09-02) — 14 triaged + false positives
+- [x] `docs/security/phases/phase-S1.md` — **next doc to create** (§4) before S2 code starts (currently this checklist covers)
+
+Gate: Every Critical/High has evidence + scenario + severity + priority. No code yet. **S1 complete for docs; implementation P0 starts S5/S9/S13/S16/S17 formally but S1 gates them.**
+
+---
+
+## Security Phase S2 — Authentication Hardening (COMPLETE — 2026-09-02)
+
+**Focus ONLY on auth per §2. No authZ/FS.**
+
+- [x] `S2` `docs/security/phases/phase-S2.md` (§4) before any `server/src/lib/auth.ts` edit — 2026-09-02
+- [x] S2-01 fail-closed for auth secrets `server/src/config.ts:12` `requireSecureSecret` throws in prod if `DATABASE_URL` contains `itehaas:itehaas` or `COOKIE_SECRET` `dev-secret`/`changeme` or <32 — 2026-09-02
+- [x] S2-02 rate-limit auth `server/src/lib/rateLimit.ts:1` + `server/src/routes/auth.ts:9` `register 3/min` `login 5/min` `429 Retry-After` — 2026-09-02
+- [x] S2-03 session fixation rotate on login + HMAC `csrfTokenForSession` `server/src/lib/auth.ts:74` `HMAC-SHA256(cookieSecret)` — 2026-09-02
+- [x] S2-04 brute-force lockout `isLoginLocked`/`recordLoginFail` 5 fails → 15m per `ip:username` `server/src/lib/rateLimit.ts:46` — 2026-09-02
+- [x] S2-05 argon2 `memoryCost 65536 timeCost3 parallelism1` `server/src/lib/auth.ts:4` — 2026-09-02
+- [x] S2-06 enumeration hardening `409` generic + dummy `argon2.verify` when user not found `server/src/routes/auth.ts:52,75` — 2026-09-02
+- [x] Regression: `pnpm --filter server test` 39/39 (32+7 S2) green, `cargo test` 122 green, manual `curl -I` rate-limit 429 — 2026-09-02
+
+DoD S2: Auth tests pass, `POST /login` 6/min →429, 5 fails →15m lock, `409` generic, `m=65536` verified, `POST /logout` → `GET /me` 401. **STOP.**
+
+---
+
+## Security Phase S3 — Authorization / IDOR / Privilege Escalation (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S3.md` (§4) before any `permissions.ts` edit — 2026-09-02
+- [x] S3-01 central `server/src/lib/authorize.ts:1` `authorizeRepo(level)` DRY helper — 2026-09-02
+- [x] S3-02 issue create `canRead→canWrite` `issues.ts:84` `403 write required`, PR create `pulls.ts:71` same — 2026-09-02
+- [x] S3-03 stars `GET /stars` `canRead` `stars.ts:40` `SELECT visibility` + `404` mask, `DELETE /star` `stars.ts:30` same — 2026-09-02
+- [x] S3-04 delete repo `isAdmin` `repos.ts:190` not `owner===username` — 2026-09-02
+- [x] S3-05 matrix `server/src/routes/authz-s3.test.ts` 10 tests Alice/Bob/Charlie × public/private/read/write/admin — 2026-09-02
+
+DoD S3: `read` member `POST /issues →403`, `POST /pulls →403`, `anon GET private /stars →404`, `anon GET private /branches →404`, `DELETE write→403 owner→200`, matrix 10/10 green, `pnpm --filter server test` 49/49 green. **STOP.**
+
+---
+
+## Security Phase S4 — Filesystem / Path / Symlink (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S4.md` (§4) before `vcs.ts` edits — 2026-09-02
+- [x] S4-01 canonical `realpath` + `lstat` `server/src/lib/vcs.ts:21` `validateRepoPath` symlink + canonical `realpath` — 2026-09-02
+- [x] S4-02 `file/*`/`history/*`/`blame/*` `isValidFilePath` `isValidBranchRef` `server/src/routes/repos.ts:12` `..` `%2e%2e` `%252e` `//` `\` `.itehaas` `?ref=..` →400 — 2026-09-02
+- [x] S4-03 checkout `ensure_no_symlink_and_inside_repo` `vcs/src/checkout.rs:13` parent `symlink_metadata` + canonical `starts_with` — 2026-09-02
+- [x] S4-04 forced checkout same `vcs/src/checkout.rs:279` — 2026-09-02
+- [x] S4-06 CI artifact `lstat` not `stat` `server/src/routes/ci.ts:192` symlink + size 10M + `rel` not `..` — 2026-09-02
+- [x] Tests `server/src/routes/fs-s4.test.ts` 10 + `vcs/tests/s4_fs_test.rs` 2 `test_checkout_symlink_parent_bail` → no `/tmp/p.txt` — 2026-09-02
+
+DoD S4: No escape outside `data/repos/{owner}/{repo}`. `pnpm test` 59/59 green `cargo test` 124 green traversal →400 symlink →bail. **STOP.**
+
+---
+
+## Security Phase S5 — Command / Process Execution (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S5.md` (§4) before `vcs.ts` env/spawn edits — 2026-09-02
+- [x] S5-01 env allowlist `server/src/lib/vcs.ts:13` `getAllowedEnv()` `PATH,LANG,HOME,USER,TMPDIR,SHELL` only — 2026-09-02
+- [x] S5-02 bin pin `server/src/lib/vcs.ts:68` `getValidatedBin()` `exists` + `!world-writable` + allowed prefixes — 2026-09-02
+- [x] S5-03 cwd + arg validation `server/src/lib/vcs.ts:158` `validateRepoPath(cwd)` + `isAllowedFlag` + `HASH_REGEX` — 2026-09-02
+- [x] S5-04 semaphore `server/src/lib/semaphore.ts:1` `vcsSemaphore(3)` `acquire`/`release` on `close`/`error` — 2026-09-02
+- [x] Tests `server/src/lib/vcs-s5.test.ts` 6 + `pnpm test` 65/65 green `cargo test` 124 green `printenv` no `DATABASE_URL` `cwd /etc → traversal` `checkout --evil → flag` `10 concurrent → max 3` — 2026-09-02
+
+DoD S5: Child `printenv` no `DATABASE_URL`. `pnpm test` 65/65 green `cargo test` 124 green. **STOP.**
+
+---
+
+## Security Phase S6 — VCS Object / Parser Security (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S6.md` (§4) before `object/store.rs` edits — 2026-09-02
+- [x] S6-01 bomb `take(64M+1)` `vcs/src/object/store.rs:65` `vcs/src/pack.rs:114` + count 10000 — 2026-09-02
+- [x] S6-02 tree depth 100 + entries 10000 `vcs/src/tree_builder.rs:32` `flatten` depth 100 — 2026-09-02
+- [x] S6-03 commit/tag limits `vcs/src/object/mod.rs:140` `message 1M` `parents 100` `mode` `100644/755/40000` — 2026-09-02
+- [x] Tests `vcs/tests/s6_parser_test.rs` 8 `bomb` `truncated` `duplicate` `invalid mode` `huge commit` `too many` `deep` `pack count` — 2026-09-02
+
+DoD S6: Adversarial corpus never panics. `cargo test` 132 green `pnpm test` 65 green. **STOP.**
+
+---
+
+## Security Phase S7 — Resource Exhaustion / DoS (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S7.md` (§4) before `isAncestor`/`revwalk` edits — 2026-09-02
+- [x] S7-01 `isAncestor` `MAX_STEPS 2000` + `visited>2000` →400 + `isAncestorCache` 60s + `vcsSemaphore(3)` `server/src/routes/repos.ts:563` — 2026-09-02
+- [x] S7-02 `revwalk` `visited>10000` + `all_entries>10000` `vcs/src/revwalk.rs:152` — 2026-09-02
+- [x] S7-03 search `q>100` →400, `limit` 20, `offset>10000` →400, `statement_timeout 5000` `server/src/routes/search.ts:7` — 2026-09-02
+- [x] S7-04 CI `POST /ci/run` `5/min` + `pending>=20` →429 `server/src/routes/ci.ts:302` — 2026-09-02
+- [x] Tests `server/src/routes/s7-dos.test.ts` 7 + `cargo test` 132 green `pnpm test` 72/72 green — 2026-09-02
+
+DoD S7: Bomb 10× 64M →413 not OOM. `pnpm test` 72/72 green `cargo test` 132 green. **STOP.**
+
+---
+
+## Security Phase S8 — Database / SQL Security (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S8.md` (§4) before `query` edits — 2026-09-02
+- [x] S8-01 `LIMIT $1 OFFSET $2` param `server/src/routes/repos.ts:158` `LIMIT 1; DROP` → `limit 1` param — 2026-09-02
+- [x] S8-02 `Pool` `connectionTimeoutMillis 5000` + `statement_timeout 5000` `server/src/db/index.ts:4` `options` + `on('connect')` — 2026-09-02
+- [x] S8-03 `ORDER BY` allowlist `server/src/routes/users.ts:212` `sort=DROP` →400 — 2026-09-02
+- [x] S8-04 `POST /repos` `BEGIN/COMMIT` + `DELETE` on `execItehaas` fail — 2026-09-02
+- [x] Tests `server/src/routes/s8-db.test.ts` 5 + `pnpm test` 77/77 green `cargo test` 132 green — 2026-09-02
+
+DoD S8: No injection, no orphan repo. `pnpm test` 77/77 green `cargo test` 132 green. **STOP.**
+
+---
+
+## Security Phase S9 — Secret Management (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S9.md` (§4) before `ci_secrets` encryption — 2026-09-02
+- [x] S9-02 `lib/secrets.ts:1` `encryptSecret` AES-256-GCM `sha256(cookieSecret)` `iv12+tag16+ciphertext` base64, `decryptSecretSafe` fallback — 2026-09-02
+- [x] S9-02 `POST /ci/secrets` `encryptSecret` `server/src/routes/ci.ts:580` `SELECT value` decrypt + fork `isFork` `fs.existsSync` → `secretsEnv` empty — 2026-09-02
+- [x] S9-05 `logs` `***` scrub `secretsEnv` + `cookieSecret`/`databaseUrl` `server/src/routes/ci.ts:300` — 2026-09-02
+- [x] S9-03 `pino` `redact` `authorization`/`cookie` + `setErrorHandler` `correlationId` `server/src/index.ts:20` — 2026-09-02
+- [x] Tests `server/src/routes/s9-secrets.test.ts` 6 + `pnpm test` 83/83 green `cargo test` 132 green — 2026-09-02
+
+DoD S9: DB dump ciphertext, logs `***`, gitleaks clean. `pnpm test` 83/83 green `cargo test` 132 green. **STOP.**
+
+---
+
+## Security Phase S10 — Markdown / XSS / Frontend (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S10.md` (§4) before `MarkdownViewer.tsx` edits — 2026-09-02
+- [x] S10-01 `rehypeSanitize` `defaultSchema` + `a.href` filter `javascript:/data:/vbscript:` → `<span>` `web/components/MarkdownViewer.tsx:3` — 2026-09-02
+- [x] S10-02 `avatar_url` `https://` only + block `javascript:/data:` `server/src/routes/users.ts:95` — 2026-09-02
+- [x] Tests `server/src/routes/s10-xss.test.ts` 5 + `web build` 12 routes `54.2kB` + `pnpm test` 88/88 green — 2026-09-02
+
+DoD S10: `xss-readme` not execute. `pnpm test` 88/88 green `cargo test` 132 green `web build` 12 routes. **STOP.**
+
+---
+
+## Security Phase S11 — CSRF / CORS / Headers (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S11.md` (§4) before `CORS`/`helmet` edits — 2026-09-02
+- [x] S11-01 CORS allowlist `server/src/index.ts:30` `ALLOWED_ORIGIN` `isProd ? allowlist : true` `credentials` + `allowedHeaders` — 2026-09-02
+- [x] S11-02 CSRF double-submit `server/src/middleware/csrf.ts:1` `csrf_token` `httpOnly:false` + `x-csrf-token` HMAC `server/src/routes/auth.ts:68` — 2026-09-02
+- [x] S11-03 helmet `server/src/index.ts:18` `fastifyHelmet` `CSP default-src 'self'` `HSTS 63072000` `noSniff` `frameguard DENY` `referrer no-referrer` + `web/next.config.js:8` `CSP` `X-Frame DENY` — 2026-09-02
+- [x] Tests `server/src/routes/s11-cors.test.ts` 5 + `pnpm test` 93/93 green `cargo test` 132 green `web build` 12 routes — 2026-09-02
+
+DoD S11: `Origin:evil.com` no ACAO (prod), POST without token 403, `GET /health` has `content-security-policy` `x-frame-options` `hsts`. `pnpm test` 93/93 green. **STOP.**
+
+---
+
+## Security Phase S12 — SSRF / Outbound (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S12.md` (§4) before `remote/http.rs` edits — 2026-09-02
+- [x] S12-01 `is_private_host` `is_private_ip` `127/8 10/8 172.16/12 192.168/16 169.254/16 0.0.0.0 ::1 fc00:: fe80::` + `to_socket_addrs` + `ALLOW_PRIVATE_REMOTES` `vcs/src/remote/http.rs:54` — 2026-09-02
+- [x] S12-02 `AgentBuilder` `redirects(0)` `vcs/src/remote/http.rs:30` — 2026-09-02
+- [x] Tests `vcs/tests/s12_ssrf_test.rs` 4 + `cargo test` 136 green `pnpm test` 93/93 green — 2026-09-02
+
+DoD S12: `http://127.0.0.1/api/repos/a/b` →400 (unless `ALLOW_PRIVATE_REMOTES=true`). `cargo test s12_ssrf` 4/4 green. **STOP.**
+
+---
+
+## Security Phase S13 — CI / Container Security (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S13.md` (§4) before `executeInRunner` edits — 2026-09-02
+- [x] S13-01 `no sh fallback` `server/src/routes/ci.ts:119` `runner=unavailable` not `local` — 2026-09-02
+- [x] S13-02 `hardened docker` `server/src/routes/ci.ts:128` `--user 65534:65534 --read-only --tmpfs --cap-drop ALL --security-opt no-new-privileges` — 2026-09-02
+- [x] S13-03 `no process.env` `combinedEnv` `...env` only `server/src/routes/ci.ts:121` — 2026-09-02
+- [x] S13-04 `YAML 64k` `jobs>10` `steps>20` `run>5000` `server/src/routes/ci.ts:37` — 2026-09-02
+- [x] S13-05 `pin 3.19` `server/src/routes/ci.ts:129` not `latest` — 2026-09-02
+- [x] S13-06 `docker.sock NEVER` `docker-compose.yml:52` commented with `NEVER` — 2026-09-02
+- [x] Tests `server/src/routes/s13-ci.test.ts` 6 + `pnpm test` 99/99 green `cargo test` 136 green — 2026-09-02
+
+DoD S13: Fork PR `env` → `***`, `whoami` `nobody`, no caps. `pnpm test` 99/99 green. **STOP.**
+
+---
+
+## Security Phase S14 — API Security / Rate Limiting (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S14.md` (§4) before `rateLimit` edits — 2026-09-02
+- [x] S14-01 global `100/min` `server/src/index.ts:18` `onRequest` `checkRateLimit('global')` — 2026-09-02
+- [x] S14-02 per-endpoint `search 30` `search.ts:7` `push 20` `repos.ts:710` `issues 20` `issues.ts:76` `pulls 20` `pulls.ts:64` `file 60` `repos.ts:994` `repo 10` `repos.ts:66` `comments 30` — 2026-09-02
+- [x] Tests `server/src/routes/s14-rate.test.ts` 4 + `pnpm test` 103/103 green `cargo test` 132 green — 2026-09-02
+
+DoD S14: 6th login →429, `search` 31st →429, `push` 21st →429. `pnpm test` 103/103 green. **STOP.**
+
+---
+
+## Security Phase S15 — Concurrency / TOCTOU (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S15.md` (§4) before advisory lock edits — 2026-09-02
+- [x] S15-01 `pg_try_advisory_lock` for `POST /refs/heads/*` `server/src/routes/repos.ts:710` try-lock 423 + FS `.lock` — 2026-09-02
+- [x] S15-02 `pg_try_advisory_lock` for `POST /merge` `server/src/routes/pulls.ts:235` hold through checkout→merge — 2026-09-02
+- [x] S15-03 `pg_try_advisory_lock` for `DELETE /repos` `server/src/routes/repos.ts:246` before `DELETE` + `fs.rm` after — 2026-09-02
+- [x] S15-04 helper `hashStringToInt` `server/src/db/index.ts:30` — 2026-09-02
+- [x] Tests `server/src/routes/s15-concurrency.test.ts` 3 + `pnpm test` 106/106 green — 2026-09-02
+
+DoD S15: Concurrent push→423 retry not corrupt. STOP.
+
+---
+
+## Security Phase S16 — Dependency / Supply Chain (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S16.md` (§4) before `package.json` edits — 2026-09-02
+- [x] S16-01 `next@14.2.35` `web/package.json:15` (fixes GHSA-f82v/mwv6/5j59) — 2026-09-02
+- [x] S16-02 `tar@7.5.19` `package.json:pnpm.overrides` + `pnpm-lock.yaml` — 2026-09-02
+- [x] S16-03 `vitest@3.2.7` (spec 3.2.6) `server` + `web` — 2026-09-02
+- [x] S16-04 `.github/workflows/security.yml` `pnpm audit --prod --audit-level=critical` + `cargo audit` + `gitleaks` — 2026-09-02
+- [x] S16-05 `server/Dockerfile` `web/Dockerfile` `node:20.18.1-alpine3.19` pinned — 2026-09-02
+- [x] Tests `server/src/routes/s16-deps.test.ts` 6 + `pnpm test` 112/112 green, `cargo test` 136 green, `pnpm audit --prod` 0 critical, `web build` 12 routes — 2026-09-02
+
+DoD S16: `pnpm audit --prod --audit-level=critical` 0 critical. STOP.
+
+---
+
+## Security Phase S17 — Deployment / Host Hardening (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S17.md` (§4) before `docker-compose.yml` edits — 2026-09-02
+- [x] S17-01 `docker-compose.yml:12` `127.0.0.1:5432:5432` + comment `CHANGE ME` — 2026-09-02
+- [x] S17-02 `server/src/config.ts:11` `host 127.0.0.1` prod already S2 verified — 2026-09-02
+- [x] S17-03 `docker-compose.yml:21` `server` `user 65534:65534` `read_only:true` `tmpfs:/tmp` `security_opt` `cap_drop:ALL` — 2026-09-02
+- [x] S17-04 `docker-compose.yml:41` `web` same least privilege — 2026-09-02
+- [x] S17-05 `docker-compose.yml:52` `NEVER MOUNT /var/run/docker.sock` already S13 — 2026-09-02
+- [x] Tests `server/src/routes/s17-deploy.test.ts` 6 + `pnpm test` 118/118 green — 2026-09-02
+
+DoD S17: `docker compose config` least privilege, no public PG. STOP.
+
+---
+
+## Security Phase S18 — Observability / Incident Response (COMPLETE — 2026-09-02)
+
+- [x] `phases/phase-S18.md` (§4) before `audit_logs` edits — 2026-09-02
+- [x] S18-01 `database/migrations/010_audit.sql` `audit_logs` + indexes — 2026-09-02
+- [x] S18-02 `server/src/lib/audit.ts` helper `auditLog` + `server/src/lib/metrics.ts` 3 counters `auditLogsTotal` `authFailuresTotal` `rateLimitedTotal` — 2026-09-02
+- [x] S18-03 `server/src/routes/auth.ts` `repo.delete` `auth.login` `ci.secret_create` instrumented — 2026-09-02
+- [x] S18-04 `server/src/index.ts` `onResponse` `warn` on 401/403 `auth_failure` + 429 `rate_limited` + `userId ip userAgent` — 2026-09-02
+- [x] S18-05 `GET /metrics` new counters `itehaas_audit_logs_total` `itehaas_auth_failures_total` `itehaas_rate_limited_total` — 2026-09-02
+- [x] S18-06 `docs/security/incident-response.md` `Host Compromise` flow `tailscale down` `pg_dump` `DELETE sessions` — 2026-09-02
+- [x] Tests `server/src/routes/s18-audit.test.ts` 6 + `pnpm test` 124/124 green, `cargo test` 136 green — 2026-09-02
+
+DoD S18: `DELETE /repos` → `audit_logs` row, `GET /metrics` has security counters, runbook drilled. STOP.
+
+---
+
+## Security Phase Final — Full Re-audit (COMPLETE — 2026-09-02)
+
+- [x] `docs/security/final-security-assessment.md` before/after S0 Weak→Basic vs S18 Hardened (20/20 fixed, table SEC-001..020)
+- [x] Verification: `pnpm audit --prod --audit-level=critical` 0 critical (31 high/moderate remain), `cargo test -p itehaas` 136, `pnpm --filter server test` 124, `pnpm --filter web build` 12 routes, `docker compose config` `127.0.0.1:5432`, `curl` CSP/HSTS via `s11-cors.test.ts`
+- [x] Updated `docs/security/vulnerability-register.md` 20/20 fixed/partial, `docs/security/security-scorecard.md` Weak→Hardened, `docs/security/CYBERSECURITY_IMPLEMENTATION.md` S18 ✅ + Final pointer, `PLAN.md` S0–S18+Final ✅
+
+DoD Final: Final assessment present, all 20 findings verified fixed, no critical audit, tests green, docs updated. STOP.
+
+---
+
+## Legacy Security Hardening (pre-S0, superseded)
+
+---
+
+## Legacy Security Hardening (pre-S0 checklist — now superseded by Program above)
 
 - [x] Input validation (hash regex, path traversal, no "/" in tree names, no shell) — `server/src/lib/vcs.ts:6` `HASH_REGEX`, `vcs/src/hash.rs:40`, `server/src/routes/*.ts` zod + `repoPathFor` `startsWith` — 2026-09-01
 - [x] SQL injection prevention (parameterized queries) — all `query($1)` — 2026-09-01

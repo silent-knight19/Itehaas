@@ -32,7 +32,86 @@ fn agent() -> ureq::Agent {
         .timeout_read(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .timeout_write(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .timeout_connect(std::time::Duration::from_secs(10))
+        .redirects(0) // S12: do not follow redirects to avoid SSRF via redirect to private IP
         .build()
+}
+
+// S12: check if host is private/link-local/loopback (unless ALLOW_PRIVATE_REMOTES=true)
+fn is_private_host(host: &str) -> bool {
+    // Allow localhost explicitly for tests and local dev (resolves to 127.0.0.1 but should be allowed)
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.starts_with("localhost:") {
+        return false;
+    }
+    // Strip port if present (but careful with IPv6)
+    let h = if host.starts_with('[') {
+        // IPv6 [::1]:port
+        if let Some(end) = host.find(']') {
+            &host[1..end]
+        } else {
+            host
+        }
+    } else {
+        // IPv4 or name: split at ':'
+        if let Some(colon) = host.find(':') {
+            // Check if it's IPv6 without brackets? Unlikely, but handle
+            if host.matches(':').count() > 1 {
+                host
+            } else {
+                &host[..colon]
+            }
+        } else {
+            host
+        }
+    };
+    // Check literal IP
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return is_private_ip(&ip);
+    }
+    // For DNS names, try to resolve (best-effort, no network in tests, so just check via ToSocketAddrs)
+    // We attempt to resolve host:80
+    use std::net::ToSocketAddrs;
+    if let Ok(addrs) = (h.to_owned() + ":80").to_socket_addrs() {
+        for addr in addrs {
+            if is_private_ip(&addr.ip()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let oct = v4.octets();
+            // 127.0.0.0/8
+            if oct[0] == 127 { return true; }
+            // 10.0.0.0/8
+            if oct[0] == 10 { return true; }
+            // 172.16.0.0/12
+            if oct[0] == 172 && (16..=31).contains(&oct[1]) { return true; }
+            // 192.168.0.0/16
+            if oct[0] == 192 && oct[1] == 168 { return true; }
+            // 169.254.0.0/16 link-local
+            if oct[0] == 169 && oct[1] == 254 { return true; }
+            // 0.0.0.0
+            if oct[0] == 0 && oct[1] == 0 && oct[2] == 0 && oct[3] == 0 { return true; }
+            false
+        }
+        std::net::IpAddr::V6(v6) => {
+            // ::1 loopback
+            if v6.is_loopback() { return true; }
+            // fc00::/7 unique local
+            let seg0 = v6.segments()[0];
+            if (seg0 & 0xfe00) == 0xfc00 { return true; }
+            // fe80::/10 link-local
+            if (seg0 & 0xffc0) == 0xfe80 { return true; }
+            // :: (unspecified)
+            if v6.is_unspecified() { return true; }
+            false
+        }
+    }
 }
 
 /// Get credential token from environment (ITEHAAS_TOKEN or ITEHAAS_SESSION)
@@ -88,6 +167,29 @@ pub fn validate_http_base(base: &str) -> Result<String> {
         // Extra: reject embedded ".." already blocked exact case; keep permissive for "a..b"
         if p.contains("..") && *p != ".." {
             // Allow names like "a..b" — Git permits, so we permit
+        }
+    }
+    // S12: private/link-local/loopback block (unless ALLOW_PRIVATE_REMOTES=true)
+    if std::env::var("ALLOW_PRIVATE_REMOTES").unwrap_or_default() != "true" {
+        // Extract host from URL: after "://" until "/" or ":" (but careful IPv6)
+        let without_scheme = if trimmed.starts_with("https://") {
+            &trimmed["https://".len()..]
+        } else {
+            &trimmed["http://".len()..]
+        };
+        let host_part = if without_scheme.starts_with('[') {
+            // IPv6 [::1]:port or [::1]/path
+            if let Some(end) = without_scheme.find(']') {
+                &without_scheme[..=end]
+            } else {
+                without_scheme.split('/').next().unwrap_or("")
+            }
+        } else {
+            without_scheme.split('/').next().unwrap_or("")
+        };
+        // host_part may be "127.0.0.1:3001" or "127.0.0.1" or "[::1]:3001" or "example.com:3001"
+        if is_private_host(host_part) {
+            anyhow::bail!("private/link-local/loopback host not allowed: {}", host_part);
         }
     }
     Ok(trimmed.to_string())

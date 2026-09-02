@@ -7,9 +7,9 @@ services:
     environment:
       POSTGRES_DB: itehaas
       POSTGRES_USER: itehaas
-      POSTGRES_PASSWORD: itehaas
+      POSTGRES_PASSWORD: itehaas # CHANGE ME — use strong password via .env POSTGRES_PASSWORD_FILE:/run/secrets/pg (S17, S9 fail-closed)
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -23,7 +23,7 @@ services:
       context: ./server
       dockerfile: Dockerfile
     ports:
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
     environment:
       DATABASE_URL: postgres://itehaas:itehaas@db:5432/itehaas
       REPOS_ROOT: /data/repos
@@ -37,25 +37,42 @@ services:
       db:
         condition: service_healthy
     command: ["node", "dist/index.js"]
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   web:
     build:
       context: ./web
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:3001
     depends_on:
       - server
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   # CI Runner (Phase 9) — optional, Docker-isolated
+  # SECURITY: NEVER MOUNT /var/run/docker.sock - host root if mounted to untrusted runner (SEC-009)
   # runner:
   #   build: ./runner
   #   environment:
   #     DATABASE_URL: postgres://itehaas:itehaas@db:5432/itehaas
   #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
+  #     - /var/run/docker.sock:/var/run/docker.sock  # NEVER - host root
   #   depends_on:
   #     - db
 

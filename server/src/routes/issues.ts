@@ -73,15 +73,18 @@ export async function issueRoutes(app: FastifyInstance) {
     return reply.send({ issues: enriched });
   });
 
-  // Create issue with labels/assignees/milestone
+  // Create issue with labels/assignees/milestone — S14: 20/min
   app.post('/api/repos/:owner/:repo/issues', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    const { checkRateLimit: cr, rateLimitReply: rlr } = await import('../lib/rateLimit');
+    const rl = cr(req as any, 'issues', 20, 60 * 1000);
+    if (!rl.allowed) return rlr(reply as any, rl.resetMs);
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     const repoMeta = await getRepoId(owner, repo);
     if (!repoMeta) return reply.status(404).send({ error: 'not found' });
-    if (!(await canRead(repoMeta.id, user.id, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
+    if (!(await canWrite(repoMeta.id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
     const schema = z.object({
       title: z.string().min(1).max(200),
       body: z.string().max(5000).optional().default(''),
@@ -235,6 +238,9 @@ export async function issueRoutes(app: FastifyInstance) {
   app.post('/api/repos/:owner/:repo/issues/:id/comments', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    const { checkRateLimit: crCom, rateLimitReply: rlrCom } = await import('../lib/rateLimit');
+    const rlCom = crCom(req as any, 'comments', 30, 60 * 1000);
+    if (!rlCom.allowed) return rlrCom(reply as any, rlCom.resetMs);
     const { owner, repo, id } = req.params as any;
     const repoMeta = await getRepoId(owner, repo);
     if (!repoMeta) return reply.status(404).send({ error: 'not found' });

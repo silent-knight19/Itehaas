@@ -100,6 +100,31 @@ export async function userRoutes(app: FastifyInstance) {
       const err = validateBio(bio);
       if (err) return reply.status(400).send({ error: err });
     }
+    // S10: avatar_url allowlist — only https://, block javascript:/data:/vbscript:
+    if (avatar_url !== undefined && avatar_url !== null) {
+      const v = String(avatar_url).trim();
+      if (v.length > 0) {
+        if (/^\s*(javascript|data|vbscript):/i.test(v)) {
+          return reply.status(400).send({ error: 'avatar_url must be https://' });
+        }
+        if (!/^https:\/\//i.test(v)) {
+          // Allow http://localhost for dev, but not in prod
+          const isLocalhost = /^http:\/\/localhost(:\d+)?\//i.test(v) || /^http:\/\/127\.0\.0\.1(:\d+)?\//i.test(v);
+          const isProd = process.env.NODE_ENV === 'production';
+          if (isProd || !isLocalhost) {
+            return reply.status(400).send({ error: 'avatar_url must be https://' });
+          }
+        }
+        try {
+          const u = new URL(v);
+          if (u.protocol !== 'https:' && !(u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1'))) {
+            return reply.status(400).send({ error: 'avatar_url must be https://' });
+          }
+        } catch {
+          return reply.status(400).send({ error: 'invalid avatar_url' });
+        }
+      }
+    }
 
     const fields: string[] = [];
     const vals: any[] = [];

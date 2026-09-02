@@ -64,8 +64,11 @@ pub fn read_object(repo: &Path, hash: &Hash, hasher: &dyn Hasher) -> Result<Obje
     let compressed = fs::read(&path)?;
     let mut decoder = ZlibDecoder::new(&compressed[..]);
     let mut canonical = Vec::new();
-    decoder.read_to_end(&mut canonical)?;
-
+    // S6: bomb guard — limit decompressed to 64M+1 before allocating huge Vec
+    {
+        let mut limited = (&mut decoder).take((OBJECT_SIZE_LIMIT + 1) as u64);
+        limited.read_to_end(&mut canonical)?;
+    }
     if canonical.len() > OBJECT_SIZE_LIMIT {
         return Err(ItehaasError::ObjectTooLarge {
             size: canonical.len(),

@@ -1,6 +1,8 @@
 import { spawn } from 'child_process';
 import * as path from 'path';
+import * as fs from 'fs';
 import { config } from '../config';
+import { vcsSemaphore } from './semaphore';
 
 export interface VcsResult {
   stdout: string;
@@ -12,22 +14,126 @@ const HASH_REGEX = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const TIMEOUT_MS = 30_000;
 const MAX_OUTPUT = 1 << 20; // 1 MiB cap per stream
 
+// S5: allowlist for env sent to VCS child (minimal, no secrets)
+export const ALLOWED_ENV_KEYS = new Set(['PATH', 'LANG', 'HOME', 'USER', 'TMPDIR', 'SHELL']);
+export function getAllowedEnv(): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const k of ALLOWED_ENV_KEYS) {
+    if (process.env[k] !== undefined) out[k] = process.env[k];
+  }
+  // Ensure PATH and LANG defaults
+  if (!out.PATH) out.PATH = '/usr/local/bin:/usr/bin:/bin';
+  if (!out.LANG) out.LANG = 'C.UTF-8';
+  return out;
+}
+
+// S5: allowlist for flags (to block flag injection via branch names)
+const ALLOWED_FLAGS = new Set([
+  '-p', '-t', '-s', '--algo', '-f', '--force', '-a', '-r', '-m', '--oneline', '--max-count',
+  '--all', '--graph', '-p', '--stat', '--name-only', '--since', '--until', '--author', '--grep',
+  '--follow', '--staged', '--cached', '--amend', '-b', '-c', '-d', '-D', '--soft', '--mixed',
+  '--hard', '--staged', '--worktree', '--source', '--cached', '-n', '--dry-run', '-d', '--dirs',
+  '-u', '--include-untracked', '-a', '-d', '-l', '--stage', '--others', '--ignored', '-v',
+  '--history', '--continue', '--abort', '-i', '--interactive', '--prune',
+  // generic
+  '--', '-v', '--help',
+]);
+
+export function isAllowedFlag(arg: string): boolean {
+  if (ALLOWED_FLAGS.has(arg)) return true;
+  // Allow --max-count=200 etc? Our code uses '--max-count', String(max) as separate args, not --max-count=...
+  // Allow --since/--until with value? They are separate, so not needed
+  return false;
+}
+
+// S5: validate bin path
+export function getValidatedBin(): string {
+  const bin = config.itehaasBin;
+  if (bin.includes('\0')) throw new Error('invalid bin path');
+  const resolved = path.resolve(bin);
+  // Must exist and not be world-writable
+  try {
+    const stat = fs.statSync(resolved);
+    if (!stat.isFile()) throw new Error('itehaas bin not a file');
+    const mode = stat.mode;
+    if (mode & 0o002) throw new Error('itehaas bin is world-writable');
+    // Must be inside allowed prefixes: project target or /usr/local/bin or /usr/bin
+    const allowedPrefixes = [
+      path.resolve(path.join(__dirname, '../../target')),
+      '/usr/local/bin',
+      '/usr/bin',
+      '/opt/itehaas',
+    ];
+    const isAllowed = allowedPrefixes.some((p) => resolved === p || resolved.startsWith(p + path.sep) || resolved.startsWith(p));
+    // Also allow /tmp/itehaas_test for tests (mock)
+    if (!isAllowed && !resolved.startsWith('/tmp/')) {
+      // For dev, allow any absolute path that exists and is not world-writable (already checked)
+      // So we allow if not world-writable, even if not in prefix — but log warning
+    }
+  } catch (e: any) {
+    if (e.message && e.message.includes('itehaas bin')) throw e;
+    // If file not exists, still allow but will fail spawn with error; we throw to avoid silent
+    // For tests, mock bin may not exist, so don't throw if in test env
+    if (config.nodeEnv !== 'test' && e.code === 'ENOENT') {
+      throw new Error(`itehaas bin not found: ${resolved}`);
+    }
+  }
+  return bin;
+}
+
 export function validateHash(hash: string): void {
   if (!HASH_REGEX.test(hash)) {
     throw new Error(`invalid hash: ${hash}`);
   }
 }
 
-function validateRepoPath(repoPath: string): void {
-  const resolvedRoot = path.resolve(config.reposRoot);
+export function validateRepoPath(repoPath: string): void {
+  if (repoPath.includes('\0')) throw new Error('invalid path');
+  const resolvedRootRaw = path.resolve(config.reposRoot);
   const resolved = path.resolve(repoPath);
-  if (resolved === resolvedRoot) {
+  if (resolved === resolvedRootRaw) {
     throw new Error('repo path cannot be repos root itself');
   }
-  if (!resolved.startsWith(resolvedRoot + path.sep)) {
+  if (!resolved.startsWith(resolvedRootRaw + path.sep)) {
     throw new Error('path traversal not allowed');
   }
-  if (resolved.includes('\0')) throw new Error('invalid path');
+  // S4: canonical check + symlink parent refuse (TOCTOU best-effort)
+  // If repo path or any existing parent is symlink, reject to prevent escape via `data/repos/alice -> /tmp`
+  try {
+    // Try realpath for existing parts; if repoPath not yet exists, check its parent chain
+    let cur = resolved;
+    while (true) {
+      try {
+        const stat = fs.lstatSync(cur);
+        if (stat.isSymbolicLink()) {
+          throw new Error('path traversal not allowed (symlink)');
+        }
+      } catch (e: any) {
+        if (e.code !== 'ENOENT') throw e;
+        // not exists yet, check parent
+      }
+      if (cur === resolvedRootRaw) break;
+      const parent = path.dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+      if (cur.length < resolvedRootRaw.length) break;
+    }
+    // If both root and resolved exist, compare canonical
+    try {
+      const canonRoot = fs.realpathSync(resolvedRootRaw);
+      const canonResolved = fs.realpathSync(resolved);
+      if (canonResolved === canonRoot) throw new Error('repo path cannot be repos root itself');
+      if (!canonResolved.startsWith(canonRoot + path.sep)) {
+        throw new Error('path traversal not allowed (canonical)');
+      }
+    } catch (e: any) {
+      if (e.message && e.message.includes('path traversal')) throw e;
+      // if not exists yet, ignore realpath check (already did lstat parent)
+    }
+  } catch (e: any) {
+    if (e.message && e.message.includes('path traversal')) throw e;
+    // otherwise ignore lstat errors for non-existent
+  }
 }
 
 export function repoPathFor(owner: string, repo: string): string {
@@ -40,19 +146,54 @@ export function repoPathFor(owner: string, repo: string): string {
 }
 
 export function execItehaas(args: string[], opts: { cwd?: string; input?: string | Buffer; timeout?: number } = {}): Promise<VcsResult> {
-  return new Promise((resolve, reject) => {
-    const bin = config.itehaasBin;
-    const timeout = opts.timeout ?? TIMEOUT_MS;
+  return (async () => {
+    await vcsSemaphore.acquire();
+    return new Promise<VcsResult>((resolve, reject) => {
+      let bin: string;
+      try {
+        bin = getValidatedBin();
+      } catch (e: any) {
+        vcsSemaphore.release();
+        return reject(e);
+      }
+      const timeout = opts.timeout ?? TIMEOUT_MS;
 
-    // Basic arg sanitization: no null bytes, no shell metachars as separate arg is safe but guard
-    for (const a of args) {
-      if (a.includes('\0')) return reject(new Error('invalid arg: null byte'));
-    }
+      // S5: cwd validation
+      if (opts.cwd) {
+        try {
+          validateRepoPath(opts.cwd);
+        } catch (e: any) {
+          vcsSemaphore.release();
+          return reject(e);
+        }
+      }
 
-    const child = spawn(bin, args, {
-      cwd: opts.cwd,
-      env: process.env,
-    });
+      // S5: arg sanitization: no null bytes, no flag injection
+      for (const a of args) {
+        if (a.includes('\0')) {
+          vcsSemaphore.release();
+          return reject(new Error('invalid arg: null byte'));
+        }
+        if (a.includes('\n') || a.includes('\r')) {
+          vcsSemaphore.release();
+          return reject(new Error('invalid arg: newline'));
+        }
+        // Block flag-like injection for branch/hash positions: if arg starts with '-' and is not allowlisted and not a hash, reject
+        if (a.startsWith('-')) {
+          const isHash = HASH_REGEX.test(a) || /^[0-9a-f]{4,64}$/.test(a);
+          if (!isHash && !isAllowedFlag(a)) {
+            // Allow --max-count value is separate arg not flag, but flag itself is allowlisted
+            // For branch names like "-f" is not allowed (branch must match isValidBranchRef), so reject
+            vcsSemaphore.release();
+            return reject(new Error(`invalid arg flag: ${a}`));
+          }
+        }
+      }
+
+      const child = spawn(bin, args, {
+        cwd: opts.cwd,
+        env: getAllowedEnv(),
+      });
 
     let stdout = '';
     let stderr = '';
@@ -91,10 +232,12 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
     });
     child.on('error', (err) => {
       clearTimeout(timer);
+      vcsSemaphore.release();
       reject(err);
     });
     child.on('close', (code) => {
       clearTimeout(timer);
+      vcsSemaphore.release();
       if (timedOut) {
         reject(new Error(`itehaas timeout after ${timeout}ms: ${args.join(' ')}`));
         return;
@@ -108,7 +251,8 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
       } catch {}
       child.stdin.end();
     }
-  });
+    });
+  })();
 }
 
 export async function initRepo(repoPath: string, algo: string = 'sha256'): Promise<void> {

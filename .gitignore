@@ -94,4 +94,12 @@ cobertura.xml
 testing/
 Testing/
 .Testing
-data/repos/
+# Itehaas data (repos are sensitive, never push)
+data/repos/*
+!data/repos/.gitkeep
+pgdata/
+*.sqlite
+*.db
+*.dump
+.forensics/
+.opencode/

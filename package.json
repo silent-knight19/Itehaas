@@ -12,5 +12,11 @@
   "packageManager": "pnpm@9.0.0",
   "engines": {
     "node": ">=20"
+  },
+  "pnpm": {
+    "overrides": {
+      "tar": "7.5.19",
+      "next": "14.2.35"
+    }
   }
 }

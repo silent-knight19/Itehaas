@@ -2,6 +2,7 @@
 import React from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { BookOpen, Copy } from "lucide-react";
 import { useToast } from "./Toast";
 
@@ -35,7 +36,23 @@ export function MarkdownViewer({ content, title = "README.md" }: MarkdownViewerP
       </div>
 
       <div className="markdown-body py-2">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          rehypePlugins={[[rehypeSanitize, defaultSchema]]}
+          components={{
+            a: ({ href, children, ...props }: any) => {
+              const h = String(href || '');
+              if (/^\s*(javascript|data|vbscript):/i.test(h)) {
+                return <span>{children}</span>;
+              }
+              return (
+                <a href={h} target="_blank" rel="noopener noreferrer" {...props}>
+                  {children}
+                </a>
+              );
+            },
+          }}
+        >
           {content}
         </ReactMarkdown>
       </div>
