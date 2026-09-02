@@ -9,6 +9,7 @@ import {
   CircleDot,
   GitPullRequest,
   PlayCircle,
+  GitCompare,
 } from "lucide-react";
 
 interface RepoTabsProps {
@@ -35,6 +36,7 @@ export function RepoTabs({
   const isIssues = pathname.startsWith(`${basePath}/issues`);
   const isPulls = pathname.startsWith(`${basePath}/pulls`);
   const isCi = pathname.startsWith(`${basePath}/ci`);
+  const isCompare = pathname.startsWith(`${basePath}/compare`) || pathname.startsWith(`${basePath}/commit`);
 
   const tabs = [
     {
@@ -76,6 +78,14 @@ export function RepoTabs({
       icon: GitPullRequest,
       active: isPulls,
       badge: typeof pullsCount === "number" ? pullsCount : null,
+    },
+    {
+      id: "compare",
+      label: "Compare",
+      href: `${basePath}/compare`,
+      icon: GitCompare,
+      active: isCompare,
+      badge: null,
     },
     {
       id: "ci",

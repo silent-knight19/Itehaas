@@ -192,8 +192,13 @@ enum Commands {
         /// Alias for --staged
         #[arg(long, group = "diff_mode")]
         cached: bool,
-        /// Target branch/commit to diff against HEAD
+        /// Show stat instead of patch
+        #[arg(long)]
+        stat: bool,
+        /// First target branch/commit (or base)
         target: Option<String>,
+        /// Second target for two-commit diff (e.g., `itehaas diff <a> <b>`)
+        target2: Option<String>,
     },
     /// Merge a branch into current branch
     Merge {
@@ -750,10 +755,12 @@ fn main() -> Result<()> {
         Commands::Diff {
             staged,
             cached,
+            stat,
             target,
+            target2,
         } => {
             let repo = find_repo_or_cwd()?;
-            cmd_diff(&repo, staged || cached, target)?;
+            cmd_diff(&repo, staged || cached, target, target2, stat)?;
         }
         Commands::Merge { branch, message } => {
             let repo = find_repo_or_cwd()?;
@@ -1817,36 +1824,130 @@ fn checkout_with_force(
     Ok(())
 }
 
-fn cmd_diff(repo: &Path, staged: bool, target: Option<String>) -> Result<()> {
+fn cmd_diff(repo: &Path, staged: bool, target: Option<String>, target2: Option<String>, stat: bool) -> Result<()> {
     let algo = config::read_hasher(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let hasher = itehaas_lib::hash::new_hasher(algo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    if staged {
-        let diffs = itehaas_lib::diff::diff_index_vs_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Two-commit diff: `itehaas diff <a> <b> [--stat]`
+    if let (Some(a_str), Some(b_str)) = (target.clone(), target2.clone()) {
+        let a_hash = itehaas_lib::refs::resolve_rev(repo, &a_str)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("target '{}' not found", a_str))?;
+        let b_hash = itehaas_lib::refs::resolve_rev(repo, &b_str)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("target '{}' not found", b_str))?;
+        let mut diffs = itehaas_lib::diff::diff_commits(repo, &a_hash, &b_hash)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // Rename detection for two-commit diff
+        if let Ok(renamed) = itehaas_lib::diff::detect_renames(repo, diffs.clone()) { diffs = renamed; }
         if diffs.is_empty() {
             return Ok(());
         }
+        if stat {
+            for d in &diffs {
+                let patch = match (&d.old_hash, &d.new_hash) {
+                    (Some(oh), Some(nh)) => {
+                        let old = itehaas_lib::diff::get_blob_content(repo, oh, hasher.as_ref()).unwrap_or_default();
+                        let new = itehaas_lib::diff::get_blob_content(repo, nh, hasher.as_ref()).unwrap_or_default();
+                        itehaas_lib::diff::unified_diff(&old, &new, d.effective_new_path())
+                    }
+                    (None, Some(nh)) => {
+                        let new = itehaas_lib::diff::get_blob_content(repo, nh, hasher.as_ref()).unwrap_or_default();
+                        itehaas_lib::diff::unified_diff(b"", &new, d.effective_new_path())
+                    }
+                    (Some(oh), None) => {
+                        let old = itehaas_lib::diff::get_blob_content(repo, oh, hasher.as_ref()).unwrap_or_default();
+                        itehaas_lib::diff::unified_diff(&old, b"", &d.effective_new_path())
+                    }
+                    _ => String::new(),
+                };
+                let (add, del) = itehaas_lib::diff::count_patch_stats(&patch);
+                let sim = d.similarity.map(|s| format!(" {}%", s)).unwrap_or_default();
+                println!("{} {} | {} +{} -{}{}", d.status_str(), d.display_path(), d.effective_new_path(), add, del, sim);
+                if d.status == itehaas_lib::diff::DiffStatus::Renamed {
+                    // also show rename header
+                }
+                if stat && !patch.is_empty() {
+                    // compact stat already printed
+                }
+            }
+            println!("{} files changed", diffs.len());
+            return Ok(());
+        }
         for d in diffs {
-            println!("{} {}", d.status_str(), d.path);
-            let old_content = if let Some(h) = d.old_hash {
-                itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).ok()
+            println!("{} {}", d.status_str(), d.display_path());
+            let old_content = if let Some(h) = &d.old_hash {
+                itehaas_lib::diff::get_blob_content(repo, h, hasher.as_ref()).ok()
             } else {
                 None
             };
-            let new_content = if let Some(h) = d.new_hash {
-                itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).ok()
+            let new_content = if let Some(h) = &d.new_hash {
+                itehaas_lib::diff::get_blob_content(repo, h, hasher.as_ref()).ok()
             } else {
                 None
             };
+            let path_for_header = d.effective_new_path().to_string();
+            match (old_content, new_content) {
+                (Some(old), Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(&old, &new, &path_for_header)),
+                (None, Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(b"", &new, &path_for_header)),
+                (Some(old), None) => print!("{}", itehaas_lib::diff::unified_diff(&old, b"", &path_for_header)),
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+
+    if staged {
+        let mut diffs = itehaas_lib::diff::diff_index_vs_head(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if let Ok(renamed) = itehaas_lib::diff::detect_renames(repo, diffs.clone()) { diffs = renamed; }
+        if diffs.is_empty() {
+            return Ok(());
+        }
+        if stat {
+            for d in &diffs {
+                let patch = match (&d.old_hash, &d.new_hash) {
+                    (Some(oh), Some(nh)) => {
+                        let old = itehaas_lib::diff::get_blob_content(repo, oh, hasher.as_ref()).unwrap_or_default();
+                        let new = itehaas_lib::diff::get_blob_content(repo, nh, hasher.as_ref()).unwrap_or_default();
+                        itehaas_lib::diff::unified_diff(&old, &new, d.effective_new_path())
+                    }
+                    (None, Some(nh)) => {
+                        let new = itehaas_lib::diff::get_blob_content(repo, nh, hasher.as_ref()).unwrap_or_default();
+                        itehaas_lib::diff::unified_diff(b"", &new, d.effective_new_path())
+                    }
+                    (Some(oh), None) => {
+                        let old = itehaas_lib::diff::get_blob_content(repo, oh, hasher.as_ref()).unwrap_or_default();
+                        itehaas_lib::diff::unified_diff(&old, b"", &d.effective_new_path())
+                    }
+                    _ => String::new(),
+                };
+                let (add, del) = itehaas_lib::diff::count_patch_stats(&patch);
+                println!("{} {} | +{} -{}", d.status_str(), d.display_path(), add, del);
+            }
+            return Ok(());
+        }
+        for d in diffs {
+            println!("{} {}", d.status_str(), d.display_path());
+            let old_content = if let Some(h) = &d.old_hash {
+                itehaas_lib::diff::get_blob_content(repo, h, hasher.as_ref()).ok()
+            } else {
+                None
+            };
+            let new_content = if let Some(h) = &d.new_hash {
+                itehaas_lib::diff::get_blob_content(repo, h, hasher.as_ref()).ok()
+            } else {
+                None
+            };
+            let path_for_header = d.effective_new_path().to_string();
             match (old_content, new_content) {
                 (Some(old), Some(new)) => {
-                    print!("{}", itehaas_lib::diff::unified_diff(&old, &new, &d.path));
+                    print!("{}", itehaas_lib::diff::unified_diff(&old, &new, &path_for_header));
                 }
                 (None, Some(new)) => {
-                    print!("{}", itehaas_lib::diff::unified_diff(b"", &new, &d.path));
+                    print!("{}", itehaas_lib::diff::unified_diff(b"", &new, &path_for_header));
                 }
                 (Some(old), None) => {
-                    print!("{}", itehaas_lib::diff::unified_diff(&old, b"", &d.path));
+                    print!("{}", itehaas_lib::diff::unified_diff(&old, b"", &path_for_header));
                 }
                 _ => {}
             }
@@ -1855,31 +1956,56 @@ fn cmd_diff(repo: &Path, staged: bool, target: Option<String>) -> Result<()> {
     }
 
     if let Some(tgt) = target {
-        // Diff HEAD vs target
+        // Diff HEAD vs target (or target vs HEAD if stat wants?)
         let target_hash = itehaas_lib::refs::resolve_rev(repo, &tgt)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
             .ok_or_else(|| anyhow::anyhow!("target '{}' not found", tgt))?;
-        let diffs = itehaas_lib::diff::diff_head_vs_commit(repo, &target_hash)
+        let mut diffs = itehaas_lib::diff::diff_head_vs_commit(repo, &target_hash)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if let Ok(renamed) = itehaas_lib::diff::detect_renames(repo, diffs.clone()) { diffs = renamed; }
         if diffs.is_empty() {
             return Ok(());
         }
+        if stat {
+            for d in &diffs {
+                let patch = match (&d.old_hash, &d.new_hash) {
+                    (Some(oh), Some(nh)) => {
+                        let old = itehaas_lib::diff::get_blob_content(repo, oh, hasher.as_ref()).unwrap_or_default();
+                        let new = itehaas_lib::diff::get_blob_content(repo, nh, hasher.as_ref()).unwrap_or_default();
+                        itehaas_lib::diff::unified_diff(&old, &new, d.effective_new_path())
+                    }
+                    (None, Some(nh)) => {
+                        let new = itehaas_lib::diff::get_blob_content(repo, nh, hasher.as_ref()).unwrap_or_default();
+                        itehaas_lib::diff::unified_diff(b"", &new, d.effective_new_path())
+                    }
+                    (Some(oh), None) => {
+                        let old = itehaas_lib::diff::get_blob_content(repo, oh, hasher.as_ref()).unwrap_or_default();
+                        itehaas_lib::diff::unified_diff(&old, b"", &d.effective_new_path())
+                    }
+                    _ => String::new(),
+                };
+                let (add, del) = itehaas_lib::diff::count_patch_stats(&patch);
+                println!("{} {} | +{} -{}", d.status_str(), d.display_path(), add, del);
+            }
+            return Ok(());
+        }
         for d in diffs {
-            println!("{} {}", d.status_str(), d.path);
-            let old_content = if let Some(h) = d.old_hash {
-                itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).ok()
+            println!("{} {}", d.status_str(), d.display_path());
+            let old_content = if let Some(h) = &d.old_hash {
+                itehaas_lib::diff::get_blob_content(repo, h, hasher.as_ref()).ok()
             } else {
                 None
             };
-            let new_content = if let Some(h) = d.new_hash {
-                itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).ok()
+            let new_content = if let Some(h) = &d.new_hash {
+                itehaas_lib::diff::get_blob_content(repo, h, hasher.as_ref()).ok()
             } else {
                 None
             };
+            let path_for_header = d.effective_new_path().to_string();
             match (old_content, new_content) {
-                (Some(old), Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(&old, &new, &d.path)),
-                (None, Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(b"", &new, &d.path)),
-                (Some(old), None) => print!("{}", itehaas_lib::diff::unified_diff(&old, b"", &d.path)),
+                (Some(old), Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(&old, &new, &path_for_header)),
+                (None, Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(b"", &new, &path_for_header)),
+                (Some(old), None) => print!("{}", itehaas_lib::diff::unified_diff(&old, b"", &path_for_header)),
                 _ => {}
             }
         }
@@ -1887,29 +2013,58 @@ fn cmd_diff(repo: &Path, staged: bool, target: Option<String>) -> Result<()> {
     }
 
     // Default: working tree vs index
-    let diffs = itehaas_lib::diff::diff_working_vs_index(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut diffs = itehaas_lib::diff::diff_working_vs_index(repo).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if let Ok(renamed) = itehaas_lib::diff::detect_renames(repo, diffs.clone()) { diffs = renamed; }
     if diffs.is_empty() {
         return Ok(());
     }
+    if stat {
+        for d in &diffs {
+            let patch = match (&d.old_hash, &d.new_hash) {
+                (Some(oh), Some(nh)) => {
+                    let old = itehaas_lib::diff::get_blob_content(repo, oh, hasher.as_ref()).unwrap_or_default();
+                    let new = {
+                        let p = repo.join(d.effective_new_path());
+                        fs::read(&p).unwrap_or_default()
+                    };
+                    itehaas_lib::diff::unified_diff(&old, &new, d.effective_new_path())
+                }
+                (None, Some(_)) => {
+                    let new = {
+                        let p = repo.join(d.effective_new_path());
+                        fs::read(&p).unwrap_or_default()
+                    };
+                    itehaas_lib::diff::unified_diff(b"", &new, d.effective_new_path())
+                }
+                (Some(oh), None) => {
+                    let old = itehaas_lib::diff::get_blob_content(repo, oh, hasher.as_ref()).unwrap_or_default();
+                    itehaas_lib::diff::unified_diff(&old, b"", &d.effective_new_path())
+                }
+                _ => String::new(),
+            };
+            let (add, del) = itehaas_lib::diff::count_patch_stats(&patch);
+            println!("{} {} | +{} -{}", d.status_str(), d.display_path(), add, del);
+        }
+        return Ok(());
+    }
     for d in diffs {
-        println!("{} {}", d.status_str(), d.path);
-        // For working vs index, need to get working file content directly
-        let old_content = if let Some(h) = d.old_hash {
+        println!("{} {}", d.status_str(), d.display_path());
+        let old_content = if let Some(h) = &d.old_hash {
             itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).ok()
         } else {
             None
         };
         let new_content = if d.new_hash.is_some() {
-            // Read from working tree file
-            let p = repo.join(&d.path);
+            let p = repo.join(d.effective_new_path());
             fs::read(&p).ok()
         } else {
             None
         };
+        let path_for_header = d.effective_new_path().to_string();
         match (old_content, new_content) {
-            (Some(old), Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(&old, &new, &d.path)),
-            (None, Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(b"", &new, &d.path)),
-            (Some(old), None) => print!("{}", itehaas_lib::diff::unified_diff(&old, b"", &d.path)),
+            (Some(old), Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(&old, &new, &path_for_header)),
+            (None, Some(new)) => print!("{}", itehaas_lib::diff::unified_diff(b"", &new, &path_for_header)),
+            (Some(old), None) => print!("{}", itehaas_lib::diff::unified_diff(&old, b"", &path_for_header)),
             _ => {}
         }
     }
@@ -3203,21 +3358,41 @@ fn cmd_cherry_pick(repo: &Path, commit_str: String, abort: bool, cont: bool) -> 
                     index.remove(path);
                 }
             }
-            itehaas_lib::diff::DiffStatus::Modified | itehaas_lib::diff::DiffStatus::TypeChange => {
+            itehaas_lib::diff::DiffStatus::Modified | itehaas_lib::diff::DiffStatus::TypeChange | itehaas_lib::diff::DiffStatus::Renamed => {
+                let effective_path = d.new_path.as_deref().unwrap_or(path);
+                let is_rename = d.status == itehaas_lib::diff::DiffStatus::Renamed;
                 if let Some((h, mode)) = d.new_hash.as_ref().map(|hh| (hh.clone(), d.new_mode.unwrap())) {
-                    let abs = repo.join(path);
-                    // Simple: overwrite if not conflicting? Check if wt == parent
+                    let abs = repo.join(effective_path);
+                    // For renames, old path may need deletion
+                    if is_rename && path != effective_path {
+                        let old_abs = repo.join(path);
+                        // Check old file existence for conflict detection against parent
+                        if old_abs.exists() {
+                            let wt_data = fs::read(&old_abs).unwrap_or_default();
+                            let wt_hash = itehaas_lib::object::Object::Blob(itehaas_lib::object::Blob::new(wt_data)).hash(hasher.as_ref());
+                            if let Some((ph, _)) = parent_map.get(path) {
+                                if wt_hash.hex() != ph.hex() && wt_hash.hex() != h.hex() {
+                                    conflicts.push(effective_path.to_string());
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let wt_exists = abs.exists();
                     if wt_exists {
                         let wt_data = fs::read(&abs).unwrap_or_default();
                         let wt_hash = itehaas_lib::object::Object::Blob(itehaas_lib::object::Blob::new(wt_data)).hash(hasher.as_ref());
-                        if let Some((ph, _)) = parent_map.get(path) {
+                        if let Some((ph, _)) = parent_map.get(if is_rename { effective_path } else { path }) {
                             if wt_hash.hex() != ph.hex() {
-                                // wt dirty vs parent, check if wt already equals new (already applied)
                                 if wt_hash.hex() == h.hex() {
                                     // already applied
+                                    if is_rename && path != effective_path {
+                                        let old_abs = repo.join(path);
+                                        let _ = fs::remove_file(&old_abs);
+                                        index.remove(path);
+                                    }
                                 } else {
-                                    conflicts.push(path.clone());
+                                    conflicts.push(effective_path.to_string());
                                     let new_content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap_or_default();
                                     let cur_content = fs::read(&abs).unwrap_or_default();
                                     let mut out = Vec::new();
@@ -3230,20 +3405,38 @@ fn cmd_cherry_pick(repo: &Path, commit_str: String, abort: bool, cont: bool) -> 
                                     continue;
                                 }
                             } else {
-                                // wt == parent, safe to apply
                                 let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
                                 fs::write(&abs, &content).unwrap();
-                                index.add_or_update(IndexEntry::new(path.clone(), h, mode));
+                                index.add_or_update(IndexEntry::new(effective_path.to_string(), h, mode));
+                                if is_rename && path != effective_path {
+                                    let old_abs = repo.join(path);
+                                    let _ = fs::remove_file(&old_abs);
+                                    index.remove(path);
+                                }
                             }
                         } else {
-                            // wt == parent, safe
                             let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
                             fs::write(&abs, &content).unwrap();
-                            index.add_or_update(IndexEntry::new(path.clone(), h, mode));
+                            index.add_or_update(IndexEntry::new(effective_path.to_string(), h, mode));
+                            if is_rename && path != effective_path {
+                                let old_abs = repo.join(path);
+                                let _ = fs::remove_file(&old_abs);
+                                index.remove(path);
+                            }
                         }
                     } else {
-                        // wt not exists, but parent had file? Means file was deleted in wt? Conflict
-                        conflicts.push(path.clone());
+                        // wt not exists
+                        if is_rename {
+                            if let Some(parent) = abs.parent() { fs::create_dir_all(parent).unwrap(); }
+                            let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
+                            fs::write(&abs, &content).unwrap();
+                            index.add_or_update(IndexEntry::new(effective_path.to_string(), h, mode));
+                            let old_abs = repo.join(path);
+                            let _ = fs::remove_file(&old_abs);
+                            index.remove(path);
+                        } else {
+                            conflicts.push(effective_path.to_string());
+                        }
                     }
                 }
             }
@@ -3340,31 +3533,31 @@ fn cmd_revert(repo: &Path, commit_str: String) -> Result<()> {
                     }
                 }
             }
-            _ => {
+            itehaas_lib::diff::DiffStatus::Modified | itehaas_lib::diff::DiffStatus::TypeChange | itehaas_lib::diff::DiffStatus::Renamed => {
+                let effective_path = d.new_path.as_deref().unwrap_or(path);
                 if let Some((h, mode)) = d.new_hash.as_ref().map(|hh| (hh.clone(), d.new_mode.unwrap())) {
-                    let abs = repo.join(path);
+                    let abs = repo.join(effective_path);
                     if let Some(parent) = abs.parent() { fs::create_dir_all(parent).unwrap(); }
                     let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
                     // Check if wt dirty
                     if abs.exists() {
                         let cur = fs::read(&abs).unwrap_or_default();
                         let cur_hash = itehaas_lib::object::Object::Blob(itehaas_lib::object::Blob::new(cur)).hash(hasher.as_ref());
-                        if let Some((ch, _)) = commit_map.get(path) {
+                        if let Some((ch, _)) = commit_map.get(effective_path) {
                             if cur_hash.hex() != ch.hex() {
-                                conflicts.push(path.clone());
+                                conflicts.push(effective_path.to_string());
                                 continue;
                             }
                         }
                     }
                     fs::write(&abs, &content).unwrap();
-                    index.add_or_update(IndexEntry::new(path.clone(), h, mode));
-                } else {
-                    // TypeChange etc: handle as modified
-                    if let Some((h, mode)) = d.new_hash.as_ref().map(|hh| (hh.clone(), d.new_mode.unwrap())) {
-                        let abs = repo.join(path);
-                        let content = itehaas_lib::diff::get_blob_content(repo, &h, hasher.as_ref()).unwrap();
-                        fs::write(&abs, &content).unwrap();
-                        index.add_or_update(IndexEntry::new(path.clone(), h, mode));
+                    index.add_or_update(IndexEntry::new(effective_path.to_string(), h, mode));
+                    if d.status == itehaas_lib::diff::DiffStatus::Renamed {
+                        let old_abs = repo.join(path);
+                        if old_abs.exists() && path != effective_path {
+                            let _ = fs::remove_file(&old_abs);
+                            index.remove(path);
+                        }
                     }
                 }
             }

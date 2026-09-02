@@ -1033,16 +1033,16 @@ export async function repoRoutes(app: FastifyInstance) {
       } catch { /* branch may not exist; fall back to current HEAD */ }
     }
 
-    let logRes: { code: number; stdout: string; stderr: string };
+    let logRes: { code: number | null; stdout: string; stderr: string };
     try {
       // Default to full hash for web (Phase 7) to enable tree browsing. Keep oneline for backwards compat if ?short=1
       if ((req.query as any)?.short === '1') {
         const args = ['log', '--oneline', '--max-count', String(maxCount)];
-        logRes = await execItehaas(args, { cwd: repoPath });
+        logRes = await execItehaas(args, { cwd: repoPath }) as any;
       } else {
         // Full hash mode: parse `itehaas log` (no --oneline)
         const args = ['log', '--max-count', String(maxCount)];
-        logRes = await execItehaas(args, { cwd: repoPath });
+        logRes = await execItehaas(args, { cwd: repoPath }) as any;
       }
     } finally {
       // Always restore the original HEAD
@@ -1098,6 +1098,362 @@ export async function repoRoutes(app: FastifyInstance) {
       if (commits.length >= maxCount) break;
     }
     return reply.send({ commits });
+  });
+
+  // ===== New: Commit diff & compare (Full GitHub clone) =====
+
+  // Helper: resolve rev (branch name or hash) to full 64 hex or null
+  async function resolveRevToHash(repoPath: string, rev: string): Promise<string | null> {
+    if (!rev) return null;
+    if (rev === 'HEAD') {
+      try {
+        const head = fs.readFileSync(path.join(repoPath, '.itehaas', 'HEAD'), 'utf8').trim();
+        if (head.startsWith('ref: ')) {
+          const ref = head.slice(5).trim();
+          const refPath = path.join(repoPath, '.itehaas', ref);
+          const hash = fs.readFileSync(refPath, 'utf8').trim();
+          if (/^[0-9a-f]{64}$/.test(hash)) return hash;
+        } else if (/^[0-9a-f]{64}$/.test(head)) {
+          return head;
+        }
+      } catch {}
+      const res = await execItehaas(['log', '--max-count', '1'], { cwd: repoPath, maxOutput: 4 << 20 });
+      const m = res.stdout.match(/^commit ([0-9a-f]{64})$/m);
+      return m ? m[1] : null;
+    }
+    if (isValidBranchRef(rev)) {
+      const refPath = path.join(repoPath, '.itehaas', 'refs', 'heads', ...rev.split('/'));
+      try {
+        const hash = fs.readFileSync(refPath, 'utf8').trim();
+        if (/^[0-9a-f]{64}$/.test(hash)) return hash;
+      } catch {}
+    }
+    // Try as hash (full or short 7+)
+    if (/^[0-9a-f]{4,64}$/.test(rev)) {
+      // Full hash check
+      if (/^[0-9a-f]{64}$/.test(rev)) {
+        const res = await execItehaas(['cat-file', '-t', rev], { cwd: repoPath, timeout: 8000 });
+        if (res.code === 0) return rev;
+      } else {
+        // short hash: try resolve via cat-file with full? For simplicity, try via `show`?
+        // Attempt to use itehaas cat-file directly may fail for short, so try resolve via objects scan
+        // Fallback: try exec with short (our Rust supports short via resolve_rev)
+        const res = await execItehaas(['cat-file', '-p', rev], { cwd: repoPath, timeout: 8000 });
+        if (res.code === 0) {
+          // Need to map short to full: find file via objects dir
+          // Try to locate object dir matching prefix
+          try {
+            const objsRoot = path.join(repoPath, '.itehaas', 'objects');
+            const prefix = rev.slice(0, 2);
+            const suffixPrefix = rev.slice(2);
+            const dir = path.join(objsRoot, prefix);
+            if (fs.existsSync(dir)) {
+              for (const f of fs.readdirSync(dir)) {
+                const full = prefix + f;
+                if (full.startsWith(rev) && /^[0-9a-f]{64}$/.test(full)) {
+                  return full;
+                }
+              }
+            }
+          } catch {}
+        }
+      }
+    }
+    return null;
+  }
+
+  function parseDiffOutput(stdout: string): { files: any[], totalAdditions: number, totalDeletions: number } {
+    const files: any[] = [];
+    let current: any = null;
+    let patchLines: string[] = [];
+    const lines = stdout.split('\n');
+    const flush = () => {
+      if (!current) return;
+      const patch = patchLines.join('\n');
+      let additions = 0, deletions = 0;
+      let isBinary = patch.includes('Binary files');
+      for (const l of patchLines) {
+        if (l.startsWith('+') && !l.startsWith('+++')) additions++;
+        else if (l.startsWith('-') && !l.startsWith('---')) deletions++;
+      }
+      const pathForImage = current.newPath || current.path;
+      const isImage = /\.(png|jpe?g|gif|webp|svg|bmp|ico)$/i.test(pathForImage);
+      current.patch = patch;
+      current.additions = additions;
+      current.deletions = deletions;
+      current.isBinary = isBinary;
+      current.isImage = isBinary && isImage ? true : isImage && (isBinary || false);
+      // For binary images, we treat isImage true regardless of binary flag?
+      if (isImage) current.isImage = true;
+      files.push(current);
+      current = null;
+      patchLines = [];
+    };
+    for (const line of lines) {
+      const m = line.match(/^(added|deleted|modified|typechange|renamed)\s+(.+)$/);
+      if (m) {
+        flush();
+        const status = m[1];
+        const display = m[2];
+        let path = display;
+        let newPath: string | null = null;
+        let similarity: number | null = null;
+        if (status === 'renamed') {
+          // format: old → new (85%)
+          const rm = display.match(/^(.+)\s+→\s+(.+)\s+\((\d+)%\)$/);
+          if (rm) {
+            path = rm[1];
+            newPath = rm[2];
+            similarity = parseInt(rm[3], 10);
+          } else {
+            const rm2 = display.match(/^(.+)\s+→\s+(.+)$/);
+            if (rm2) {
+              path = rm2[1];
+              newPath = rm2[2];
+            }
+          }
+        }
+        current = { path, newPath, status, similarity, patch: '', additions: 0, deletions: 0, isBinary: false, isImage: false };
+        continue;
+      }
+      if (line.startsWith('diff --itehaas')) {
+        patchLines.push(line);
+        continue;
+      }
+      if (current) {
+        patchLines.push(line);
+      }
+    }
+    flush();
+    let totalAdditions = 0, totalDeletions = 0;
+    for (const f of files) { totalAdditions += f.additions; totalDeletions += f.deletions; }
+    return { files, totalAdditions, totalDeletions };
+  }
+
+  async function getCommitMeta(repoPath: string, hash: string): Promise<any | null> {
+    const res = await execItehaas(['cat-file', '-p', hash], { cwd: repoPath, timeout: 8000, maxOutput: 1 << 20 });
+    if (res.code !== 0) return null;
+    const content = res.stdout;
+    const lines = content.split('\n');
+    let tree = '', parents: string[] = [], author = '', committer = '', message = '';
+    let inMsg = false;
+    let msgLines: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!inMsg) {
+        if (line.startsWith('tree ')) tree = line.slice(5).trim();
+        else if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
+        else if (line.startsWith('author ')) author = line.slice(7).trim();
+        else if (line.startsWith('committer ')) committer = line.slice(9).trim();
+        else if (line === '') { inMsg = true; }
+      } else {
+        msgLines.push(line);
+      }
+    }
+    message = msgLines.join('\n');
+    // Date parsing: author contains timestamp
+    return { hash, tree, parents, author, committer, message };
+  }
+
+  // GET /api/repos/:owner/:repo/commits/:hash  (single commit diff)
+  app.get('/api/repos/:owner/:repo/commits/:hash', async (req, reply) => {
+    const { owner, repo, hash } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    if (!/^[0-9a-f]{4,64}$/.test(hash)) return reply.status(400).send({ error: 'invalid hash' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+
+    const { checkRateLimit: crDiff, rateLimitReply: rlrDiff } = await import('../lib/rateLimit');
+    const rl = crDiff(req as any, 'diff', 30, 60 * 1000);
+    if (!rl.allowed) return rlrDiff(reply as any, rl.resetMs);
+
+    const fullHash = await resolveRevToHash(repoPath, hash);
+    if (!fullHash) return reply.status(404).send({ error: 'commit not found' });
+
+    const meta = await getCommitMeta(repoPath, fullHash);
+    if (!meta) return reply.status(404).send({ error: 'commit not found' });
+
+    // Parent diff: if root, diff against empty tree
+    let diffStdout = '';
+    if (meta.parents.length === 0) {
+      // No parent: diff against empty -> show all as added
+      // Use `itehaas diff` with empty vs commit? For root, we can call `diff` with same hash vs hash? Instead use cat-file tree handling:
+      // Simpler: call `itehaas diff <hash> <hash>` will be empty, so we need to handle root specially by using diff_commits with parent empty.
+      // We will produce diff by running `itehaas show` logic via `diff`? For MVP, run `cat-file -p` tree and diff via `itehaas diff` from empty?
+      // Fallback: use `diff` between hash and hash but with --stat not useful. We'll instead run `itehaas show` via exec `show <hash>` and capture patch.
+      const showRes = await execItehaas(['show', fullHash], { cwd: repoPath, maxOutput: 4 << 20, timeout: 15000 });
+      diffStdout = showRes.stdout || '';
+      // show output includes header commit/Author/Date/message + patches; we need to strip header and keep diff section
+      // Our parseDiffOutput expects status lines, but show outputs `commit ...` header, not status. For root, we fallback to using `itehaas diff` technique:
+      // Instead, if show parsing fails, fallback to empty
+      // For now, try to use show's diff part: extract from first "diff --itehaas"
+      const idx = diffStdout.indexOf('diff --itehaas');
+      if (idx !== -1) diffStdout = diffStdout.slice(idx);
+      else {
+        // Try running diff for root: we have no parent, so we simulate by diffing empty tree 6ef19b... (known empty tree hash for sha256)
+        // Empty tree hash computed: for sha256, blob header `tree 0\0` hash is 6ef19b... (from README)
+        // But easier: run `itehaas diff <hash>` vs HEAD? Instead just return files as added via tree walk
+        try {
+          const treeRes = await execItehaas(['cat-file', '-p', meta.tree], { cwd: repoPath, maxOutput: 4 << 20 });
+          const lines = treeRes.stdout.split('\n').filter(Boolean);
+          let txt = '';
+          for (const line of lines) {
+            const m = line.match(/^(\d{5,6})\s+([0-9a-f]{64})\s+(.+)$/);
+            if (m) {
+              const name = m[3];
+              txt += `added ${name}\n`;
+              const blobRes = await execItehaas(['cat-file', '-p', m[2]], { cwd: repoPath, maxOutput: 4 << 20 });
+              const patch = `diff --itehaas a/${name} b/${name}\n--- a/${name}\n+++ b/${name}\n@@ -0,0 +1 @@\n${blobRes.stdout.split('\n').map(l=>`+${l}`).join('\n')}\n`;
+              txt += patch;
+            }
+          }
+          diffStdout = txt;
+        } catch {}
+      }
+    } else {
+      const parentHash = meta.parents[0];
+      const diffRes = await execItehaas(['diff', parentHash, fullHash], { cwd: repoPath, maxOutput: 4 << 20, timeout: 15000 });
+      if (diffRes.code !== 0) return reply.status(500).send({ error: diffRes.stderr || 'diff failed' });
+      diffStdout = diffRes.stdout;
+    }
+
+    const { files, totalAdditions, totalDeletions } = parseDiffOutput(diffStdout);
+    const stats = { changedFiles: files.length, additions: totalAdditions, deletions: totalDeletions };
+
+    // Also fetch parent commit short for UI
+    return reply.send({ commit: meta, parent: meta.parents[0] || null, stats, files, patch: diffStdout });
+  });
+
+  // GET /api/repos/:owner/:repo/diff?from=&to=  (arbitrary pair)
+  app.get('/api/repos/:owner/:repo/diff', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    const { from, to } = req.query as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    if (!from || !to || typeof from !== 'string' || typeof to !== 'string') return reply.status(400).send({ error: 'from and to required' });
+    if (from.length > 100 || to.length > 100 || from.includes('\0') || to.includes('\0')) return reply.status(400).send({ error: 'invalid rev' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+
+    const { checkRateLimit: crDiff, rateLimitReply: rlrDiff } = await import('../lib/rateLimit');
+    const rl = crDiff(req as any, 'diff', 30, 60 * 1000);
+    if (!rl.allowed) return rlrDiff(reply as any, rl.resetMs);
+
+    const fromHash = await resolveRevToHash(repoPath, from);
+    const toHash = await resolveRevToHash(repoPath, to);
+    if (!fromHash) return reply.status(404).send({ error: `from rev not found: ${from}` });
+    if (!toHash) return reply.status(404).send({ error: `to rev not found: ${to}` });
+    if (fromHash === toHash) return reply.send({ from: fromHash, to: toHash, stats: { changedFiles: 0, additions: 0, deletions: 0 }, files: [], commits: [] });
+
+    const diffRes = await execItehaas(['diff', fromHash, toHash], { cwd: repoPath, maxOutput: 4 << 20, timeout: 15000 });
+    if (diffRes.code !== 0) return reply.status(500).send({ error: diffRes.stderr || 'diff failed' });
+    const { files, totalAdditions, totalDeletions } = parseDiffOutput(diffRes.stdout);
+    const stats = { changedFiles: files.length, additions: totalAdditions, deletions: totalDeletions };
+
+    // Commits between from..to (simple: walk log from to, stop at from)
+    // For now, return empty commits; frontend can fetch log separately if needed
+    // Attempt to get at most 50 commits between
+    let commits: any[] = [];
+    try {
+      const logRes = await execItehaas(['log', '--max-count', '100'], { cwd: repoPath, maxOutput: 4 << 20 });
+      if (logRes.code === 0) {
+        const raw = logRes.stdout.trim();
+        const blocks = raw.split('\ncommit ').map((b, i) => (i === 0 ? b : 'commit ' + b));
+        for (const block of blocks) {
+          const m = block.match(/^commit ([0-9a-f]{64})/);
+          if (!m) continue;
+          const h = m[1];
+          if (h === fromHash) break;
+          const msgMatch = block.match(/\n    (.+)/);
+          const authorMatch = block.match(/Author:\s*(.+)/);
+          const dateMatch = block.match(/Date:\s*(.+)/);
+          commits.push({ hash: h, message: msgMatch ? msgMatch[1] : '', author: authorMatch ? authorMatch[1] : '', date: dateMatch ? dateMatch[1] : '' });
+          if (h === toHash) break;
+          if (commits.length >= 50) break;
+        }
+        // Reverse to chronological if needed; keep as log order (newest first)
+      }
+    } catch {}
+
+    return reply.send({ from: fromHash, to: toHash, stats, files, commits, patch: diffRes.stdout });
+  });
+
+  // GET /api/repos/:owner/:repo/compare/:base...:head  (GitHub style)
+  app.get('/api/repos/:owner/:repo/compare/*', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    const spec = (req.params as any)['*'] as string;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    if (!spec || typeof spec !== 'string' || spec.length > 200) return reply.status(400).send({ error: 'invalid compare spec' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+
+    const { checkRateLimit: crDiff, rateLimitReply: rlrDiff } = await import('../lib/rateLimit');
+    const rl = crDiff(req as any, 'diff', 30, 60 * 1000);
+    if (!rl.allowed) return rlrDiff(reply as any, rl.resetMs);
+
+    // Parse spec: supports "base...head" (3-dot) or "base..head" (2-dot) or "base" (single)
+    let baseRaw: string | null = null;
+    let headRaw: string | null = null;
+    let threeDot = false;
+    if (spec.includes('...')) {
+      const parts = spec.split('...');
+      baseRaw = parts[0];
+      headRaw = parts.slice(1).join('...');
+      threeDot = true;
+    } else if (spec.includes('..')) {
+      const parts = spec.split('..');
+      baseRaw = parts[0];
+      headRaw = parts.slice(1).join('..');
+      threeDot = false;
+    } else {
+      return reply.status(400).send({ error: 'compare spec must be base...head or base..head' });
+    }
+    if (!baseRaw || !headRaw) return reply.status(400).send({ error: 'invalid compare spec' });
+    baseRaw = decodeURIComponent(baseRaw);
+    headRaw = decodeURIComponent(headRaw);
+
+    const baseHash = await resolveRevToHash(repoPath, baseRaw);
+    const headHash = await resolveRevToHash(repoPath, headRaw);
+    if (!baseHash) return reply.status(404).send({ error: `base not found: ${baseRaw}` });
+    if (!headHash) return reply.status(404).send({ error: `head not found: ${headRaw}` });
+
+    let fromHash = baseHash;
+    let ancestor: string | null = null;
+    if (threeDot) {
+      // For 3-dot, find merge-base (common ancestor) via itehaas merge-base --is-ancestor checks + fallback to base if not ancestor
+      // Try to find ancestor via `itehaas log --all` style? Simplest: if base is ancestor of head, use base as ancestor, else find via BFS using isAncestor cache helper
+      // Use our isAncestor helper logic via exec `merge-base --is-ancestor`
+      const isAncRes = await execItehaas(['merge-base', '--is-ancestor', baseHash, headHash], { cwd: repoPath, timeout: 8000 });
+      if (isAncRes.code === 0) {
+        ancestor = baseHash;
+        fromHash = baseHash;
+      } else {
+        // Not ancestor: try to find common ancestor via brute force walk (limited)
+        // For now, fallback to baseHash (2-dot behavior) to avoid missing ancestor logic
+        // Could also try to compute via `find_common_ancestor` by spawning a small helper, but we fallback
+        ancestor = baseHash;
+        fromHash = baseHash;
+      }
+    }
+
+    if (fromHash === headHash) return reply.send({ base: baseHash, head: headHash, ancestor, stats: { changedFiles: 0, additions: 0, deletions: 0 }, files: [], commits: [] });
+
+    const diffRes = await execItehaas(['diff', fromHash, headHash], { cwd: repoPath, maxOutput: 4 << 20, timeout: 15000 });
+    if (diffRes.code !== 0) return reply.status(500).send({ error: diffRes.stderr || 'diff failed' });
+    const { files, totalAdditions, totalDeletions } = parseDiffOutput(diffRes.stdout);
+    const stats = { changedFiles: files.length, additions: totalAdditions, deletions: totalDeletions };
+    return reply.send({ base: baseHash, head: headHash, ancestor, from: fromHash, to: headHash, stats, files, commits: [], patch: diffRes.stdout, threeDot });
   });
 
   // Get tree / file via VCS (requires read)

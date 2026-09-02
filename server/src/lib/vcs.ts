@@ -145,7 +145,7 @@ export function repoPathFor(owner: string, repo: string): string {
   return p;
 }
 
-export function execItehaas(args: string[], opts: { cwd?: string; input?: string | Buffer; timeout?: number } = {}): Promise<VcsResult> {
+export function execItehaas(args: string[], opts: { cwd?: string; input?: string | Buffer; timeout?: number; maxOutput?: number } = {}): Promise<VcsResult> {
   return (async () => {
     await vcsSemaphore.acquire();
     return new Promise<VcsResult>((resolve, reject) => {
@@ -157,6 +157,7 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
         return reject(e);
       }
       const timeout = opts.timeout ?? TIMEOUT_MS;
+      const maxOut = opts.maxOutput ?? MAX_OUTPUT;
 
       // S5: cwd validation
       if (opts.cwd) {
@@ -212,9 +213,9 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
 
     child.stdout.on('data', (d: Buffer) => {
       const s = d.toString();
-      if (stdoutLen + s.length > MAX_OUTPUT) {
-        stdout += s.slice(0, MAX_OUTPUT - stdoutLen);
-        stdoutLen = MAX_OUTPUT;
+      if (stdoutLen + s.length > maxOut) {
+        stdout += s.slice(0, maxOut - stdoutLen);
+        stdoutLen = maxOut;
       } else {
         stdout += s;
         stdoutLen += s.length;
@@ -222,9 +223,9 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
     });
     child.stderr.on('data', (d: Buffer) => {
       const s = d.toString();
-      if (stderrLen + s.length > MAX_OUTPUT) {
-        stderr += s.slice(0, MAX_OUTPUT - stderrLen);
-        stderrLen = MAX_OUTPUT;
+      if (stderrLen + s.length > maxOut) {
+        stderr += s.slice(0, maxOut - stderrLen);
+        stderrLen = maxOut;
       } else {
         stderr += s;
         stderrLen += s.length;

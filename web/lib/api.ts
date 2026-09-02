@@ -91,6 +91,16 @@ export const Api = {
   },
   tree: (owner: string, repo: string, hash: string) =>
     api(`/api/repos/${owner}/${repo}/tree/${hash}`),
+  // New: Commit diff & compare (Full GitHub clone)
+  getCommit: (owner: string, repo: string, hash: string) =>
+    api(`/api/repos/${owner}/${repo}/commits/${hash}`),
+  getDiff: (owner: string, repo: string, from: string, to: string) =>
+    api(`/api/repos/${owner}/${repo}/diff?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
+  getCompare: (owner: string, repo: string, base: string, head: string, threeDot = true) => {
+    const sep = threeDot ? '...' : '..';
+    const spec = `${encodeURIComponent(base)}${sep}${encodeURIComponent(head)}`;
+    return api(`/api/repos/${owner}/${repo}/compare/${spec}`);
+  },
   // File browsing (recursive ?path)
   getFile: (owner: string, repo: string, filePath: string, ref?: string) => {
     const enc = filePath.split('/').map(encodeURIComponent).join('/');

@@ -31,7 +31,7 @@ export async function issueRoutes(app: FastifyInstance) {
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     const user = await getSessionUser(req as any);
     if (!(await canRead(repoMeta.id, user?.id ?? null, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
     const { status, label, assignee, milestone, limit, offset } = req.query as any;
@@ -88,6 +88,7 @@ export async function issueRoutes(app: FastifyInstance) {
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     const repoMeta = await getRepoId(owner, repo);
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     // SEC-023: Public collaboration allows read-permitted users to open issues on public repos;
     // private repos require write permission.
     if (repoMeta.visibility === 'private') {
@@ -158,7 +159,7 @@ export async function issueRoutes(app: FastifyInstance) {
     const { owner, repo, id } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     const user = await getSessionUser(req as any);
     if (!(await canRead(repoMeta.id, user?.id ?? null, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
     const res = await query(`SELECT i.id, i.title, i.body, i.status, i.milestone_id, i.created_at, i.updated_at, u.username as author FROM issues i JOIN users u ON i.author_id=u.id WHERE i.id=$1 AND i.repo_id=$2`, [id, repoMeta.id]);
@@ -173,7 +174,7 @@ export async function issueRoutes(app: FastifyInstance) {
     if (!user) return;
     const { owner, repo, id } = req.params as any;
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     // SEC-011: Strict repository scoping — prevent cross-repository issue tampering
     const issue = await query(`SELECT author_id, repo_id FROM issues WHERE id=$1 AND repo_id=$2`, [id, repoMeta.id]);
     if (issue.rows.length === 0) return reply.status(404).send({ error: 'not found' });
@@ -240,7 +241,7 @@ export async function issueRoutes(app: FastifyInstance) {
   app.get('/api/repos/:owner/:repo/issues/:id/comments', async (req, reply) => {
     const { owner, repo, id } = req.params as any;
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     const user = await getSessionUser(req as any);
     if (!(await canRead(repoMeta.id, user?.id ?? null, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
     const res = await query(`SELECT c.id, c.body, c.created_at, u.username as author FROM issue_comments c JOIN users u ON c.author_id=u.id WHERE c.issue_id=$1 ORDER BY c.created_at`, [id]);
@@ -255,7 +256,7 @@ export async function issueRoutes(app: FastifyInstance) {
     if (!rlCom.allowed) return rlrCom(reply as any, rlCom.resetMs);
     const { owner, repo, id } = req.params as any;
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     if (!(await canRead(repoMeta.id, user.id, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
     const schema = z.object({ body: z.string().min(1).max(5000) });
     const parsed = schema.safeParse(req.body);
@@ -285,7 +286,7 @@ export async function issueRoutes(app: FastifyInstance) {
   app.get('/api/repos/:owner/:repo/labels', async (req, reply) => {
     const { owner, repo } = req.params as any;
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     const user = await getSessionUser(req as any);
     if (!(await canRead(repoMeta.id, user?.id ?? null, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
     const res = await query(`SELECT id, name, color, description FROM labels WHERE repo_id=$1 ORDER BY name`, [repoMeta.id]);
@@ -296,7 +297,7 @@ export async function issueRoutes(app: FastifyInstance) {
     if (!user) return;
     const { owner, repo } = req.params as any;
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     if (!(await canWrite(repoMeta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
     const schema = z.object({ name: z.string().min(1).max(50), color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().default('#0969da'), description: z.string().max(200).optional().default('') });
     const parsed = schema.safeParse(req.body);
@@ -314,7 +315,7 @@ export async function issueRoutes(app: FastifyInstance) {
     if (!user) return;
     const { owner, repo, id } = req.params as any;
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     if (!(await canWrite(repoMeta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
     const del = await query(`DELETE FROM labels WHERE id=$1 AND repo_id=$2`, [id, repoMeta.id]);
     if (del.rowCount === 0) return reply.status(404).send({ error: 'not found' });
@@ -325,7 +326,7 @@ export async function issueRoutes(app: FastifyInstance) {
   app.get('/api/repos/:owner/:repo/milestones', async (req, reply) => {
     const { owner, repo } = req.params as any;
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     const user = await getSessionUser(req as any);
     if (!(await canRead(repoMeta.id, user?.id ?? null, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
     const res = await query(`SELECT id, title, description, due_date, status, created_at, updated_at FROM milestones WHERE repo_id=$1 ORDER BY created_at`, [repoMeta.id]);
@@ -336,7 +337,7 @@ export async function issueRoutes(app: FastifyInstance) {
     if (!user) return;
     const { owner, repo } = req.params as any;
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     if (!(await canWrite(repoMeta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
     const schema = z.object({ title: z.string().min(1).max(100), description: z.string().max(5000).optional().default(''), due_date: z.string().optional(), status: z.enum(['open','closed']).optional().default('open') });
     const parsed = schema.safeParse(req.body);
@@ -360,7 +361,7 @@ export async function issueRoutes(app: FastifyInstance) {
     if (!user) return;
     const { owner, repo, id } = req.params as any;
     const repoMeta = await getRepoId(owner, repo);
-    if (!repoMeta) return reply.status(404).send({ error: 'not found' });
+    if (!repoMeta) return reply.status(404).send({ error: "not found" });
     if (!(await canWrite(repoMeta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
     const schema = z.object({ title: z.string().min(1).max(100).optional(), description: z.string().max(5000).optional(), due_date: z.string().nullable().optional(), status: z.enum(['open','closed']).optional() });
     const parsed = schema.safeParse(req.body);

@@ -7,13 +7,13 @@ import { config } from '../config';
  */
 export function getSecretEncryptionKey(rootKey?: string): Buffer {
   const secret = rootKey || config.secretEncryptionKey || config.cookieSecret;
-  return crypto.hkdfSync(
+  return Buffer.from(crypto.hkdfSync(
     'sha256',
     Buffer.from(secret),
     Buffer.from('itehaas-salt-ci-secrets-v1'),
     Buffer.from('itehaas-ci-secrets-v1'),
     32
-  );
+  ) as ArrayBuffer);
 }
 
 /**

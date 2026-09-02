@@ -83,13 +83,14 @@ async function buildApp() {
   });
 
   // Support empty JSON bodies gracefully without throwing FST_ERR_CTP_EMPTY_JSON_BODY
-  app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
-    if (!body || (typeof body === 'string' && body.trim() === '')) {
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body: any, done) => {
+    if (!body || (typeof body === 'string' && (body as string).trim() === '')) {
       done(null, {});
       return;
     }
     try {
-      done(null, JSON.parse(body));
+      const bodyStr = typeof body === 'string' ? body : (body as Buffer).toString();
+      done(null, JSON.parse(bodyStr));
     } catch (err: any) {
       err.statusCode = 400;
       done(err, undefined);

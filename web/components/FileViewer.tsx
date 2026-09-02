@@ -173,15 +173,36 @@ export function FileViewer({ fileName, content, onClose, filePath, owner, repo, 
           {!loading && history && history.length === 0 && <div className="text-xs text-fg-muted">No history found for this file.</div>}
           {!loading && history && history.length > 0 && (
             <div className="space-y-1.5">
-              {history.map((c: any, i: number) => (
-                <div key={c.hash || i} className="flex items-center justify-between rounded-xs border border-border-subtle bg-surface px-2.5 py-1.5">
-                  <div className="min-w-0">
-                    <div className="text-xs font-mono text-fg truncate">{c.message || c.hash?.slice(0,7)}</div>
-                    <div className="text-[11px] text-fg-muted font-mono">{c.hash?.slice(0,7)} {c.author && `• ${c.author}`}</div>
+              {history.map((c: any, i: number) => {
+                const prev = history[i + 1]?.hash;
+                return (
+                  <div key={c.hash || i} className="flex items-center justify-between rounded-xs border border-border-subtle bg-surface px-2.5 py-1.5">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-xs font-mono text-fg truncate">{c.message || c.hash?.slice(0,7)}</div>
+                      <div className="text-[11px] text-fg-muted font-mono">{c.hash?.slice(0,7)} {c.author && `• ${c.author}`}</div>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0 ml-2">
+                      <a
+                        href={owner && repo ? `/${owner}/${repo}/commit/${c.hash}` : "#"}
+                        className="px-2 py-1 text-[11px] font-mono border border-border-subtle rounded-sm bg-bg-subtle hover:bg-surface-hover text-fg"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        View
+                      </a>
+                      {prev && owner && repo && (
+                        <a
+                          href={`/${owner}/${repo}/compare/${prev}...${c.hash}`}
+                          className="px-2 py-1 text-[11px] font-mono border border-accent/30 rounded-sm bg-accent-subtle hover:bg-accent/20 text-accent"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          Diff
+                        </a>
+                      )}
+                      <Clock className="h-3 w-3 text-fg-subtle shrink-0" />
+                    </div>
                   </div>
-                  <Clock className="h-3 w-3 text-fg-subtle shrink-0" />
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
