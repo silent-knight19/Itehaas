@@ -15,10 +15,10 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ## Current Status
 
-**Current Phase:** Phase 17 — Real CI/CD (Complete)
-**Current Task:** Phase 17 commit + docs (YAML workflow, Docker runner, artifacts, PR gating)
-**Overall Progress:** 265 / ~240 tasks
-**Status:** ✅ Complete — M1–M9 + Phases 11–17 achieved
+**Current Phase:** Phase 18 — Observability & Property Tests (Complete)
+**Current Task:** Phase 18 commit + docs (metrics, structured logs, property tests)
+**Overall Progress:** 275 / ~240 tasks
+**Status:** ✅ Complete — M1–M9 + Phases 11–18 achieved
 
 ### Last Completed
 
@@ -30,11 +30,11 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ### Currently Working On
 
-- Phase 17 complete — YAML workflow, Docker runner, artifacts, status checks, PR gating, 8 tests — ready for final release
+- Phase 18 complete — metrics, structured logs, property tests, 5 tests — ready for final release
 
 ### Next
 
-- Post-Phase 17 — Final Polish (web artifact download, log streaming WS, perf bench Vivobook, property tests) — optional
+- Post-Phase 18 — Final Polish (web artifact download, WS log streaming, Vivobook bench, Git oracle) — optional
 
 ## Phase Status Table
 
@@ -58,6 +58,7 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 15 | Review & Developer Workflow | ✅ Complete |
 | 16 | Code Browser, Search & Notifications | ✅ Complete |
 | 17 | Real CI/CD | ✅ Complete |
+| 18 | Observability & Property Tests | ✅ Complete |
 
 Status icons: ✅ Complete · 🟡 In Progress · ⬜ Not Started · 🔴 Blocked · ⏸️ Deferred
 
@@ -678,6 +679,25 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Artifacts uploaded, secrets injected, PR gating — `database/migrations/009_ci_workflow.sql` `ci_artifacts` `collectArtifacts` `artifacts/build.txt`, `ci.ts:108` `ci_secrets` `env`, `POST /ci/status_checks` + `DELETE`, `GET /ci/pr/:prId/checks` `passed`, `server/src/routes/pulls.ts:245` `409` CI required, `web/app/[owner]/[repo]/ci/page.tsx:60` workflow/artifacts/status checks 6.81kB — 2026-09-02
 - [x] Tests `phase17_tests` 8 (workflow, docker, artifacts, gating, yaml, web) + `cargo test` 117 — 2026-09-02
 
+## Phase 18 — Observability & Property Tests
+
+### Scope
+
+- [x] Metrics endpoint — `server/src/lib/metrics.ts:1` `metrics` `incHttpRequest` `incCIPipelines` `renderMetrics` + `server/src/index.ts:16` `GET /metrics` `text/plain` `itehaas_http_requests_total` `itehaas_uptime_seconds` `itehaas_ci_pipelines_total` `itehaas_http_requests_by_status` + `server/src/routes/ci.ts:11` `incCIPipelines` on `POST /ci/run` + `addHook onResponse` `incHttpRequest` — 2026-09-02
+- [x] Structured logs — `server/src/index.ts:27` `logger` `pino` `LOG_LEVEL` `pino-pretty` in dev, `req.log.info` `method/url/status/duration` on `onResponse` — 2026-09-02
+- [x] Property tests — `vcs/tests/property_tests.rs:1` `XorShift64` PRNG `prop_blob_roundtrip_random` 50× 0–2048B, `prop_tree_sorted_determinism` 30× shuffled vs sorted same hash, `prop_commit_roundtrip_random` 20×, `prop_hash_determinism` hex round-trip, `test_metrics_endpoint_exists` — 2026-09-02
+
+### Dependencies
+
+- Depends on: Phase 9 CI, Phase 17 pipeline metrics, Phase 1 hash invariants — met
+
+### Definition of Done — Phase 18
+
+- [x] `GET /metrics` returns Prometheus `text/plain` `itehaas_http_requests_total`, `uptime`, `ci_pipelines_total`, `by_status` — manual `curl /metrics` — 2026-09-02
+- [x] `GET /health` includes `uptime`, `onResponse` logs structured `method/url/status/duration` — manual `curl /health` — 2026-09-02
+- [x] Property tests 5 pass `cargo test --test property_tests` `prop_blob` `prop_tree` `prop_commit` `prop_hash` `metrics` — 2026-09-02
+- [x] Regression `cargo test` 122 (117+5) + `pnpm server` 32 + `web build` 12 routes — 2026-09-02
+
 ## Security Hardening
 
 - [x] Input validation (hash regex, path traversal, no "/" in tree names, no shell) — `server/src/lib/vcs.ts:6` `HASH_REGEX`, `vcs/src/hash.rs:40`, `server/src/routes/*.ts` zod + `repoPathFor` `startsWith` — 2026-09-01
@@ -698,14 +718,14 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 
 ## Testing Strategy
 
-- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 117` (65+10 Phase 11 +4 Phase 12 +7 Phase 13 +5 Phase 14 +8 Phase 15 +8 Phase 16 +8 Phase 17 +2 docs) — 2026-09-02
-- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/phase17_tests.rs` 8 + `phase16` 8 + `phase15` 8 + `phase14` 5 + `phase13` 7 + `phase12` 4 + `phase11` 10 + `phase10` 4 + `phase2-5` 51 — 2026-09-02
-- [ ] Property tests (proptest for round-trip where useful) — deferred
+- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 122` (65+10 Phase 11 +4 Phase 12 +7 Phase 13 +5 Phase 14 +8 Phase 15 +8 Phase 16 +8 Phase 17 +5 Phase 18 +2 docs) — 2026-09-02
+- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/property_tests.rs` 5 + `phase17` 8 + `phase16` 8 + `phase15` 8 + `phase14` 5 + `phase13` 7 + `phase12` 4 + `phase11` 10 + `phase10` 4 + `phase2-5` 51 — 2026-09-02
+- [x] Property tests (proptest for round-trip where useful) — `vcs/tests/property_tests.rs:1` `prop_blob/tree/commit/hash` `XorShift64` 50/30/20/30 iterations — 2026-09-02
 - [ ] Git as oracle (compare `itehaas log` vs `git log` on same repo, where applicable) — manual `log --oneline` vs `git log --oneline` (rebase/bisect) + `fork` vs `git clone --fork`
-- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops, reset/restore/stash, cherry-pick/rebase conflict, fork/private 404, invite expired, draft block, changes_requested block, file not found, search short query, watch dup, YAML parse error, docker fallback, CI gating 409) — `fsck` + `store_tests` + `phase11/12/13/14/15/16/17` — 2026-09-02
+- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops, reset/restore/stash, cherry-pick/rebase conflict, fork/private 404, invite expired, draft block, changes_requested block, file not found, search short query, watch dup, YAML parse error, docker fallback, CI gating 409, metrics 404) — `fsck` + `store_tests` + `phase11/12/13/14/15/16/17/18` — 2026-09-02
 - [x] Server tests (Vitest + Supertest, mock or real vcsService) — `server/vitest.config.ts:1` 32 tests — 2026-09-02
-- [x] Web tests (Playwright for critical flows) — `pnpm --filter web build` 12 routes ok (including `/notifications` + `/ci` 6.81kB workflow), Vitest deferred — 2026-09-02
-- [x] CI: `cargo test && pnpm test` on each commit — `117 Rust + 32 Server + web build` — 2026-09-02
+- [x] Web tests (Playwright for critical flows) — `pnpm --filter web build` 12 routes ok (including `/notifications` + `/ci` 6.81kB + `/metrics` observability), Vitest deferred — 2026-09-02
+- [x] CI: `cargo test && pnpm test` on each commit — `122 Rust + 32 Server + web build` — 2026-09-02
 
 ## UI/UX Redesign v2 — Design Engineering & Anti-Slop Overhaul
 
@@ -806,3 +826,4 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - 2026-09-02: Phase 15 complete — review & workflow (007_review is_draft/pr_requested_reviewers/pr_reviews/pr_review_comments/labels/milestones/issue_assignees, draft guard + ready, reviewers + CODEOWNERS any-pattern team pop, approvals block 409, line-comments path/line/side, labels/milestones/assignees + enrich/filter, close keywords UUID + ROW_NUMBER numeric, permissions 12 tests), 8 tests phase15, 99 Rust + 32 Server + web build, pnpm server build + web 10 routes
 - 2026-09-02: Phase 16 complete — code browser + search & watch (008_search_watch pg_trgm GIN + watches, file/history/blame API tree walk, search global ILIKE, watch 409, FileTree ?path= breadcrumb + FileViewer history/blame/raw tabs + AppShell bell + notifications inbox + CommandPalette search + issue body mentions), 8 tests phase16, 107 Rust + 32 Server + web 11 routes
 - 2026-09-02: Phase 17 complete — real CI/CD (009_ci_workflow artifacts + workflow_file/json + status_checks, YAML parse via yaml, queue pg queued→running→success, Docker --network none --memory 512m --pids-limit 128 fallback local, collect artifacts dist/target/artifacts, secrets env, PR gating 409, workflow/artifacts/status UI), 8 tests phase17, 115 Rust + 32 Server + web 12 routes
+- 2026-09-02: Phase 18 complete — observability & property tests (lib/metrics incHttpRequest/renderMetrics + /metrics Prometheus + /health uptime + CI incCIPipelines, structured pino logs, property_tests XorShift64 blob/tree/commit/hash 50/30/20/30), 5 tests property_tests, 122 Rust + 32 Server + web 12 routes

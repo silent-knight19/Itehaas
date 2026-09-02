@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import * as yaml from 'yaml';
+import { incCIPipelines } from '../lib/metrics';
 
 function validateOwnerRepo(o: string, r: string) {
   return /^[a-zA-Z0-9._-]{1,100}$/.test(o) && /^[a-zA-Z0-9._-]{1,100}$/.test(r);
@@ -338,6 +339,7 @@ export async function ciRoutes(app: FastifyInstance) {
 
     const pipeRes = await query(`INSERT INTO ci_pipelines (repo_id, ref, commit_hash, created_by, workflow_file, workflow_json, branch) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, status, created_at`, [meta.id, ref, commitHash, user.id, workflow.file, workflow as any, ref]);
     const pipelineId = pipeRes.rows[0].id;
+    incCIPipelines();
 
     // Create jobs from workflow
     for (const job of workflow.jobs) {

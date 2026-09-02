@@ -12,10 +12,14 @@ import { userRoutes } from './routes/users';
 import { orgRoutes } from './routes/orgs';
 import { inviteRoutes } from './routes/invites';
 import { searchRoutes } from './routes/search';
+import { metrics, incHttpRequest, renderMetrics } from './lib/metrics';
 
 async function buildApp() {
   const app = Fastify({
-    logger: true,
+    logger: {
+      level: process.env.LOG_LEVEL || 'info',
+      transport: process.env.NODE_ENV === 'development' ? { target: 'pino-pretty' } : undefined,
+    },
   });
 
   await app.register(fastifyCookie);
@@ -24,7 +28,19 @@ async function buildApp() {
     credentials: true,
   });
 
-  app.get('/health', async () => ({ ok: true, version: '0.1.0' }));
+  // Metrics hook: count requests + structured log
+  app.addHook('onResponse', async (req, reply) => {
+    incHttpRequest(req.method, reply.statusCode);
+    req.log.info({ method: req.method, url: req.url, status: reply.statusCode, duration: reply.elapsedTime }, 'request completed');
+  });
+
+  app.get('/health', async () => ({ ok: true, version: '0.1.0', uptime: Math.round((Date.now() - metrics.startTime)/1000) }));
+
+  app.get('/metrics', async (_req, reply) => {
+    const out = renderMetrics();
+    reply.header('Content-Type', 'text/plain; version=0.0.4');
+    return reply.send(out);
+  });
 
   await app.register(authRoutes);
   await app.register(repoRoutes);
