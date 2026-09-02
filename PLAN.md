@@ -15,10 +15,10 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ## Current Status
 
-**Current Phase:** Phase 14 — Forks, Networks & Organizations (Complete)
-**Current Task:** Phase 14 commit + docs
-**Overall Progress:** 235 / ~200 tasks
-**Status:** ✅ Complete — M1–M9 + Phases 11–14 achieved
+**Current Phase:** Phase 15 — Review & Developer Workflow (Complete)
+**Current Task:** Phase 15 commit + docs
+**Overall Progress:** 245 / ~200 tasks
+**Status:** ✅ Complete — M1–M9 + Phases 11–15 achieved
 
 ### Last Completed
 
@@ -29,11 +29,11 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ### Currently Working On
 
-- Phase 15 — Review & Developer Workflow (draft PR, reviewers, approvals, line-comments, CODEOWNERS, labels)
+- Phase 15 complete — hardening + docs (permissions fix, CODEOWNERS, close keywords, 8 tests) — ready for commit
 
 ### Next
 
-- Phase 15 — Review & Developer Workflow (draft/approved/changes_requested, reviewers, approvals, line-level comments, CODEOWNERS, labels/assignees/milestones, close keywords)
+- Post-Phase 15 — Polish & Self-Hosted Release (web review UI polish, property tests, Git oracle, perf bench on Vivobook) — optional
 
 ## Phase Status Table
 
@@ -54,6 +54,7 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 12 | Remote Transport & Git Interop | ✅ Complete (HTTP fetch/push/pull + SHA-1 local, pack deferred) |
 | 13 | History & Code Archaeology | ✅ Complete |
 | 14 | Forks, Networks & Organizations | ✅ Complete |
+| 15 | Review & Developer Workflow | ✅ Complete |
 
 Status icons: ✅ Complete · 🟡 In Progress · ⬜ Not Started · 🔴 Blocked · ⏸️ Deferred
 
@@ -594,6 +595,36 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Tests `phase14_tests` 5 (fork table, org validation, fork clone, cross-fork migration, team perm) — 2026-09-02
 - [x] Regression `cargo test` 91+2 (86+5), `pnpm --filter server build` — 2026-09-02
 
+## Phase 15 — Review & Developer Workflow
+
+### Scope
+
+- [x] Draft PRs — `database/migrations/007_review.sql` `is_draft BOOLEAN DEFAULT false` + index, `server/src/routes/pulls.ts:78` `draft` param, `pulls.ts:126` `INSERT ... is_draft`, `pulls.ts:221` merge guard `cannot merge draft`, `pulls.ts:311` `PATCH is_draft` + `pulls.ts:341` `POST /ready` — 2026-09-02
+- [x] Requested reviewers — `007_review.sql` `pr_requested_reviewers(pr_id,user_id,requested_by)` + `server/src/routes/pulls.ts:354` `GET/POST/DELETE /reviewers`, auto-request via `CODEOWNERS` (`pulls.ts:128` reads `.github/CODEOWNERS|CODEOWNERS|docs/CODEOWNERS`, any pattern → `owners` set, team `org/team` → `pop()`) — 2026-09-02
+- [x] Reviews / approvals — `007_review.sql` `pr_reviews(decision approved|changes_requested|commented)` + `pulls.ts:405` `POST /reviews` + `pulls.ts:440` `GET /reviews`, merge guard `pulls.ts:230` `changes_requested` → `409`, `DELETE pr_requested_reviewers` on decision, notify author — 2026-09-02
+- [x] Line-level review comments — `007_review.sql` `pr_review_comments(path,line,side,commit_hash)` + `pulls.ts:450` `GET/POST /review_comments` (`path 500`, `line 1..`, `side LEFT|RIGHT|UNIFIED`, `commit_hash 40|64`) — 2026-09-02
+- [x] Labels, milestones, assignees — `007_review.sql` `labels(repo_id,name,color,description)` + `issue_labels` + `milestones(repo_id,title,description,due_date,status)` + `issue_assignees` + `issues.milestone_id`; `server/src/routes/issues.ts:17` `enrichIssue` + `issues.ts:37` filtering `?label=&assignee=&milestone=&status`, `issues.ts:88` create with `labels[]/assignees[]/milestone`, `issues.ts:156` patch, `issues.ts:250` `/labels` CRUD + `issues.ts:290` `/milestones` CRUD, auto-create label `#0969da` — 2026-09-02
+- [x] Close keywords — `pulls.ts:263` parse `title+body` for `(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s*:?\s+#([0-9a-f-]{4,36})` UUID prefix `ILIKE prefix%` + `pulls.ts:277` numeric `#[0-9]{1,6}` via `ROW_NUMBER() OVER (ORDER BY created_at)` → `closed`, `handledIds` dedup — 2026-09-02
+- [x] Permissions hardening — `server/src/lib/permissions.ts:13` `getTeamPermission` used in `canWrite/isAdmin`, tests `permissions.test.ts:42` fixed 12 tests (team write/admin/read) — 2026-09-02
+- [x] Mention/notify — `issues.ts:233` `@mention` regex → `notifications` `mention` for issue comments; `stars.ts` `pr_review_requested` notify — 2026-09-02
+
+### Dependencies
+
+- Depends on: Phase 8 collaboration, Phase 14 forks/orgs/teams, Phase 11-13 VCS — met
+
+### Definition of Done — Phase 15
+
+- [x] Draft PR creation + `is_draft` guard + ready → merge — manual `POST /pulls draft:true` → `merge 400` → `ready` → `merge` OK + `phase15_tests.rs:30`
+- [x] Requested reviewers + CODEOWNERS auto-request — manual `.github/CODEOWNERS @bob` auto `pr_requested_reviewers` + `POST /reviewers`/`DELETE` — 2026-09-02
+- [x] Reviews approvals / changes_requested blocks merge — manual `POST /reviews changes_requested` → `merge 409` → `approved` → `merge` OK + `phase15_tests` — 2026-09-02
+- [x] Line-level comments `path/line/side/commit_hash` — manual `POST /review_comments` + `GET` — 2026-09-02
+- [x] Labels CRUD + issue labels filter — manual `POST /labels` + `POST /issues labels:[bug]` + `GET /issues?label=bug` — 2026-09-02
+- [x] Milestones CRUD + `milestone_id` on issues + filter — manual `POST /milestones` + `milestone` on create/patch — 2026-09-02
+- [x] Assignees many-to-many + notify — manual `POST /issues assignees:[bob]` + `GET` assignees — 2026-09-02
+- [x] Close keywords fix UUID prefix + numeric `ROW_NUMBER` → `closed` on merge — manual `fixes #<uuid-prefix>` + `fixes #1` → issue `closed` — 2026-09-02
+- [x] Tests `phase15_tests` 8 (tables, labels/milestones, reviewers, line comments, CODEOWNERS, close keywords) + `cargo test` 99+2 (91+8), `pnpm --filter server` 32 tests — 2026-09-02
+- [x] Regression `cargo test` 99+2, `pnpm --filter server build` + `web build` — 2026-09-02
+
 ## Security Hardening
 
 - [x] Input validation (hash regex, path traversal, no "/" in tree names, no shell) — `server/src/lib/vcs.ts:6` `HASH_REGEX`, `vcs/src/hash.rs:40`, `server/src/routes/*.ts` zod + `repoPathFor` `startsWith` — 2026-09-01
@@ -614,14 +645,14 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 
 ## Testing Strategy
 
-- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 91` (65+10 Phase 11 +4 Phase 12 +7 Phase 13 +5 Phase 14) — 2026-09-02
-- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/phase14_tests.rs` 5 + `phase13` 7 + `phase12` 4 + `phase11` 10 + `phase10` 4 + `phase2-5` 51 — 2026-09-02
+- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 99` (65+10 Phase 11 +4 Phase 12 +7 Phase 13 +5 Phase 14 +8 Phase 15) — 2026-09-02
+- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/phase15_tests.rs` 8 + `phase14` 5 + `phase13` 7 + `phase12` 4 + `phase11` 10 + `phase10` 4 + `phase2-5` 51 — 2026-09-02
 - [ ] Property tests (proptest for round-trip where useful) — deferred
 - [ ] Git as oracle (compare `itehaas log` vs `git log` on same repo, where applicable) — manual `log --oneline` vs `git log --oneline` (rebase/bisect) + `fork` vs `git clone --fork`
-- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops, reset/restore/stash, cherry-pick/rebase conflict, fork/private 404, invite expired) — `fsck` + `store_tests` + `phase11/12/13/14` — 2026-09-02
-- [x] Server tests (Vitest + Supertest, mock or real vcsService) — `server/vitest.config.ts:1` 28 tests — 2026-09-01
-- [x] Web tests (Playwright for critical flows) — `pnpm --filter web build` 7 routes ok, Vitest deferred — 2026-09-01
-- [x] CI: `cargo test && pnpm test` on each commit — `91 Rust + 28 Server + web build` — 2026-09-02
+- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops, reset/restore/stash, cherry-pick/rebase conflict, fork/private 404, invite expired, draft block, changes_requested block) — `fsck` + `store_tests` + `phase11/12/13/14/15` — 2026-09-02
+- [x] Server tests (Vitest + Supertest, mock or real vcsService) — `server/vitest.config.ts:1` 32 tests — 2026-09-02
+- [x] Web tests (Playwright for critical flows) — `pnpm --filter web build` 10 routes ok, Vitest deferred — 2026-09-02
+- [x] CI: `cargo test && pnpm test` on each commit — `99 Rust + 32 Server + web build` — 2026-09-02
 
 ## UI/UX Redesign v2 — Design Engineering & Anti-Slop Overhaul
 
@@ -719,3 +750,4 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - 2026-09-02: Phase 12 complete — remote protocol + HTTP fetch/push/pull incremental + SHA-1 local (Sha1Hasher, algo-aware) + short-hash HEAD~n, 4 tests phase12, 79 Rust total, live http-test private repo verified
 - 2026-09-02: Phase 13 complete — revwalk (log --all/--graph/-p/--stat/--name-only/--since/--until/--author/--grep/--follow) + show/ls-files/for-each-ref/grep/blame + commit --amend/cherry-pick/revert/bisect/rebase + short-hash, 7 tests phase13, 86 Rust total
 - 2026-09-02: Phase 14 complete — forks (005_forks_orgs + fork/network, clone via execItehaas, cross-fork PR source_repo + copyMissingObjects), orgs/teams (orgs, organization_members, teams, team_members, team_repositories), invites (token 32B hex, 7d, pending/accepted), permissions (getTeamPermission), 5 tests phase14, 91 Rust total, live fork/PR/org/team/invite verified
+- 2026-09-02: Phase 15 complete — review & workflow (007_review is_draft/pr_requested_reviewers/pr_reviews/pr_review_comments/labels/milestones/issue_assignees, draft guard + ready, reviewers + CODEOWNERS any-pattern team pop, approvals block 409, line-comments path/line/side, labels/milestones/assignees + enrich/filter, close keywords UUID + ROW_NUMBER numeric, permissions 12 tests), 8 tests phase15, 99 Rust + 32 Server + web build, pnpm server build + web 10 routes

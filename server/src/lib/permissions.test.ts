@@ -42,7 +42,8 @@ describe('permissions', () => {
   it('canWrite member read false', async () => {
     mockQuery
       .mockResolvedValueOnce({ rows: [{ owner_id: 'other' }] })
-      .mockResolvedValueOnce({ rows: [{ role: 'read' }] });
+      .mockResolvedValueOnce({ rows: [{ role: 'read' }] })
+      .mockResolvedValueOnce({ rows: [] });
     expect(await canWrite('repo-id', 'user-2')).toBe(false);
   });
 
@@ -56,7 +57,40 @@ describe('permissions', () => {
   it('isAdmin read false', async () => {
     mockQuery
       .mockResolvedValueOnce({ rows: [{ owner_id: 'other' }] })
-      .mockResolvedValueOnce({ rows: [{ role: 'read' }] });
+      .mockResolvedValueOnce({ rows: [{ role: 'read' }] })
+      .mockResolvedValueOnce({ rows: [] });
     expect(await isAdmin('repo-id', 'user-2')).toBe(false);
+  });
+
+  it('canWrite via team write true', async () => {
+    mockQuery
+      .mockResolvedValueOnce({ rows: [{ owner_id: 'other' }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ permission: 'write' }] });
+    expect(await canWrite('repo-id', 'user-2')).toBe(true);
+  });
+
+  it('canWrite via team read false', async () => {
+    mockQuery
+      .mockResolvedValueOnce({ rows: [{ owner_id: 'other' }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ permission: 'read' }] });
+    expect(await canWrite('repo-id', 'user-2')).toBe(false);
+  });
+
+  it('isAdmin via team admin true', async () => {
+    mockQuery
+      .mockResolvedValueOnce({ rows: [{ owner_id: 'other' }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ permission: 'admin' }] });
+    expect(await isAdmin('repo-id', 'user-2')).toBe(true);
+  });
+
+  it('canRead via team read true', async () => {
+    mockQuery
+      .mockResolvedValueOnce({ rows: [{ owner_id: 'other' }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ permission: 'read' }] });
+    expect(await canRead('repo-id', 'user-2', 'private')).toBe(true);
   });
 });
