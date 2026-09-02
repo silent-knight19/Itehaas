@@ -15,25 +15,25 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ## Current Status
 
-**Current Phase:** Phase 13 — History & Code Archaeology (Complete)
-**Current Task:** Phase 13 commit + docs
-**Overall Progress:** 210 / ~180 tasks
-**Status:** ✅ Complete — M1–M9 + Phases 11–13 achieved
+**Current Phase:** Phase 14 — Forks, Networks & Organizations (Complete)
+**Current Task:** Phase 14 commit + docs
+**Overall Progress:** 235 / ~200 tasks
+**Status:** ✅ Complete — M1–M9 + Phases 11–14 achieved
 
 ### Last Completed
 
-- Phase 10 complete: `vcs/src/pack.rs` `pack` + `verify_pack` + `list_packs`, `vcs/src/gc.rs` reachable BFS + prune, `vcs/src/fsck.rs` `fsck` + `count_objects`, CLI `fsck|gc|pack|count-objects` (`vcs/src/main.rs:520`), `vcs/tests/phase10_tests.rs` 4 tests (fsck ok, gc unreachable, pack verify, count), `docs/vcs-advanced.md` + `docs/ci.md` + `docs/collaboration.md`
 - Phase 11 complete: `vcs/src/reflog.rs` (logs/HEAD + logs/refs/heads/*, record on commit/checkout/reset), `vcs/src/reset.rs` (--soft/--mixed/--hard + paths), `vcs/src/restore.rs` (--staged/--worktree/--source), `vcs/src/ignore.rs` (.itehaasignore+.gitignore, `*`/`?`/`**`/`!`/`/`), `vcs/src/stash.rs` (refs/stash + stash_list, push/pop/apply/list/show/clear/drop), tag CLI (lightweight/annotated), branch -a/-r/-m, rm/mv/clean, `itehaas reflog`, 10 tests `phase11_tests.rs`, `cargo test` 75+2
 - Phase 12 complete: `docs/remote-protocol.md` (refs discovery, negotiation, object/pack, auth, FF, lock), `vcs/src/remote/http.rs` (`http_fetch` incremental 6 vs 0, `upload_object_http`, `http_push` missing-set, `update_remote_ref_http` 409/423), `server/src/routes/repos.ts` (POST /objects/:hash 64M + verify, POST /refs/heads/* atomic CAS + isAncestor + 423 lock + reflog), HTTP clone+fetch+push+pull verified (`http-test` private), SHA-1 mode local (`Sha1Hasher` + `hash.rs`, `object/mod.rs` algo-aware, `init --algo sha1` 40-char), short-hash `resolve_rev` (`HEAD~n` + prefix 7+), 4 tests `phase12_tests.rs`
 - Phase 13 complete: `vcs/src/revwalk.rs` (walk_log --all/--graph/-p/--stat/--name-only/--since/--until/--author/--grep/--follow, `format_stat`, `parse_date` chrono), `vcs/src/blame.rs` (line blame via diff), `vcs/src/hash.rs` `resolve_short_hash`, `vcs/src/refs.rs` `HEAD~n` + short, `vcs/src/main.rs` `commit --amend`, `show`, `ls-files`, `for-each-ref`, `grep`, `blame`, `cherry-pick`/`revert` (inverse diff, conflict markers, `CHERRY_PICK_HEAD`), `bisect` (BISECT_*), `rebase` (rebase-merge, --abort/--continue, todo), 7 tests `phase13_tests.rs`, `cargo test` 86+2
+- Phase 14 complete: `database/migrations/005_forks_orgs.sql` (organizations/organization_members/teams/team_members/team_repositories/forks/invites), `006_pr_fork.sql` (source_repo_id), `server/src/lib/permissions.ts` (`getTeamPermission` + `canRead/canWrite/isAdmin` team check), `server/src/routes/repos.ts` (POST /fork + GET /forks/network, FS clone via `execItehaas clone` + `forks` DB), `server/src/routes/pulls.ts` (source_repo + `copyMissingObjects` + `fork/owner/branch` ref), `server/src/routes/orgs.ts` (POST/GET orgs, members, teams, team members/repos), `server/src/routes/invites.ts` (org/repo/team invites + accept/reject token), 5 tests `phase14_tests.rs` + manual cross-fork PR (`fork/bob_fork/feature_fork` → `main` fast-forward) + org/team/invite flow
 
 ### Currently Working On
 
-- Phase 14 design (forks, orgs, teams)
+- Phase 15 — Review & Developer Workflow (draft PR, reviewers, approvals, line-comments, CODEOWNERS, labels)
 
 ### Next
 
-- Phase 14 — Forks, Networks & Organizations (fork/network, cross-fork PR, orgs/teams/invites, fine-grained perms)
+- Phase 15 — Review & Developer Workflow (draft/approved/changes_requested, reviewers, approvals, line-level comments, CODEOWNERS, labels/assignees/milestones, close keywords)
 
 ## Phase Status Table
 
@@ -53,6 +53,7 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 11 | VCS Recovery & Daily-Use | ✅ Complete |
 | 12 | Remote Transport & Git Interop | ✅ Complete (HTTP fetch/push/pull + SHA-1 local, pack deferred) |
 | 13 | History & Code Archaeology | ✅ Complete |
+| 14 | Forks, Networks & Organizations | ✅ Complete |
 
 Status icons: ✅ Complete · 🟡 In Progress · ⬜ Not Started · 🔴 Blocked · ⏸️ Deferred
 
@@ -566,6 +567,33 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Short-hash + HEAD~n + conflict continue/abort tested — manual `revert` short + `rebase` conflict — 2026-09-02
 - [x] Tests `phase13_tests` 7 + `cargo test` 86+2 — 2026-09-02
 
+## Phase 14 — Forks, Networks & Organizations
+
+### Scope
+
+- [x] Forks DB — `database/migrations/005_forks_orgs.sql` (organizations/organization_members/teams/team_members/team_repositories/forks/invites) + `006_pr_fork.sql` (source_repo_id) — 2026-09-02
+- [x] Fork endpoint — `server/src/routes/repos.ts:215` `POST /fork` (canRead upstream, `BEGIN` tx `repositories`+`repository_members`+`forks`, `execItehaas clone` upstream→fork, 409 already forked) + `GET /forks` + `GET /network` (upstream + forks) — 2026-09-02
+- [x] Cross-fork PR — `server/src/routes/pulls.ts:31` `source_repo` `owner/repo` + `copyMissingObjects` (walk `objects/*/*` copy missing), `fork/<owner>/<branch>` ref in target, `source_repo_id` column — 2026-09-02
+- [x] Organizations + Teams — `server/src/routes/orgs.ts:1` (POST/GET `orgs`, `orgs/:org/members`, `orgs/:org/teams`, `teams/:team/members`, `teams/:team/repos` permission `read/write/admin`, `GET /orgs` list) — 2026-09-02
+- [x] Invites — `server/src/routes/invites.ts:1` (POST `orgs/:org/invites`, `repos/:owner/:repo/invites`, `orgs/:org/teams/:team/invites`, `GET /invites` pending, `POST /invites/:token/accept`/`reject` + `organization_members`/`team_members`/`repository_members` + `expires_at` 7d) — 2026-09-02
+- [x] Permission centralization — `server/src/lib/permissions.ts:1` `getTeamPermission` (`team_members` JOIN `team_repositories` max `read<write<admin`), `canRead`/`canWrite`/`isAdmin` check owner→direct→team — 2026-09-02
+
+### Dependencies
+
+- Depends on: Phase 8 collaboration, Phase 12 HTTP, Phase 11 branch — met
+
+### Definition of Done — Phase 14
+
+- [x] Fork creation + network — manual `fork` bob_fork/http-test + `forks`/`network` lists — 2026-09-02
+- [x] Cross-fork PR (fork/bob_fork/feature_fork → main, `copyMissingObjects`, `fork/` branch, diff + merge fast-forward) — manual PR `456e2d97` — 2026-09-02
+- [x] Organizations (create acme, members bob/charlie) — manual `POST /orgs` + `members` — 2026-09-02
+- [x] Teams (devs, members bob/charlie, repos permission write) — manual `POST /teams` + `members` + `repos` — 2026-09-02
+- [x] Team permission (bob via team write can `POST /issues` on alice private) — manual `Team issue` — 2026-09-02
+- [x] Invites (org/repo/team, token 32B hex, 7d, accept adds member) — manual `invite charlie` org+repo+team — 2026-09-02
+- [x] Fork network security (private upstream requires canRead, 404-mask) — manual public/private — 2026-09-02
+- [x] Tests `phase14_tests` 5 (fork table, org validation, fork clone, cross-fork migration, team perm) — 2026-09-02
+- [x] Regression `cargo test` 91+2 (86+5), `pnpm --filter server build` — 2026-09-02
+
 ## Security Hardening
 
 - [x] Input validation (hash regex, path traversal, no "/" in tree names, no shell) — `server/src/lib/vcs.ts:6` `HASH_REGEX`, `vcs/src/hash.rs:40`, `server/src/routes/*.ts` zod + `repoPathFor` `startsWith` — 2026-09-01
@@ -586,14 +614,14 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 
 ## Testing Strategy
 
-- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 86` (65+10 Phase 11 +4 Phase 12 +7 Phase 13) — 2026-09-02
-- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/phase13_tests.rs` 7 + `phase12` 4 + `phase11` 10 + `phase10` 4 + `phase2-5` 51 — 2026-09-02
+- [x] Rust unit tests (hash, object parsing, tree sort, commit order) — `cargo test 91` (65+10 Phase 11 +4 Phase 12 +7 Phase 13 +5 Phase 14) — 2026-09-02
+- [x] Rust integration tests (tempfile repos, write→read, merge, corruption, concurrency) — `vcs/tests/phase14_tests.rs` 5 + `phase13` 7 + `phase12` 4 + `phase11` 10 + `phase10` 4 + `phase2-5` 51 — 2026-09-02
 - [ ] Property tests (proptest for round-trip where useful) — deferred
-- [ ] Git as oracle (compare `itehaas log` vs `git log` on same repo, where applicable) — manual `log --oneline` vs `git log --oneline` on same repo (rebase/bisect)
-- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops, reset/restore/stash, cherry-pick/rebase conflict) — `fsck` + `store_tests` + `phase11/12/13` — 2026-09-02
+- [ ] Git as oracle (compare `itehaas log` vs `git log` on same repo, where applicable) — manual `log --oneline` vs `git log --oneline` (rebase/bisect) + `fork` vs `git clone --fork`
+- [x] Failure cases (corrupt object, invalid commit, missing parent, merge conflict, missing object, concurrent ops, reset/restore/stash, cherry-pick/rebase conflict, fork/private 404, invite expired) — `fsck` + `store_tests` + `phase11/12/13/14` — 2026-09-02
 - [x] Server tests (Vitest + Supertest, mock or real vcsService) — `server/vitest.config.ts:1` 28 tests — 2026-09-01
 - [x] Web tests (Playwright for critical flows) — `pnpm --filter web build` 7 routes ok, Vitest deferred — 2026-09-01
-- [x] CI: `cargo test && pnpm test` on each commit — `86 Rust + 28 Server + web build` — 2026-09-02
+- [x] CI: `cargo test && pnpm test` on each commit — `91 Rust + 28 Server + web build` — 2026-09-02
 
 ## UI/UX Redesign v2 — Design Engineering & Anti-Slop Overhaul
 
@@ -690,3 +718,4 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - 2026-09-02: Phase 11 complete — reflog+reset/restore/rm/mv/clean/stash/tags/branch -a/-r/-m/ignore, 10 tests phase11, 75 Rust total, manual reflog+stash+ignore verified, PLAN.md updated
 - 2026-09-02: Phase 12 complete — remote protocol + HTTP fetch/push/pull incremental + SHA-1 local (Sha1Hasher, algo-aware) + short-hash HEAD~n, 4 tests phase12, 79 Rust total, live http-test private repo verified
 - 2026-09-02: Phase 13 complete — revwalk (log --all/--graph/-p/--stat/--name-only/--since/--until/--author/--grep/--follow) + show/ls-files/for-each-ref/grep/blame + commit --amend/cherry-pick/revert/bisect/rebase + short-hash, 7 tests phase13, 86 Rust total
+- 2026-09-02: Phase 14 complete — forks (005_forks_orgs + fork/network, clone via execItehaas, cross-fork PR source_repo + copyMissingObjects), orgs/teams (orgs, organization_members, teams, team_members, team_repositories), invites (token 32B hex, 7d, pending/accepted), permissions (getTeamPermission), 5 tests phase14, 91 Rust total, live fork/PR/org/team/invite verified

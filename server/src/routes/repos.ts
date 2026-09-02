@@ -212,6 +212,134 @@ export async function repoRoutes(app: FastifyInstance) {
     return reply.send({ ok: true });
   });
 
+  // Fork: create fork under current user (requires read on upstream)
+  app.post('/api/repos/:owner/:repo/fork', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+
+    const upstreamRes = await query(
+      `SELECT r.id, r.name, r.description, r.visibility, r.default_branch, r.owner_id, u.username as owner_name
+       FROM repositories r JOIN users u ON r.owner_id = u.id WHERE u.username = $1 AND r.name = $2`,
+      [owner, repo]
+    );
+    if (upstreamRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const upstream = upstreamRes.rows[0];
+    const upstreamId = upstream.id;
+    const upstreamName = upstream.name;
+
+    const can = await canRead(upstreamId, user.id, upstream.visibility);
+    if (!can) return reply.status(404).send({ error: 'not found' });
+
+    // Check if already forked by this user (same owner+name)
+    const existing = await query(
+      `SELECT r.id FROM repositories r WHERE r.owner_id = $1 AND r.name = $2`,
+      [user.id, upstreamName]
+    );
+    if (existing.rows.length > 0) {
+      // Check if this existing is already a fork of upstream
+      const forkCheck = await query(`SELECT id FROM forks WHERE upstream_repo_id = $1 AND fork_repo_id = $2`, [upstreamId, existing.rows[0].id]);
+      if (forkCheck.rows.length > 0) return reply.status(409).send({ error: 'already forked' });
+      // If user already has repo with same name but not a fork, still conflict per GitHub: fork would collide
+      return reply.status(409).send({ error: 'repository already exists' });
+    }
+
+    // Create fork repo DB entry
+    const client = await getClient();
+    let forkRepo: any = null;
+    try {
+      await client.query('BEGIN');
+      const repoRes = await client.query(
+        `INSERT INTO repositories (owner_id, name, description, visibility, default_branch) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, description, visibility, default_branch, created_at`,
+        [user.id, upstreamName, upstream.description ?? '', upstream.visibility, upstream.default_branch]
+      );
+      forkRepo = repoRes.rows[0];
+      await client.query(`INSERT INTO repository_members (repo_id, user_id, role) VALUES ($1, $2, 'admin')`, [forkRepo.id, user.id]);
+      await client.query(`INSERT INTO forks (upstream_repo_id, fork_repo_id, forked_by) VALUES ($1, $2, $3)`, [upstreamId, forkRepo.id, user.id]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    const upstreamPath = repoPathFor(upstream.owner_name, upstreamName);
+    const forkPath = repoPathFor(user.username, upstreamName);
+    try {
+      await fs.promises.mkdir(path.dirname(forkPath), { recursive: true });
+      const res = await execItehaas(['clone', upstreamPath, forkPath]);
+      if (res.code !== 0) {
+        // Cleanup DB on clone failure
+        await query(`DELETE FROM repositories WHERE id = $1`, [forkRepo.id]);
+        return reply.status(500).send({ error: `fork clone failed: ${res.stderr}` });
+      }
+    } catch (e: any) {
+      await query(`DELETE FROM repositories WHERE id = $1`, [forkRepo.id]);
+      return reply.status(500).send({ error: e.message });
+    }
+
+    return reply.status(201).send({ repo: { ...forkRepo, owner: user.username }, forked_from: { owner, repo: upstreamName } });
+  });
+
+  // List forks of a repo
+  app.get('/api/repos/:owner/:repo/forks', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const user = await getSessionUser(req as any);
+    const upstreamRes = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (upstreamRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const { id: upstreamId, visibility } = upstreamRes.rows[0];
+    if (!(await canRead(upstreamId, user?.id ?? null, visibility))) return reply.status(404).send({ error: 'not found' });
+
+    const forksRes = await query(
+      `SELECT r.id, r.name, r.description, r.visibility, r.updated_at, u.username as owner, f.created_at as forked_at
+       FROM forks f JOIN repositories r ON f.fork_repo_id = r.id JOIN users u ON r.owner_id = u.id
+       WHERE f.upstream_repo_id = $1 ORDER BY f.created_at DESC`,
+      [upstreamId]
+    );
+    return reply.send({ forks: forksRes.rows });
+  });
+
+  // Network: upstream + forks
+  app.get('/api/repos/:owner/:repo/network', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const user = await getSessionUser(req as any);
+    const repoRes = await query(`SELECT r.id, r.visibility, r.name FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (repoRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const { id: repoId, visibility, name } = repoRes.rows[0];
+    if (!(await canRead(repoId, user?.id ?? null, visibility))) return reply.status(404).send({ error: 'not found' });
+
+    // Check if this repo is itself a fork
+    const forkInfo = await query(`SELECT f.upstream_repo_id, r.name as upstream_name, u.username as upstream_owner FROM forks f JOIN repositories r ON f.upstream_repo_id = r.id JOIN users u ON r.owner_id = u.id WHERE f.fork_repo_id = $1`, [repoId]);
+    let upstream: any = null;
+    if (forkInfo.rows.length > 0) {
+      upstream = forkInfo.rows[0];
+    } else {
+      // Check if this repo is upstream (has forks) — for network we still want to show itself as upstream
+      const selfInfo = await query(`SELECT u.username as owner, r.name FROM repositories r JOIN users u ON r.owner_id=u.id WHERE r.id=$1`, [repoId]);
+      if (selfInfo.rows.length > 0) upstream = { upstream_owner: selfInfo.rows[0].owner, upstream_name: selfInfo.rows[0].name, upstream_repo_id: repoId };
+    }
+
+    // Get all forks of the ultimate upstream
+    let ultimateUpstreamId = forkInfo.rows[0]?.upstream_repo_id ?? repoId;
+    // If this repo is fork, ultimate is its upstream; else itself
+    // For network, we want all forks of ultimate + ultimate itself
+    const forksRes = await query(
+      `SELECT r.id, r.name, u.username as owner, f.created_at as forked_at
+       FROM forks f JOIN repositories r ON f.fork_repo_id = r.id JOIN users u ON r.owner_id = u.id
+       WHERE f.upstream_repo_id = $1 ORDER BY f.created_at`,
+      [ultimateUpstreamId]
+    );
+    // Get ultimate repo info
+    const ultimateRes = await query(`SELECT r.id, r.name, u.username as owner FROM repositories r JOIN users u ON r.owner_id=u.id WHERE r.id=$1`, [ultimateUpstreamId]);
+    const ultimate = ultimateRes.rows[0] ?? null;
+
+    return reply.send({ upstream: ultimate, forks: forksRes.rows, current: { owner, repo: name } });
+  });
+
   // Members: list
   app.get('/api/repos/:owner/:repo/members', async (req, reply) => {
     const { owner, repo } = req.params as any;
