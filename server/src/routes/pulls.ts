@@ -124,6 +124,13 @@ export async function pullRoutes(app: FastifyInstance) {
     }
 
     const res = await query(`INSERT INTO pull_requests (repo_id, author_id, title, body, source_branch, target_branch, source_repo_id, is_draft) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, title, status, source_branch, target_branch, is_draft, created_at`, [meta.id, user.id, title, body, effectiveSourceBranch, target_branch, sourceRepoId, isDraft]);
+    // Notify watchers
+    try {
+      const watchers = await query(`SELECT user_id FROM watches WHERE repo_id=$1 AND user_id != $2`, [meta.id, user.id]);
+      for (const w of watchers.rows) {
+        await query(`INSERT INTO notifications (user_id, type, payload) VALUES ($1,'pr_open',$2)`, [w.user_id, JSON.stringify({ repo: `${owner}/${repo}`, pr_id: res.rows[0].id, title, author: user.username })]);
+      }
+    } catch {}
     // CODEOWNERS auto-request (if not draft, or even for draft we still suggest)
     try {
       const codeownersPath = require('path').join(repoPath, '.github', 'CODEOWNERS');
@@ -324,6 +331,24 @@ export async function pullRoutes(app: FastifyInstance) {
     const exists = await query(`SELECT id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
     if (exists.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const res = await query(`INSERT INTO pr_comments (pr_id, author_id, body) VALUES ($1,$2,$3) RETURNING id, body, created_at`, [id, user.id, parsed.data.body]);
+    // Mentions
+    try {
+      const mentionRegex = /@([a-zA-Z0-9._-]{3,32})/g;
+      let m: any;
+      const body = parsed.data.body as string;
+      const seen = new Set<string>();
+      let match: RegExpExecArray | null;
+      const re = new RegExp(mentionRegex);
+      while ((match = re.exec(body)) !== null) {
+        const uname = match[1];
+        if (uname === user.username || seen.has(uname)) continue;
+        seen.add(uname);
+        const u = await query(`SELECT id FROM users WHERE username=$1`, [uname]);
+        if (u.rows.length > 0) {
+          try { await query(`INSERT INTO notifications (user_id, type, payload) VALUES ($1,'mention',$2)`, [u.rows[0].id, JSON.stringify({ repo: `${owner}/${repo}`, pr_id: id, by: user.username })]); } catch {}
+        }
+      }
+    } catch {}
     return reply.status(201).send({ comment: { ...res.rows[0], author: user.username } });
   });
 
@@ -497,6 +522,21 @@ export async function pullRoutes(app: FastifyInstance) {
     const prRes = await query(`SELECT id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
     if (prRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const res = await query(`INSERT INTO pr_review_comments (pr_id, author_id, body, path, line, side, commit_hash) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, body, path, line, side, commit_hash, created_at`, [id, user.id, body, filePath, line ?? null, side, commit_hash ?? null]);
+    try {
+      const mentionRegex = /@([a-zA-Z0-9._-]{3,32})/g;
+      const seen = new Set<string>();
+      let match: RegExpExecArray | null;
+      const re = new RegExp(mentionRegex);
+      while ((match = re.exec(body)) !== null) {
+        const uname = match[1];
+        if (uname === user.username || seen.has(uname)) continue;
+        seen.add(uname);
+        const u = await query(`SELECT id FROM users WHERE username=$1`, [uname]);
+        if (u.rows.length > 0) {
+          try { await query(`INSERT INTO notifications (user_id, type, payload) VALUES ($1,'mention',$2)`, [u.rows[0].id, JSON.stringify({ repo: `${owner}/${repo}`, pr_id: id, by: user.username })]); } catch {}
+        }
+      }
+    } catch {}
     return reply.status(201).send({ comment: { ...res.rows[0], author: user.username } });
   });
 }

@@ -779,7 +779,60 @@ export async function repoRoutes(app: FastifyInstance) {
     }
   });
 
-  // List branches via VCS (requires read)
+  // Watch / Unwatch
+  app.post('/api/repos/:owner/:repo/watch', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(r.rows[0].id, user.id, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+    try {
+      await query(`INSERT INTO watches (user_id, repo_id) VALUES ($1,$2)`, [user.id, r.rows[0].id]);
+    } catch (e: any) {
+      if (e.code === '23505') return reply.send({ ok: true, watching: true });
+      throw e;
+    }
+    return reply.send({ ok: true, watching: true });
+  });
+
+  app.delete('/api/repos/:owner/:repo/watch', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const r = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    await query(`DELETE FROM watches WHERE user_id=$1 AND repo_id=$2`, [user.id, r.rows[0].id]);
+    return reply.send({ ok: true, watching: false });
+  });
+
+  app.get('/api/repos/:owner/:repo/watch', async (req, reply) => {
+    const user = await getSessionUser(req as any);
+    if (!user) return reply.send({ watching: false });
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const r = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const res = await query(`SELECT 1 FROM watches WHERE user_id=$1 AND repo_id=$2`, [user.id, r.rows[0].id]);
+    return reply.send({ watching: res.rows.length > 0 });
+  });
+
+  app.get('/api/repos/:owner/:repo/watchers', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    const user = await getSessionUser(req as any);
+    if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+    const res = await query(`SELECT u.username FROM watches w JOIN users u ON w.user_id=u.id WHERE w.repo_id=$1`, [r.rows[0].id]);
+    return reply.send({ watchers: res.rows.map(r=>r.username), count: res.rows.length });
+  });
+
+  // List branches via VCS
+
+    // List branches via VCS (requires read)
   app.get('/api/repos/:owner/:repo/branches', async (req, reply) => {
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
@@ -897,13 +950,135 @@ export async function repoRoutes(app: FastifyInstance) {
   // Get file content at branch: GET /api/repos/:owner/:repo/file/*?ref=main
   app.get('/api/repos/:owner/:repo/file/*', async (req, reply) => {
     const { owner, repo } = req.params as any;
-    const wildcard = (req.params as any)['*'] as string | undefined;
+    const filePath = (req.params as any)['*'] as string;
+    const ref = (req.query as any)?.ref as string | undefined;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    if (!filePath) return reply.status(400).send({ error: 'path required' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility, r.default_branch FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+    const repoId = r.rows[0].id;
+    const branch = ref || r.rows[0].default_branch || 'main';
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    // Resolve branch to commit
+    const branchRes = await execItehaas(['branch'], { cwd: repoPath });
+    if (branchRes.code !== 0) return reply.status(404).send({ error: 'repo not initialized' });
+    const branches = branchRes.stdout.split('\n').map(l=>l.replace(/^\*\s*/, '').trim()).filter(Boolean);
+    // Allow any branch via read_ref, not just list
+    const hashRes = await execItehaas(['log', '--oneline', '--max-count', '1'], { cwd: repoPath });
+    // Use revwalk via execItehaas cat-file? Simpler: use `show` to get file
+    // Resolve branch hash via refs file
+    const refPath = require('path').join(repoPath, '.itehaas', 'refs', 'heads', ...branch.split('/'));
+    let commitHash: string | null = null;
+    try { commitHash = require('fs').readFileSync(refPath, 'utf8').trim(); } catch {
+      // Try via resolve HEAD if branch == HEAD
+      if (branch === 'HEAD') {
+        try { commitHash = require('fs').readFileSync(require('path').join(repoPath, '.itehaas', 'HEAD'), 'utf8').trim(); if (commitHash.startsWith('ref: ')) { const rp = commitHash.slice(5).trim(); commitHash = require('fs').readFileSync(require('path').join(repoPath, '.itehaas', rp), 'utf8').trim(); } } catch {}
+      }
+    }
+    if (!commitHash || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commitHash)) return reply.status(404).send({ error: 'branch not found' });
+    // Use itehaas show to get file? Instead use tree traversal via execItehaas
+    // We will use `cat-file -p` for commit to get tree, then walk
+    const commitRes = await execItehaas(['cat-file', '-p', commitHash], { cwd: repoPath });
+    if (commitRes.code !== 0) return reply.status(404).send({ error: 'commit not found' });
+    const treeMatch = commitRes.stdout.match(/^tree ([0-9a-f]{40,64})$/m);
+    if (!treeMatch) return reply.status(500).send({ error: 'invalid commit' });
+    const treeHash = treeMatch[1];
+    // Use itehaas cat-file to get tree and find file
+    // For simplicity, use `show` via `cat-file` recursion in JS? We'll use a helper that calls `execItehaas` with `ls-files` like logic: we can call `execItehaas(['cat-file', '-p', treeHash])` and parse, but need recursive.
+    // Instead, we can call our Rust helper via `execItehaas` with a custom command that we don't have. Simpler: use `node` to call `flame`? For MVP, we will use `execItehaas` with `show` that we can implement as `cat-file` for tree and then manually walk via JS using `execItehaas` recursively.
+    // For now, we will implement a simple file fetch via `execItehaas` with `show` that we add as `show` command that already prints file? But `show` prints commit diff, not file.
+    // Simpler: we will directly use `fs` to read the file from working tree if branch == current HEAD? But for historical branch, we need to read from objects.
+    // We will implement a helper that walks tree via `cat-file -p` recursively in JS.
+    async function findFileInTree(tHash: string, targetPath: string): Promise<string | null> {
+      const parts = targetPath.split('/').filter(Boolean);
+      let curTree = tHash;
+      for (let i = 0; i < parts.length; i++) {
+        const isLast = i === parts.length - 1;
+        const res = await execItehaas(['cat-file', '-p', curTree], { cwd: repoPath });
+        if (res.code !== 0) return null;
+        const lines = res.stdout.split('\n').filter(Boolean);
+        let found: { mode: string, hash: string, name: string } | null = null;
+        for (const line of lines) {
+          const m = line.match(/^(\d{5,6})\s+([0-9a-f]{40,64})\s+(.+)$/);
+          if (!m) continue;
+          const [, mode, hash, name] = m;
+          if (name === parts[i]) { found = { mode, hash, name }; break; }
+        }
+        if (!found) return null;
+        if (isLast) {
+          if (found.mode === '40000') return null; // is dir, not file
+          const blobRes = await execItehaas(['cat-file', '-p', found.hash], { cwd: repoPath });
+          if (blobRes.code !== 0) return null;
+          return blobRes.stdout;
+        } else {
+          if (found.mode !== '40000') return null;
+          curTree = found.hash;
+        }
+      }
+      return null;
+    }
+    const content = await findFileInTree(treeHash, filePath);
+    if (content === null) return reply.status(404).send({ error: 'file not found' });
+    // Detect binary
+    const isBinary = content.includes('\u0000') || /[\x00-\x08\x0E-\x1F]/.test(content.slice(0, 1000));
+    return reply.send({ path: filePath, ref: branch, commit: commitHash, content, isBinary, size: Buffer.byteLength(content) });
+  });
+
+  // File history: GET /api/repos/:owner/:repo/history/*?ref=main
+  app.get('/api/repos/:owner/:repo/history/*', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    const filePath = (req.params as any)['*'] as string;
+    const ref = (req.query as any)?.ref as string | undefined;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    if (!filePath) return reply.status(400).send({ error: 'path required' });
+    const user = await getSessionUser(req as any);
+    const r = await query(`SELECT r.id, r.visibility, r.default_branch FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
+    if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
+    const branch = ref || r.rows[0].default_branch || 'main';
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    // Use `itehaas log --follow --name-only` like via revwalk? For MVP, use `log --follow` if available, else just walk log and filter
+    const logRes = await execItehaas(['log', '--oneline', '--max-count', '100', '--', filePath], { cwd: repoPath });
+    // Our log --follow not fully implemented, but we can use `log --follow` if provided, else fallback to filtering via `log --name-only`
+    // For now, we will run `log` with `follow` flag if available
+    const followRes = await execItehaas(['log', '--follow', '--oneline', '--max-count', '100', '--', filePath], { cwd: repoPath });
+    const raw = followRes.code === 0 ? followRes.stdout : logRes.stdout;
+    const commits = raw.split('\n').filter(Boolean).map(line => {
+      const [hash, ...msg] = line.split(' ');
+      return { hash, message: msg.join(' ') };
+    });
+    // Also get full log via revwalk for accurate history (including renames)
+    // For now return commits
+    return reply.send({ path: filePath, ref: branch, commits });
+  });
+
+  // Blame: GET /api/repos/:owner/:repo/blame/*?ref=main
+  app.get('/api/repos/:owner/:repo/blame/*', async (req, reply) => {
+    const { owner, repo } = req.params as any;
+    const filePath = (req.params as any)['*'] as string;
+    const ref = (req.query as any)?.ref as string | undefined;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    if (!filePath) return reply.status(400).send({ error: 'path required' });
     const user = await getSessionUser(req as any);
     const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
-    return reply.status(501).send({ error: 'not implemented: use tree/:hash with commit traversal in Phase 7' });
+    let repoPath: string;
+    try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    const blameRes = await execItehaas(['blame', filePath], { cwd: repoPath });
+    if (blameRes.code !== 0) return reply.status(404).send({ error: blameRes.stderr || 'blame failed' });
+    // Parse blame output: lines like "hash (author line_no): content"
+    const lines = blameRes.stdout.split('\n').filter(Boolean).map(l => {
+      // Our blame format: "hash (author line_no file): content"
+      const m = l.match(/^([0-9a-f]{7,64})\s+\((.+?)\s+(\d+)\s+.+\):\s*(.*)$/);
+      if (m) return { hash: m[1], author: m[2], line: parseInt(m[3], 10), content: m[4] };
+      return { raw: l };
+    });
+    return reply.send({ path: filePath, ref: ref || 'HEAD', blame: lines });
   });
 
   // Remote operations: fetch & push (delegates to Rust engine via execItehaas)

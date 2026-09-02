@@ -15,10 +15,10 @@ Core principles: Understand first, implement second. Correctness → Understandi
 
 ## Current Status
 
-**Current Phase:** Phase 15 — Review & Developer Workflow (Complete)
-**Current Task:** Phase 15 commit + docs
-**Overall Progress:** 245 / ~200 tasks
-**Status:** ✅ Complete — M1–M9 + Phases 11–15 achieved
+**Current Phase:** Phase 16 — Code Browser, Search & Notifications (In Progress)
+**Current Task:** Phase 16 file browsing + search + watch
+**Overall Progress:** 250 / ~240 tasks
+**Status:** 🟡 In Progress — M1–M9 + Phases 11–15 achieved, Phase 16 building
 
 ### Last Completed
 
@@ -26,14 +26,16 @@ Core principles: Understand first, implement second. Correctness → Understandi
 - Phase 12 complete: `docs/remote-protocol.md` (refs discovery, negotiation, object/pack, auth, FF, lock), `vcs/src/remote/http.rs` (`http_fetch` incremental 6 vs 0, `upload_object_http`, `http_push` missing-set, `update_remote_ref_http` 409/423), `server/src/routes/repos.ts` (POST /objects/:hash 64M + verify, POST /refs/heads/* atomic CAS + isAncestor + 423 lock + reflog), HTTP clone+fetch+push+pull verified (`http-test` private), SHA-1 mode local (`Sha1Hasher` + `hash.rs`, `object/mod.rs` algo-aware, `init --algo sha1` 40-char), short-hash `resolve_rev` (`HEAD~n` + prefix 7+), 4 tests `phase12_tests.rs`
 - Phase 13 complete: `vcs/src/revwalk.rs` (walk_log --all/--graph/-p/--stat/--name-only/--since/--until/--author/--grep/--follow, `format_stat`, `parse_date` chrono), `vcs/src/blame.rs` (line blame via diff), `vcs/src/hash.rs` `resolve_short_hash`, `vcs/src/refs.rs` `HEAD~n` + short, `vcs/src/main.rs` `commit --amend`, `show`, `ls-files`, `for-each-ref`, `grep`, `blame`, `cherry-pick`/`revert` (inverse diff, conflict markers, `CHERRY_PICK_HEAD`), `bisect` (BISECT_*), `rebase` (rebase-merge, --abort/--continue, todo), 7 tests `phase13_tests.rs`, `cargo test` 86+2
 - Phase 14 complete: `database/migrations/005_forks_orgs.sql` (organizations/organization_members/teams/team_members/team_repositories/forks/invites), `006_pr_fork.sql` (source_repo_id), `server/src/lib/permissions.ts` (`getTeamPermission` + `canRead/canWrite/isAdmin` team check), `server/src/routes/repos.ts` (POST /fork + GET /forks/network, FS clone via `execItehaas clone` + `forks` DB), `server/src/routes/pulls.ts` (source_repo + `copyMissingObjects` + `fork/owner/branch` ref), `server/src/routes/orgs.ts` (POST/GET orgs, members, teams, team members/repos), `server/src/routes/invites.ts` (org/repo/team invites + accept/reject token), 5 tests `phase14_tests.rs` + manual cross-fork PR (`fork/bob_fork/feature_fork` → `main` fast-forward) + org/team/invite flow
+- Phase 15 complete: `database/migrations/007_review.sql` (is_draft, pr_requested_reviewers, pr_reviews approved/changes_requested, pr_review_comments path/line/side, labels/issue_labels, milestones, issue_assignees), `server/src/routes/pulls.ts` (draft `is_draft` + PATCH/ready, reviewers CRUD + CODEOWNERS `* @user` auto, reviews `approved` 409, line-comments, close keywords `fixes #` UUID ILIKE), `server/src/routes/issues.ts` (enrichIssue, `?label&assignee&milestone`, `POST /issues` labels/assignees/milestone, `PATCH` labels/assignees, `GET /labels`/`/milestones` CRUD, mentions `@user` → `notifications`), 5 tests `phase15_tests.rs` + live `acme` draft→ready→approve→line-comment→merge+close
 
 ### Currently Working On
 
-- Phase 15 complete — hardening + docs (permissions fix, CODEOWNERS, close keywords, 8 tests) — ready for commit
+- Phase 16 — Code Browser, Search & Notifications (file `?path=` browsing, `raw`/`history`/`blame`, `pg_trgm` search, `watch`/`notifications`)
 
 ### Next
 
-- Post-Phase 15 — Polish & Self-Hosted Release (web review UI polish, property tests, Git oracle, perf bench on Vivobook) — optional
+- Phase 16 — Code Browser, Search & Notifications (recursive `?path=` browser, `raw`/`history`/`blame` UI, `pg_trgm` global/code search, `watch`/`notifications`)
+- Phase 17 — Real CI/CD (YAML `on: push`, queue, isolated Docker runner, artifacts)
 
 ## Phase Status Table
 
@@ -54,6 +56,9 @@ Core principles: Understand first, implement second. Correctness → Understandi
 | 12 | Remote Transport & Git Interop | ✅ Complete (HTTP fetch/push/pull + SHA-1 local, pack deferred) |
 | 13 | History & Code Archaeology | ✅ Complete |
 | 14 | Forks, Networks & Organizations | ✅ Complete |
+| 15 | Review & Developer Workflow | ✅ Complete |
+| 16 | Code Browser, Search & Notifications | 🟡 In Progress |
+| 17 | Real CI/CD | ⬜ Not Started |
 | 15 | Review & Developer Workflow | ✅ Complete |
 
 Status icons: ✅ Complete · 🟡 In Progress · ⬜ Not Started · 🔴 Blocked · ⏸️ Deferred
@@ -624,6 +629,53 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Close keywords fix UUID prefix + numeric `ROW_NUMBER` → `closed` on merge — manual `fixes #<uuid-prefix>` + `fixes #1` → issue `closed` — 2026-09-02
 - [x] Tests `phase15_tests` 8 (tables, labels/milestones, reviewers, line comments, CODEOWNERS, close keywords) + `cargo test` 99+2 (91+8), `pnpm --filter server` 32 tests — 2026-09-02
 - [x] Regression `cargo test` 99+2, `pnpm --filter server build` + `web build` — 2026-09-02
+
+
+## Phase 16 — Code Browser, Search & Notifications
+
+### Scope
+
+- [x] DB 008 (watches, pg_trgm indexes) — `database/migrations/008_search_watch.sql` (watches, GIN trigram indexes `repositories`/`issues`/`pull_requests`/`users`) — 2026-09-02
+- [x] File browsing API — `server/src/routes/repos.ts:215` `GET /file/*?ref=` (tree walk `cat-file -p` recursive, 404, binary check) + `GET /history/*?ref=` (`log --follow` via `revwalk`) + `GET /blame/*?ref=` (`blame` via `execItehaas blame`) — 2026-09-02
+- [x] Search API — `server/src/routes/search.ts:1` `GET /api/search?q=&type=repos/issues/pulls/users&limit=&offset=` (ILIKE + visibility filter, `pg_trgm` GIN, `canRead` for private) — 2026-09-02
+- [x] Watch — `server/src/routes/repos.ts:215` `POST /watch` (INSERT watches 409 dedup) + `DELETE /watch` + `GET /watch` (watching?) + `GET /watchers` (list) — 2026-09-02
+- [ ] Notifications inbox UI — `GET /api/notifications` already exists (`stars.ts`), needs `watch` + `mention` + `pr_open` filtering, frontend bell
+- [ ] Mentions — `@user` regex in `issue_comments`/`pr_comments`/`review_comments` → `notifications` (already in `issues.ts` and `pulls.ts` for comments, needs `pr_review_comments` and `issue` body)
+- [ ] Web: recursive `FileTree` `?path=` + `FileViewer` `raw`/`history`/`blame` + `CommandPalette` search + `AppShell` inbox
+
+### Dependencies
+
+- Depends on: Phase 11 ignore, Phase 13 revwalk/blame, Phase 8 search (pg_trgm) — met
+
+### Definition of Done — Phase 16 (initial)
+
+- [x] File `?path=` browsing via `GET /file/*` (tree walk) — manual `curl /file/a.txt?ref=main` — 2026-09-02
+- [x] History via `GET /history/*` (`log --follow`) — manual `curl /history/a.txt` — 2026-09-02
+- [x] Blame via `GET /blame/*` (`blame` ) — manual `curl /blame/a.txt` — 2026-09-02
+- [x] Search `GET /api/search?q=hello&type=repos` (repositories/issues/pulls/users, visibility, limit/offset) — manual `curl /api/search` — 2026-09-02
+- [x] Watch `POST /watch` (watches 409, `GET /watch` + `GET /watchers`) — manual `watch` via curl — 2026-09-02
+- [ ] Notifications inbox `GET /api/notifications` already exists but needs `watch` + `mention` filtering + frontend bell
+- [ ] Web recursive `FileTree` + `FileViewer` raw/history/blame + search palette
+- [ ] Tests `phase16_tests` (file browsing, history, search, watch) — deferred
+
+## Phase 17 — Real CI/CD
+
+### Scope
+
+- [ ] Workflow format — YAML `on: push/pull_request` `jobs.runs-on` `steps` `checkout/install/test/build` (e.g., `.itehaas/workflows/test.yml`)
+- [ ] Queue — `BullMQ` or `pg` `ci_pipelines` (already `003_ci.sql` `queued`→`simulateRun` via `execItehaas log`, needs queue)
+- [ ] Runner — isolated `docker --network none --memory 512m --pids-limit 128` (currently `simulateRun` via `execItehaas log` dummy, needs `docker run`)
+- [ ] Artifacts, `ci_secrets` injection, `status_checks` + PR gating, log streaming
+
+### Dependencies
+
+- Depends on: Phase 9 CI (simulateRun), Phase 12 pack, Docker — met
+
+### Definition of Done — Phase 17
+
+- [ ] YAML workflow parsed and queued on push
+- [ ] Runner executes in Docker, logs captured, status `queued→running→success/failed`
+- [ ] Artifacts uploaded, secrets injected, PR gating
 
 ## Security Hardening
 

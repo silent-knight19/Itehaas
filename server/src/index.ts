@@ -11,6 +11,7 @@ import { ciRoutes } from './routes/ci';
 import { userRoutes } from './routes/users';
 import { orgRoutes } from './routes/orgs';
 import { inviteRoutes } from './routes/invites';
+import { searchRoutes } from './routes/search';
 
 async function buildApp() {
   const app = Fastify({
@@ -34,6 +35,7 @@ async function buildApp() {
   await app.register(userRoutes);
   await app.register(orgRoutes);
   await app.register(inviteRoutes);
+  await app.register(searchRoutes);
 
   // Global error handler
   app.setErrorHandler((err, _req, reply) => {
