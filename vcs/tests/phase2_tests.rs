@@ -324,3 +324,32 @@ fn test_commit_author_via_config() {
     assert_eq!(name.unwrap(), "Custom");
     assert_eq!(email.unwrap(), "custom@example.com");
 }
+
+#[test]
+fn test_global_config_fallback() {
+    let temp_global = tempfile::NamedTempFile::new().unwrap();
+    let temp_global_path = temp_global.path().to_path_buf();
+    std::env::set_var("ITEHAAS_CONFIG_GLOBAL", &temp_global_path);
+
+    config::write_user_to_file(&temp_global_path, Some("Silent-Knight19"), Some("sachinsinghtomar7749@gmail.com")).unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().to_path_buf();
+    itehaas_lib::init(&repo, HashAlgo::Sha256).unwrap();
+
+    // Repo has no local user config yet; should inherit from global
+    let (name, email) = config::read_user(&repo).unwrap();
+    assert_eq!(name.unwrap(), "Silent-Knight19");
+    assert_eq!(email.unwrap(), "sachinsinghtomar7749@gmail.com");
+
+    // Local repo config overrides name, but falls back to global for email
+    let local_cfg = repo.join(".itehaas").join("config");
+    config::write_user_to_file(&local_cfg, Some("LocalOverride"), None).unwrap();
+    let (name2, email2) = config::read_user(&repo).unwrap();
+    assert_eq!(name2.unwrap(), "LocalOverride");
+    assert_eq!(email2.unwrap(), "sachinsinghtomar7749@gmail.com");
+
+    std::env::remove_var("ITEHAAS_CONFIG_GLOBAL");
+}
+
+

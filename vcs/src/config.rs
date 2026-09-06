@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{ItehaasError, Result};
 use crate::hash::HashAlgo;
@@ -38,12 +38,24 @@ pub fn init_config(repo: &Path, hasher: HashAlgo) -> Result<()> {
     write_config(repo, hasher)
 }
 
-pub fn read_user(repo: &Path) -> Result<(Option<String>, Option<String>)> {
-    let config_path = repo.join(".itehaas").join("config");
+pub fn global_config_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ITEHAAS_CONFIG_GLOBAL") {
+        if !p.trim().is_empty() {
+            return Some(PathBuf::from(p.trim()));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        Some(PathBuf::from(home).join(".itehaasconfig"))
+    } else {
+        None
+    }
+}
+
+pub fn read_user_from_file(config_path: &Path) -> Result<(Option<String>, Option<String>)> {
     if !config_path.exists() {
         return Ok((None, None));
     }
-    let content = fs::read_to_string(&config_path)?;
+    let content = fs::read_to_string(config_path)?;
     let mut in_user = false;
     let mut name: Option<String> = None;
     let mut email: Option<String> = None;
@@ -68,17 +80,40 @@ pub fn read_user(repo: &Path) -> Result<(Option<String>, Option<String>)> {
     Ok((name, email))
 }
 
-pub fn write_user(repo: &Path, name: &str, email: &str) -> Result<()> {
-    let config_path = repo.join(".itehaas").join("config");
-    let hasher = read_hasher(repo)?;
-    let mut content = if config_path.exists() {
-        fs::read_to_string(&config_path)?
+pub fn read_global_user() -> Result<(Option<String>, Option<String>)> {
+    if let Some(path) = global_config_path() {
+        read_user_from_file(&path)
     } else {
-        format!("[core]\n\thasher = {}\n\trepositoryformatversion = 1\n", hasher.as_str())
+        Ok((None, None))
+    }
+}
+
+pub fn read_user(repo: &Path) -> Result<(Option<String>, Option<String>)> {
+    let local_path = repo.join(".itehaas").join("config");
+    let (local_name, local_email) = read_user_from_file(&local_path)?;
+    if local_name.is_some() && local_email.is_some() {
+        return Ok((local_name, local_email));
+    }
+    let (global_name, global_email) = read_global_user()?;
+    Ok((
+        local_name.or(global_name),
+        local_email.or(global_email),
+    ))
+}
+
+pub fn write_user_to_file(config_path: &Path, name: Option<&str>, email: Option<&str>) -> Result<()> {
+    if let Some(parent) = config_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let content = if config_path.exists() {
+        fs::read_to_string(config_path)?
+    } else {
+        String::new()
     };
-    // Ensure [user] section exists; simple append/replace
+
     if content.contains("[user]") {
-        // Replace existing name/email if present — simple rewrite by lines
         let mut out = String::new();
         let mut in_user = false;
         let mut has_name = false;
@@ -87,11 +122,15 @@ pub fn write_user(repo: &Path, name: &str, email: &str) -> Result<()> {
             let trimmed = line.trim();
             if trimmed.starts_with('[') {
                 if in_user {
-                    if !has_name {
-                        out.push_str(&format!("\tname = {}\n", name));
+                    if let Some(n) = name {
+                        if !has_name {
+                            out.push_str(&format!("\tname = {}\n", n));
+                        }
                     }
-                    if !has_email {
-                        out.push_str(&format!("\temail = {}\n", email));
+                    if let Some(e) = email {
+                        if !has_email {
+                            out.push_str(&format!("\temail = {}\n", e));
+                        }
                     }
                 }
                 in_user = trimmed == "[user]";
@@ -100,36 +139,72 @@ pub fn write_user(repo: &Path, name: &str, email: &str) -> Result<()> {
             }
             if in_user {
                 if trimmed.starts_with("name") {
-                    out.push_str(&format!("\tname = {}\n", name));
-                    has_name = true;
-                    continue;
+                    if let Some(n) = name {
+                        out.push_str(&format!("\tname = {}\n", n));
+                        has_name = true;
+                        continue;
+                    } else {
+                        has_name = true;
+                    }
                 } else if trimmed.starts_with("email") {
-                    out.push_str(&format!("\temail = {}\n", email));
-                    has_email = true;
-                    continue;
+                    if let Some(e) = email {
+                        out.push_str(&format!("\temail = {}\n", e));
+                        has_email = true;
+                        continue;
+                    } else {
+                        has_email = true;
+                    }
                 }
             }
             out.push_str(line);
             out.push('\n');
         }
-        // Handle trailing
         if in_user {
-            if !has_name {
-                out.push_str(&format!("\tname = {}\n", name));
+            if let Some(n) = name {
+                if !has_name {
+                    out.push_str(&format!("\tname = {}\n", n));
+                }
             }
-            if !has_email {
-                out.push_str(&format!("\temail = {}\n", email));
+            if let Some(e) = email {
+                if !has_email {
+                    out.push_str(&format!("\temail = {}\n", e));
+                }
             }
         }
-        content = out;
+        fs::write(config_path, out)?;
     } else {
-        if !content.ends_with('\n') {
-            content.push('\n');
+        let mut new_content = content;
+        if !new_content.is_empty() && !new_content.ends_with('\n') {
+            new_content.push('\n');
         }
-        content.push_str(&format!("[user]\n\tname = {}\n\temail = {}\n", name, email));
+        new_content.push_str("[user]\n");
+        if let Some(n) = name {
+            new_content.push_str(&format!("\tname = {}\n", n));
+        }
+        if let Some(e) = email {
+            new_content.push_str(&format!("\temail = {}\n", e));
+        }
+        fs::write(config_path, new_content)?;
     }
-    fs::write(config_path, content)?;
     Ok(())
+}
+
+pub fn write_user(repo: &Path, name: &str, email: &str) -> Result<()> {
+    let config_path = repo.join(".itehaas").join("config");
+    let hasher = read_hasher(repo)?;
+    if !config_path.exists() {
+        let content = format!("[core]\n\thasher = {}\n\trepositoryformatversion = 1\n", hasher.as_str());
+        fs::write(&config_path, content)?;
+    }
+    write_user_to_file(&config_path, Some(name), Some(email))
+}
+
+pub fn write_global_user(name: Option<&str>, email: Option<&str>) -> Result<PathBuf> {
+    let path = global_config_path().ok_or_else(|| {
+        ItehaasError::Other("could not determine home directory for global config".to_string())
+    })?;
+    write_user_to_file(&path, name, email)?;
+    Ok(path)
 }
 
 pub fn add_remote(repo: &Path, name: &str, url: &str) -> Result<()> {

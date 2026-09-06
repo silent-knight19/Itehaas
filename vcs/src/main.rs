@@ -139,6 +139,9 @@ enum Commands {
     },
     /// Get or set config
     Config {
+        /// Global configuration (~/.itehaasconfig)
+        #[arg(long)]
+        global: bool,
         /// Key (e.g., user.name, user.email)
         key: Option<String>,
         /// Value (if setting)
@@ -720,9 +723,13 @@ fn main() -> Result<()> {
                 &repo, oneline, max_count, all, graph, patch, stat, name_only, since, until, author, grep, follow, rev, paths,
             )?;
         }
-        Commands::Config { key, value } => {
-            let repo = find_repo_or_cwd()?;
-            cmd_config(&repo, key, value)?;
+        Commands::Config { global, key, value } => {
+            if global {
+                cmd_global_config(key, value)?;
+            } else {
+                let repo = find_repo_or_cwd()?;
+                cmd_config(&repo, key, value)?;
+            }
         }
         Commands::Branch {
             name,
@@ -1431,11 +1438,56 @@ fn cmd_log(
     Ok(())
 }
 
+fn cmd_global_config(key: Option<String>, value: Option<String>) -> Result<()> {
+    let path = config::global_config_path().ok_or_else(|| anyhow::anyhow!("could not determine home directory for global config"))?;
+    match (key, value) {
+        (None, _) => {
+            if path.exists() {
+                let content = fs::read_to_string(&path)?;
+                print!("{}", content);
+            } else {
+                println!("no global config");
+            }
+        }
+        (Some(k), None) => {
+            if k == "user.name" {
+                let (name, _) = config::read_global_user().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if let Some(n) = name {
+                    println!("{}", n);
+                } else {
+                    anyhow::bail!("global user.name not set");
+                }
+            } else if k == "user.email" {
+                let (_, email) = config::read_global_user().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if let Some(e) = email {
+                    println!("{}", e);
+                } else {
+                    anyhow::bail!("global user.email not set");
+                }
+            } else {
+                anyhow::bail!("unknown config key: {} (supported: user.name, user.email)", k);
+            }
+        }
+        (Some(k), Some(v)) => {
+            if k == "user.name" {
+                config::write_global_user(Some(&v), None).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("set global user.name = {}", v);
+            } else if k == "user.email" {
+                config::write_global_user(None, Some(&v)).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("set global user.email = {}", v);
+            } else {
+                anyhow::bail!("unknown config key: {} (supported: user.name, user.email)", k);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_config(repo: &Path, key: Option<String>, value: Option<String>) -> Result<()> {
+    let cfg_path = repo.join(".itehaas").join("config");
     match (key, value) {
         (None, _) => {
             // Show all config
-            let cfg_path = repo.join(".itehaas").join("config");
             if cfg_path.exists() {
                 let content = fs::read_to_string(&cfg_path)?;
                 print!("{}", content);
@@ -1465,15 +1517,15 @@ fn cmd_config(repo: &Path, key: Option<String>, value: Option<String>) -> Result
         }
         (Some(k), Some(v)) => {
             // Set
+            if !cfg_path.exists() {
+                let hasher = config::read_hasher(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
+                config::write_config(repo, hasher).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
+            }
             if k == "user.name" {
-                let (_, email) = config::read_user(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
-                let email = email.unwrap_or_else(|| "author@example.com".to_string());
-                config::write_user(repo, &v, &email).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
+                config::write_user_to_file(&cfg_path, Some(&v), None).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
                 println!("set user.name = {}", v);
             } else if k == "user.email" {
-                let (name, _) = config::read_user(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
-                let name = name.unwrap_or_else(|| "Author".to_string());
-                config::write_user(repo, &name, &v).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
+                config::write_user_to_file(&cfg_path, None, Some(&v)).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
                 println!("set user.email = {}", v);
             } else {
                 anyhow::bail!("unknown config key: {} (supported: user.name, user.email)", k);
