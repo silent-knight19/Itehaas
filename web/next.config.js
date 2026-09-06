@@ -38,7 +38,7 @@ const nextConfig = {
     ];
   },
   async rewrites() {
-    const upstream = process.env.INTERNAL_API_URL;
+    const upstream = (process.env.INTERNAL_API_URL || '').trim().replace(/\/+$/, '');
     if (!upstream) return [];
     return [
       {
