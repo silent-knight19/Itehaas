@@ -1,8 +1,8 @@
 FROM node:20.18.1-alpine3.19 AS builder
 WORKDIR /app
 COPY package.json pnpm-lock.yaml* ./
-# S16/S17: strict frozen lockfile — never silently resolve fresh (unaudited) versions.
-RUN corepack enable && pnpm install --frozen-lockfile
+# S16/S17: install pinned pnpm directly via npm to avoid corepack signing key expiration
+RUN npm install -g pnpm@9.0.0 && pnpm install --frozen-lockfile
 COPY . .
 RUN npm run build
 
