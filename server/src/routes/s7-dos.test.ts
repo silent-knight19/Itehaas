@@ -160,7 +160,9 @@ describe('S7 Resource Exhaustion / DoS', () => {
         return { rows: [{ id: 'r1', visibility: 'private' }] };
       }
       if (text.includes('SELECT owner_id FROM repositories')) return { rows: [{ owner_id: 'u-alice' }] };
-      if (text.includes('SELECT count(*)::int as c FROM ci_pipelines')) return { rows: [{ c: 20 }] };
+      // S15: admission is serialized (FOR UPDATE) then counted inside the txn.
+      if (text.includes('SELECT id FROM repositories WHERE id=$1 FOR UPDATE')) return { rows: [{ id: 'r1' }] };
+      if (text.includes('FROM ci_pipelines WHERE repo_id=$1 AND status IN')) return { rows: [{ c: 20 }] };
       return { rows: [], rowCount: 0 };
     });
     const app = await buildApp();
@@ -245,5 +247,163 @@ describe('S7 Resource Exhaustion / DoS', () => {
     const content = fs.readFileSync('src/routes/users.ts', 'utf8');
     expect(content).toContain('MAX_REPOS_TO_SCAN = 15');
     expect(content).toContain('filteredRepos.slice(0, MAX_REPOS_TO_SCAN)');
+  });
+
+  describe('S7-fresh: output, collection, and disk budgets', () => {
+    it('budgets: parsePagination bounds limits and offsets', async () => {
+      const { parsePagination } = await import('../lib/budgets');
+      expect(parsePagination({})).toEqual({ limit: 50, offset: 0 });
+      expect(parsePagination({ limit: '500' })).toEqual({ limit: 100, offset: 0 });
+      expect(parsePagination({ limit: '10', offset: '20' })).toEqual({ limit: 10, offset: 20 });
+      expect(parsePagination({ offset: '999999' })).toEqual({ error: 'offset too large' });
+      expect(parsePagination({ limit: 'abc' })).toEqual({ error: 'invalid limit' });
+    });
+
+    it('budgets: escapeLikePattern neutralizes % and _', async () => {
+      const { escapeLikePattern } = await import('../lib/budgets');
+      expect(escapeLikePattern('%%')).toBe('\\%\\%');
+      expect(escapeLikePattern('a%b_c\\d')).toBe('a\\%b\\_c\\\\d');
+      expect(escapeLikePattern('hello')).toBe('hello');
+    });
+
+    it('budgets: repoQuotaBytes honors env, floors absurd values', async () => {
+      const { repoQuotaBytes, DEFAULT_REPO_QUOTA_BYTES } = await import('../lib/budgets');
+      expect(repoQuotaBytes({} as any)).toBe(DEFAULT_REPO_QUOTA_BYTES);
+      expect(repoQuotaBytes({ REPO_QUOTA_BYTES: '1073741824' } as any)).toBe(1073741824);
+      expect(repoQuotaBytes({ REPO_QUOTA_BYTES: '10' } as any)).toBe(DEFAULT_REPO_QUOTA_BYTES);
+      expect(repoQuotaBytes({ REPO_QUOTA_BYTES: 'junk' } as any)).toBe(DEFAULT_REPO_QUOTA_BYTES);
+    });
+
+    it('budgets: getRepoDiskUsage sums lstat sizes, skips symlinks, early-exits', async () => {
+      const fs = await import('fs');
+      const os = await import('os');
+      const path = await import('path');
+      const { getRepoDiskUsage } = await import('../lib/budgets');
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'itehaas-s7q-'));
+      const itehaas = path.join(tmp, '.itehaas', 'objects', 'ab');
+      fs.mkdirSync(itehaas, { recursive: true });
+      fs.writeFileSync(path.join(itehaas, 'f1'), Buffer.alloc(1000, 1));
+      fs.writeFileSync(path.join(itehaas, 'f2'), Buffer.alloc(2000, 2));
+      expect(getRepoDiskUsage(tmp)).toBe(3000);
+      // Symlink to a big outside file must not count
+      const outside = path.join(tmp, 'big-outside');
+      fs.writeFileSync(outside, Buffer.alloc(5000, 3));
+      try { fs.symlinkSync(outside, path.join(itehaas, 'link')); } catch {}
+      expect(getRepoDiskUsage(tmp)).toBe(3000);
+      // Early exit once over the cap
+      expect(getRepoDiskUsage(tmp, 100)).toBeGreaterThan(100);
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+    });
+
+    it('S7-fresh: search escapes LIKE wildcards (q=%% stays selective)', async () => {
+      let captured: any[] = [];
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('SET statement_timeout')) return { rows: [], rowCount: 0 };
+        if (text.includes('FROM repositories r JOIN users u')) {
+          captured = params ?? [];
+          return { rows: [] };
+        }
+        if (text.includes('FROM issues')) return { rows: [] };
+        if (text.includes('FROM pull_requests')) return { rows: [] };
+        if (text.includes('FROM users')) return { rows: [] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({ method: 'GET', url: '/api/search?q=100%25%25' });
+      expect(res.statusCode).toBe(200);
+      expect(captured.some((p) => typeof p === 'string' && p.includes('\\%'))).toBe(true);
+      await app.close();
+    });
+
+    it('S7-fresh: forks/members/labels paginate (limit capped, offset bounded)', async () => {
+      let captured: any[] = [];
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r1', visibility: 'public' }] };
+        if (text.includes('FROM forks f JOIN repositories')) {
+          captured = params ?? [];
+          return { rows: [] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({ method: 'GET', url: '/api/repos/alice/repo/forks?limit=5000' });
+      expect(res.statusCode).toBe(200);
+      expect(captured[captured.length - 2]).toBe(100);
+      const bad = await app.inject({ method: 'GET', url: '/api/repos/alice/repo/forks?offset=999999' });
+      expect(bad.statusCode).toBe(400);
+      await app.close();
+    });
+
+    it('S7-fresh: users repos deep offset -> 400', async () => {
+      mockQuery.mockImplementation(async (text: string) => {
+        if (text.includes('FROM users WHERE username')) {
+          return { rows: [{ id: 'u1', username: 'alice', email: 'a@b.c' }] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({ method: 'GET', url: '/api/users/alice/repos?offset=999999' });
+      expect(res.statusCode).toBe(400);
+      await app.close();
+    });
+
+    it('S7-fresh: JSON body over 1MiB -> 413 (not parsed/hashed)', async () => {
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'alice', password: `x`.repeat(2 * 1024 * 1024) },
+      });
+      expect(res.statusCode).toBe(413);
+      await app.close();
+    });
+
+    it('S7-fresh: object push over repo quota -> 413', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const zlib = await import('zlib');
+      const crypto = await import('crypto');
+      // Plant 2MiB under the mocked repo path, set quota to 1MiB.
+      const repoDir = '/tmp/itehaas_test/alice/quota-repo';
+      const objDir = path.join(repoDir, '.itehaas', 'objects', 'aa');
+      fs.mkdirSync(objDir, { recursive: true });
+      fs.writeFileSync(path.join(objDir, 'pad'), Buffer.alloc(2 * 1024 * 1024, 7));
+      const prev = process.env.REPO_QUOTA_BYTES;
+      process.env.REPO_QUOTA_BYTES = String(1024 * 1024);
+      try {
+        mockQuery.mockImplementation(async (text: string) => {
+          if (text.includes('FROM sessions s JOIN users u')) return { rows: [{ id: 'u-alice', username: 'alice' }] };
+          if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r1', visibility: 'private' }] };
+          if (text.includes('SELECT owner_id FROM repositories')) return { rows: [{ owner_id: 'u-alice' }] };
+          return { rows: [], rowCount: 0 };
+        });
+        const canonical = Buffer.from('blob 11\0hello world');
+        const compressed = zlib.deflateSync(canonical);
+        const hash = crypto.createHash('sha256').update(canonical).digest('hex');
+        const app = await buildApp();
+        const res = await app.inject({
+          method: 'POST',
+          url: `/api/repos/alice/quota-repo/objects/${hash}`,
+          headers: { cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'content-type': 'application/octet-stream' },
+          payload: compressed,
+        });
+        expect(res.statusCode).toBe(413);
+        expect(res.json().error).toMatch(/quota/);
+        await app.close();
+      } finally {
+        if (prev === undefined) delete process.env.REPO_QUOTA_BYTES;
+        else process.env.REPO_QUOTA_BYTES = prev;
+        try { fs.rmSync(repoDir, { recursive: true, force: true }); } catch {}
+      }
+    });
+
+    it('S7-fresh: CI runner caps script and output budgets (code check)', async () => {
+      const fs = await import('fs');
+      const content = fs.readFileSync('src/routes/ci.ts', 'utf8');
+      expect(content).toContain('MAX_CI_SCRIPT_BYTES');
+      expect(content).toContain('MAX_CI_LOG_BYTES');
+      expect(content).toContain('Logs truncated');
+      expect(content).toContain('LIMIT $2');
+    });
   });
 });

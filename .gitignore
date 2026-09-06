@@ -27,6 +27,13 @@ build/
 .coverage/
 coverage/
 .nyc_output/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
 
 # Itehaas VCS
 .itehaas/
@@ -49,6 +56,9 @@ coverage/
 # OS
 .DS_Store
 **/.DS_Store
+._*
+.AppleDouble
+.LSOverride
 Thumbs.db
 ehthumbs.db
 Desktop.ini

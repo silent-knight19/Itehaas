@@ -135,30 +135,33 @@ pub fn flatten_tree(
     depth: usize,
 ) -> Result<()> {
     let mut active = std::collections::BTreeSet::new();
-    flatten_tree_with_ancestors(repo, tree_hash, hasher, prefix, out, depth, &mut active)
+    let mut memo: std::collections::HashMap<String, Vec<(String, Hash, u32)>> = std::collections::HashMap::new();
+    flatten_tree_with_ancestors(repo, tree_hash, hasher, prefix, out, depth, &mut active, &mut memo)
 }
 
-pub fn flatten_tree_with_ancestors(
+/// Inner worker: returns this subtree's entries with paths relative to the subtree
+/// root. Results are memoized by tree hash so diamond DAGs (shared subtrees that
+/// are never ancestors of themselves) compute once instead of expanding 2^depth.
+fn flatten_inner(
     repo: &Path,
     tree_hash: &Hash,
     hasher: &dyn Hasher,
-    prefix: &str,
-    out: &mut BTreeMap<String, (Hash, u32)>,
     depth: usize,
     active_ancestors: &mut std::collections::BTreeSet<String>,
-) -> Result<()> {
+    memo: &mut std::collections::HashMap<String, Vec<(String, Hash, u32)>>,
+) -> Result<Vec<(String, Hash, u32)>> {
     // S6: depth limit
     if depth > 100 {
         return Err(crate::error::ItehaasError::InvalidObject(format!("tree depth too deep: {}", depth)));
     }
-    // SEC-014: bound total flattened entries to prevent DAG expansion bomb
-    if out.len() > 100_000 {
-        return Err(crate::error::ItehaasError::InvalidObject("flattened tree too large (exceeded 100,000 entries)".into()));
-    }
-    // Cycle detection
     let hex = tree_hash.hex();
+    // Cycle detection (true cycles on the current path).
     if active_ancestors.contains(&hex) {
         return Err(crate::error::ItehaasError::InvalidObject(format!("cycle detected in tree: {}", hex)));
+    }
+    // S6-fresh: memo hit — shared subtree already computed.
+    if let Some(cached) = memo.get(&hex) {
+        return Ok(cached.clone());
     }
     active_ancestors.insert(hex.clone());
 
@@ -170,27 +173,64 @@ pub fn flatten_tree_with_ancestors(
             return Err(crate::error::ItehaasError::InvalidObject(format!(
                 "expected tree, got {}",
                 obj.object_type()
-            )))
+            )));
         }
     };
+    let mut local: Vec<(String, Hash, u32)> = Vec::new();
     for e in tree.entries {
-        let full_path = if prefix.is_empty() {
-            e.name.clone()
-        } else {
-            format!("{}/{}", prefix, e.name)
-        };
         if e.mode == 0o040000 {
-            // Subdirectory — recurse
-            flatten_tree_with_ancestors(repo, &e.hash, hasher, &full_path, out, depth + 1, active_ancestors)?;
+            // Subdirectory — recurse once per unique hash thanks to the memo.
+            for (rel, h, m) in flatten_inner(repo, &e.hash, hasher, depth + 1, active_ancestors, memo)? {
+                local.push((format!("{}/{}", e.name, rel), h, m));
+                // Bound memoized expansion (defense in depth alongside the out-cap below).
+                if local.len() > 100_000 {
+                    active_ancestors.remove(&hex);
+                    return Err(crate::error::ItehaasError::InvalidObject("flattened tree too large (exceeded 100,000 entries)".into()));
+                }
+            }
         } else {
-            if out.len() >= 100_000 {
+            local.push((e.name.clone(), e.hash, e.mode));
+            if local.len() > 100_000 {
                 active_ancestors.remove(&hex);
                 return Err(crate::error::ItehaasError::InvalidObject("flattened tree too large (exceeded 100,000 entries)".into()));
             }
-            out.insert(full_path, (e.hash, e.mode));
         }
     }
     active_ancestors.remove(&hex);
+    memo.insert(hex, local.clone());
+    Ok(local)
+}
+
+/// Outer compatibility wrapper: prefix application + output budget on top of the
+/// memoized inner worker. Keeps the historical argument list for callers.
+// S6-fresh: 8 args predate this change (active-set + memo accumulators); bundling
+// them would churn every VCS call site for no security gain.
+#[allow(clippy::too_many_arguments)]
+pub fn flatten_tree_with_ancestors(
+    repo: &Path,
+    tree_hash: &Hash,
+    hasher: &dyn Hasher,
+    prefix: &str,
+    out: &mut BTreeMap<String, (Hash, u32)>,
+    depth: usize,
+    active_ancestors: &mut std::collections::BTreeSet<String>,
+    memo: &mut std::collections::HashMap<String, Vec<(String, Hash, u32)>>,
+) -> Result<()> {
+    // SEC-014: bound total flattened entries to prevent DAG expansion bomb
+    if out.len() > 100_000 {
+        return Err(crate::error::ItehaasError::InvalidObject("flattened tree too large (exceeded 100,000 entries)".into()));
+    }
+    for (rel, h, m) in flatten_inner(repo, tree_hash, hasher, depth, active_ancestors, memo)? {
+        let full_path = if prefix.is_empty() {
+            rel
+        } else {
+            format!("{}/{}", prefix, rel)
+        };
+        if out.len() >= 100_000 {
+            return Err(crate::error::ItehaasError::InvalidObject("flattened tree too large (exceeded 100,000 entries)".into()));
+        }
+        out.insert(full_path, (h, m));
+    }
     Ok(())
 }
 

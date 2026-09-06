@@ -1,8 +1,8 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { query } from '../db';
+import { query, getClient } from '../db';
 import { getSessionUser, requireAuth } from '../middleware/auth';
-import { canRead, canWrite } from '../lib/permissions';
+import { canRead, canWrite, isAdmin } from '../lib/permissions';
 import { repoPathFor, execItehaas } from '../lib/vcs';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -10,7 +10,8 @@ import { spawn } from 'child_process';
 import * as yaml from 'yaml';
 import { incCIPipelines } from '../lib/metrics';
 import { checkRateLimit, rateLimitReply } from '../lib/rateLimit';
-import { encryptSecret, decryptSecretSafe, maskSecretInLog } from '../lib/secrets';
+import { MAX_CI_LOG_BYTES, MAX_CI_SCRIPT_BYTES, MAX_CI_DETAIL_ROWS } from '../lib/budgets';
+import { encryptSecret, decryptSecret, isEncryptedValue, maskSecretInLog } from '../lib/secrets';
 import { config } from '../config';
 import { auditLog } from '../lib/audit';
 
@@ -139,6 +140,11 @@ async function executeInRunner(repoPath: string, script: string, env: Record<str
   const combinedEnv = { ...env } as Record<string, string>;
   // Prepare logs header
   let logs = '';
+  // S7: script output budget (defense in depth behind workflow step limits — the
+  // inline-workflow path is otherwise unbounded until S10 caps it at the source).
+  if (Buffer.byteLength(script) > MAX_CI_SCRIPT_BYTES) {
+    return { logs: `# Script exceeds ${MAX_CI_SCRIPT_BYTES} byte budget — rejected\n`, exitCode: 1, runner: dockerOk ? 'docker' : 'unavailable' };
+  }
   const header = `# Runner: ${dockerOk ? 'docker (network none, memory 512m, pids 128, user 65534, read-only)' : 'unavailable (no docker, no host exec)'}\n# Script:\n${script}\n---\n`;
   logs += header;
 
@@ -146,6 +152,7 @@ async function executeInRunner(repoPath: string, script: string, env: Record<str
     // S13: pin image to 3.19, harden args
     const dockerImage = 'alpine:3.19';
     // S13: hardened args: user 65534, read-only, tmpfs, cap-drop, no-new-privileges
+    // S10: + ulimit on open files (fd-exhaustion guard to complement pids-limit).
     const args = [
       'run', '--rm',
       '--network', 'none',
@@ -153,6 +160,7 @@ async function executeInRunner(repoPath: string, script: string, env: Record<str
       '--memory-swap', '512m',
       '--cpus', '1',
       '--pids-limit', '128',
+      '--ulimit', 'nofile=1024:1024',
       '--user', '65534:65534',
       '--read-only',
       '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
@@ -171,8 +179,22 @@ async function executeInRunner(repoPath: string, script: string, env: Record<str
         const cp = spawn('docker', args, { timeout: timeoutMs });
         let out = '';
         let err = '';
-        cp.stdout?.on('data', (d) => { out += d.toString(); });
-        cp.stderr?.on('data', (d) => { err += d.toString(); });
+        let truncated = false;
+        // S7: log-flooding guard — a malicious `yes` loop must not OOM the server
+        // by growing `out` without bound. Kill on budget breach (fail-closed, marked).
+        const onData = (d: any, isErr: boolean) => {
+          if (truncated) return;
+          const s = d.toString();
+          if (out.length + err.length + s.length > MAX_CI_LOG_BYTES) {
+            truncated = true;
+            try { cp.kill('SIGKILL'); } catch {}
+            resolve({ stdout: out, stderr: err + `\n# Logs truncated: exceeded ${MAX_CI_LOG_BYTES} byte budget\n`, code: 1 });
+            return;
+          }
+          if (isErr) err += s; else out += s;
+        };
+        cp.stdout?.on('data', (d) => onData(d, false));
+        cp.stderr?.on('data', (d) => onData(d, true));
         cp.on('error', (e) => resolve({ stdout: out, stderr: `docker error: ${e.message}`, code: 1 }));
         cp.on('close', (code) => resolve({ stdout: out, stderr: err, code: code ?? 1 }));
         setTimeout(() => { try { cp.kill('SIGKILL'); } catch {}; }, timeoutMs);
@@ -248,21 +270,56 @@ async function collectArtifacts(repoPath: string, pipelineId: string, jobId: str
   return count;
 }
 
+/**
+ * S9: resolve CI secrets for a pipeline run. Returns injectable env + skipped keys.
+ * - v1 ciphertext is decrypted (fail → skipped, never injected raw).
+ * - legacy plaintext is accepted once and healed at rest (re-encrypted).
+ * Exported for adversarial unit testing of the isolation rules.
+ */
+export async function resolvePipelineSecrets(repoId: string): Promise<{ env: Record<string, string>; skipped: string[] }> {
+  const secretsRes = await query(`SELECT id, key, value FROM ci_secrets WHERE repo_id=$1`, [repoId]);
+  const secretsEnv: Record<string, string> = {};
+  const skippedSecrets: string[] = [];
+  for (const s of secretsRes.rows) {
+    const raw = String(s.value ?? '');
+    try {
+      if (isEncryptedValue(raw)) {
+        secretsEnv[s.key] = decryptSecret(raw);
+      } else {
+        // S9: legacy plaintext row — accept once (migration compat), then heal by
+        // re-encrypting at rest so the plaintext window closes on first CI run.
+        secretsEnv[s.key] = raw;
+        try {
+          await query(`UPDATE ci_secrets SET value=$1 WHERE id=$2`, [encryptSecret(raw), s.id]);
+        } catch {}
+      }
+    } catch {
+      // S9: undecryptable (corrupt/tampered/wrong-key after rotation) — NEVER inject
+      // the raw stored value as env: it would poison secret-masking and leak
+      // ciphertext into build logs. Skip the key and mark it visibly.
+      skippedSecrets.push(s.key);
+      try {
+        await auditLog({ action: 'ci.secret_decrypt_failure', target: `${repoId}:${s.key}` });
+      } catch {}
+    }
+  }
+  return { env: secretsEnv, skipped: skippedSecrets };
+}
+
 async function runPipeline(pipelineId: string, repoPath: string, repoId: string) {
   await query(`UPDATE ci_pipelines SET status='running', updated_at=now() WHERE id=$1`, [pipelineId]);
   const jobs = await query(`SELECT id, name FROM ci_jobs WHERE pipeline_id=$1 ORDER BY created_at`, [pipelineId]);
   // Load secrets for env injection — S9: decrypt at-rest, fork isolation
-  const secretsRes = await query(`SELECT key, value FROM ci_secrets WHERE repo_id=$1`, [repoId]);
-  const secretsEnv: Record<string, string> = {};
-  for (const s of secretsRes.rows) {
-    try {
-      secretsEnv[s.key] = decryptSecretSafe(s.value);
-    } catch {
-      secretsEnv[s.key] = s.value;
-    }
-  }
+  const { env: secretsEnv, skipped: skippedSecrets } = await resolvePipelineSecrets(repoId);
   // S10/SEC-008: Fork PR & untrusted contributor secret exclusion
   // Untrusted PRs (from forks, external contributors, or non-collaborators) must NEVER receive repository secrets.
+  // S10-fresh: fail CLOSED. The whole detection runs under a default-untrusted latch:
+  // any DB error (or missing pipeline row) now withholds secrets instead of keeping
+  // them (the old `catch {}` left secretsEnv full on error). DB fork markers are
+  // authoritative; the object-existence check below is advisory only (fork objects
+  // are pre-copied by copyMissingObjects, so absence proves nothing — presence
+  // proves nothing either; it can only ever ADD untrusted, never remove it).
+  let isUntrusted = true;
   try {
     const pipeRes = await query(
       `SELECT p.ref, p.branch, p.commit_hash, p.created_by,
@@ -276,36 +333,44 @@ async function runPipeline(pipelineId: string, repoPath: string, repoId: string)
       [pipelineId]
     );
     const pipeInfo = pipeRes.rows[0];
-    const isForkBranch = pipeInfo?.branch?.startsWith('fork/') || pipeInfo?.ref?.includes('/fork/') || Boolean(pipeInfo?.is_fork_pr);
+    if (pipeInfo) {
+      const isForkBranch = pipeInfo?.branch?.startsWith('fork/') || pipeInfo?.ref?.includes('/fork/') || Boolean(pipeInfo?.is_fork_pr);
 
-    let isCollaborator = false;
-    if (pipeInfo?.created_by) {
-      const ownerCheck = await query(`SELECT owner_id FROM repositories WHERE id=$1`, [repoId]);
-      if (ownerCheck.rows[0]?.owner_id === pipeInfo.created_by) {
-        isCollaborator = true;
-      } else {
-        const memCheck = await query(
-          `SELECT 1 FROM repository_members WHERE repo_id=$1 AND user_id=$2 AND role IN ('admin', 'write', 'maintainer')`,
-          [repoId, pipeInfo.created_by]
-        );
-        if (memCheck.rows.length > 0) isCollaborator = true;
+      let isCollaborator = false;
+      if (pipeInfo?.created_by) {
+        const ownerCheck = await query(`SELECT owner_id FROM repositories WHERE id=$1`, [repoId]);
+        if (ownerCheck.rows[0]?.owner_id === pipeInfo.created_by) {
+          isCollaborator = true;
+        } else {
+          const memCheck = await query(
+            `SELECT 1 FROM repository_members WHERE repo_id=$1 AND user_id=$2 AND role IN ('admin', 'write', 'maintainer')`,
+            [repoId, pipeInfo.created_by]
+          );
+          if (memCheck.rows.length > 0) isCollaborator = true;
+        }
+      }
+
+      isUntrusted = isForkBranch || !isCollaborator;
+
+      if (pipeInfo?.commit_hash) {
+        const objPath = path.join(repoPath, '.itehaas', 'objects', pipeInfo.commit_hash.slice(0, 2), pipeInfo.commit_hash.slice(2));
+        if (!fs.existsSync(objPath)) {
+          isUntrusted = true;
+        }
       }
     }
-
-    let isUntrusted = isForkBranch || !isCollaborator;
-
-    if (pipeInfo?.commit_hash) {
-      const objPath = path.join(repoPath, '.itehaas', 'objects', pipeInfo.commit_hash.slice(0, 2), pipeInfo.commit_hash.slice(2));
-      if (!fs.existsSync(objPath)) {
-        isUntrusted = true;
-      }
-    }
+  } catch {
+    // Stay untrusted (fail closed) — a detection outage must not release secrets.
+  }
 
     if (isUntrusted) {
       // Untrusted PR or fork commit — clear secrets per GitHub Actions security model
       for (const k of Object.keys(secretsEnv)) delete secretsEnv[k];
+      // S9: audit every strip (names of withheld keys are not logged — only the fact).
+      try {
+        await auditLog({ action: 'ci.secret_strip_fork', target: `${repoId}:${pipelineId}` });
+      } catch {}
     }
-  } catch {}
 
   let pipelineFailed = false;
   for (const job of jobs.rows) {
@@ -337,6 +402,9 @@ async function runPipeline(pipelineId: string, repoPath: string, repoId: string)
     const safeEnvKeys = Object.keys(secretsEnv);
     let logsPrefix = '';
     if (safeEnvKeys.length > 0) logsPrefix = `# Secrets injected: ${safeEnvKeys.join(', ')} (values hidden)\n`;
+    // S9: skipped keys are visible so a silently-missing secret cannot be mistaken
+    // for an injected one (fail-closed visibility; names only, never values).
+    if (skippedSecrets.length > 0) logsPrefix += `# Secrets skipped (undecryptable, NOT injected): ${skippedSecrets.join(', ')}\n`;
 
     const { logs, exitCode, runner } = await executeInRunner(repoPath, script, secretsEnv, 30000);
     let fullLogs = logsPrefix + logs + `\n# Exit: ${exitCode} (${runner})\n` + (workflowFile ? `# Workflow: ${workflowFile}\n` : '');
@@ -370,6 +438,10 @@ async function runPipeline(pipelineId: string, repoPath: string, repoId: string)
   const durationRes = await query(`SELECT EXTRACT(EPOCH FROM (now() - created_at))*1000 as ms FROM ci_pipelines WHERE id=$1`, [pipelineId]);
   const durationMs = Math.round(durationRes.rows[0]?.ms || 0);
   await query(`UPDATE ci_pipelines SET status=$1, updated_at=now(), duration_ms=$2 WHERE id=$3`, [newStatus, durationMs, pipelineId]);
+  // S18: pipeline completion (no req context in background runner; repo-scoped target only).
+  try {
+    await auditLog({ action: 'ci.pipeline_complete', target: `${repoId}:${pipelineId}:${newStatus}` });
+  } catch {}
 
   // If pipeline is for a PR, update status checks? For now, nothing extra
 }
@@ -388,11 +460,15 @@ export async function ciRoutes(app: FastifyInstance) {
     // S7: rate-limit CI run 5/min per IP
     const rl = checkRateLimit(req as any, 'ci_run', 5, 60 * 1000);
     if (!rl.allowed) return rateLimitReply(reply, rl.resetMs);
-    // S7: queue bound — max 20 queued/running per repo
+    // S7 fail-fast queue bound (advisory: races are closed authoritatively by the
+    // S15 serialized admission at INSERT time below). Checked up front so a full
+    // queue rejects without spawning log/workflow subprocesses first.
     try {
       const pending = await query(`SELECT count(*)::int as c FROM ci_pipelines WHERE repo_id=$1 AND status IN ('queued','running')`, [meta.id]);
       if (pending.rows[0].c >= 20) return reply.status(429).send({ error: 'too many queued pipelines' });
     } catch {}
+    // S7 queue bound (max 20) is enforced atomically at INSERT time below (S15) —
+    // a pre-check here would race with concurrent triggers.
 
     const schema = z.object({
       ref: z.string().min(1).max(200).optional().default('main'),
@@ -420,30 +496,85 @@ export async function ciRoutes(app: FastifyInstance) {
     // Parse workflow YAML (or use inline)
     let workflow: ParsedWorkflow | null = null;
     if (parsed.data.workflow) {
-      // Inline workflow provided (for tests)
+      // Inline workflow provided (for tests).
+      // S10 (FSEC-013): the file path enforces 10 jobs / 20 steps / 5K run caps in
+      // parseWorkflow — the inline path had NONE, allowing 1000-job queue/DB floods
+      // via a single API call. Enforce identical budgets here, fail closed (400).
       const raw = parsed.data.workflow as any;
       const jobs: WorkflowJob[] = [];
-      if (raw.jobs) {
-        for (const [k, v] of Object.entries(raw.jobs as Record<string, any>)) {
-          const steps = Array.isArray((v as any).steps) ? (v as any).steps : [];
-          jobs.push({ name: k, steps });
+      const toSteps = (stepsRaw: unknown, jobName: string): WorkflowJob['steps'] => {
+        if (!Array.isArray(stepsRaw)) return [];
+        if (stepsRaw.length > 20) {
+          throw new Error(`workflow job "${jobName}" has too many steps (max 20)`);
         }
-      } else if (Array.isArray(raw.steps)) {
-        jobs.push({ name: 'build', steps: raw.steps });
+        return stepsRaw.map((s: any) => {
+          const run = s?.run;
+          if (run !== undefined && (typeof run !== 'string' || run.length > 5000)) {
+            throw new Error(`workflow job "${jobName}" has an invalid step (run must be a string ≤5000 chars)`);
+          }
+          return { name: typeof s?.name === 'string' ? s.name : undefined, run, uses: typeof s?.uses === 'string' ? s.uses : undefined };
+        });
+      };
+      try {
+        if (raw.jobs) {
+          if (typeof raw.jobs !== 'object' || Array.isArray(raw.jobs)) {
+            return reply.status(400).send({ error: 'invalid inline workflow: jobs must be an object' });
+          }
+          const jobKeys = Object.keys(raw.jobs as Record<string, any>);
+          if (jobKeys.length > 10) {
+            return reply.status(400).send({ error: 'inline workflow has too many jobs (max 10)' });
+          }
+          for (const [k, v] of Object.entries(raw.jobs as Record<string, any>)) {
+            if (typeof k !== 'string' || k.length < 1 || k.length > 100) {
+              return reply.status(400).send({ error: 'invalid inline workflow job name' });
+            }
+            jobs.push({ name: k, steps: toSteps((v as any)?.steps, k) });
+          }
+        } else if (Array.isArray(raw.steps)) {
+          jobs.push({ name: 'build', steps: toSteps(raw.steps, 'build') });
+        }
+      } catch (e: any) {
+        return reply.status(400).send({ error: e.message || 'invalid inline workflow' });
       }
       workflow = { name: raw.name || 'CI', jobs: jobs.length ? jobs : [{ name: 'build', steps: [{ run: 'echo hi' }] }], raw, file: 'inline' };
     } else {
       workflow = await parseWorkflow(repoPath);
     }
 
-    const pipeRes = await query(`INSERT INTO ci_pipelines (repo_id, ref, commit_hash, created_by, workflow_file, workflow_json, branch) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, status, created_at`, [meta.id, ref, commitHash, user.id, workflow.file, workflow as any, ref]);
-    const pipelineId = pipeRes.rows[0].id;
-    incCIPipelines();
-
-    // Create jobs from workflow
-    for (const job of workflow.jobs) {
-      await query(`INSERT INTO ci_jobs (pipeline_id, name) VALUES ($1,$2)`, [pipelineId, job.name]);
+    // S8: atomic pipeline creation — pipeline + jobs commit together. A mid-write
+    // failure previously left an orphan queued pipeline with partial jobs that the
+    // runner would then execute (uses getClient directly: universally mocked in tests).
+    // S15: admission is serialized on the repo row (FOR UPDATE) so the queue bound
+    // below observes all committed predecessors — concurrent triggers can no longer
+    // jointly overshoot it (check-then-act race).
+    const pclient = await getClient();
+    let pipelineId: string;
+    try {
+      await pclient.query('BEGIN');
+      await pclient.query(`SELECT id FROM repositories WHERE id=$1 FOR UPDATE`, [meta.id]);
+      const pending = await pclient.query(`SELECT count(*)::int AS c FROM ci_pipelines WHERE repo_id=$1 AND status IN ('queued','running')`, [meta.id]);
+      if ((pending.rows[0]?.c ?? 0) >= 20) {
+        await pclient.query('ROLLBACK');
+        return reply.status(429).send({ error: 'too many queued pipelines' });
+      }
+      const pipeRes = await pclient.query(`INSERT INTO ci_pipelines (repo_id, ref, commit_hash, created_by, workflow_file, workflow_json, branch) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, status, created_at`, [meta.id, ref, commitHash, user.id, workflow.file, workflow as any, ref]);
+      pipelineId = pipeRes.rows[0].id;
+      // Create jobs from workflow
+      for (const job of workflow.jobs) {
+        await pclient.query(`INSERT INTO ci_jobs (pipeline_id, name) VALUES ($1,$2)`, [pipelineId, job.name]);
+      }
+      await pclient.query('COMMIT');
+    } catch (e) {
+      try { await pclient.query('ROLLBACK'); } catch {}
+      throw e;
+    } finally {
+      pclient.release();
     }
+    incCIPipelines();
+    // S18: pipeline trigger is a detection signal (who ran what, where).
+    try {
+      await auditLog({ userId: user.id, action: 'ci.pipeline_trigger', target: `${owner}/${repo}:${ref}@${String(commitHash).slice(0, 12)}`, req });
+    } catch {}
 
     setImmediate(() => runPipeline(pipelineId, repoPath, meta.id).catch(()=>{}));
     return reply.status(201).send({ pipeline: { id: pipelineId, status: 'queued', commit: commitHash, ref, workflow: workflow.file } });
@@ -457,6 +588,9 @@ export async function ciRoutes(app: FastifyInstance) {
     if (!meta) return reply.status(404).send({ error: 'not found' });
     const user = await getSessionUser(req as any);
     if (!(await canRead(meta.id, user?.id ?? null, meta.visibility))) return reply.status(404).send({ error: 'not found' });
+    // S14: pollable CI reads — 60/min (dashboard polling must not become a query flood).
+    const rlCiReads = checkRateLimit(req as any, 'ci_reads', 60, 60 * 1000);
+    if (!rlCiReads.allowed) return rateLimitReply(reply as any, rlCiReads.resetMs);
     const res = await query(`SELECT id, ref, commit_hash, status, workflow_file, duration_ms, created_at, updated_at FROM ci_pipelines WHERE repo_id=$1 ORDER BY created_at DESC LIMIT 20`, [meta.id]);
     return reply.send({ pipelines: res.rows });
   });
@@ -468,10 +602,13 @@ export async function ciRoutes(app: FastifyInstance) {
     if (!meta) return reply.status(404).send({ error: 'not found' });
     const user = await getSessionUser(req as any);
     if (!(await canRead(meta.id, user?.id ?? null, meta.visibility))) return reply.status(404).send({ error: 'not found' });
+    const rlCiReadsDetail = checkRateLimit(req as any, 'ci_reads', 60, 60 * 1000);
+    if (!rlCiReadsDetail.allowed) return rateLimitReply(reply as any, rlCiReadsDetail.resetMs);
     const pipe = await query(`SELECT id, ref, commit_hash, status, workflow_file, workflow_json, duration_ms, created_at FROM ci_pipelines WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
     if (pipe.rows.length === 0) return reply.status(404).send({ error: 'not found' });
-    const jobs = await query(`SELECT id, name, status, logs, runner, exit_code, started_at, finished_at FROM ci_jobs WHERE pipeline_id=$1 ORDER BY created_at`, [id]);
-    const artifacts = await query(`SELECT id, job_id, name, path, size_bytes FROM ci_artifacts WHERE pipeline_id=$1`, [id]);
+    // S7: output budget on detail collections (inline workflows are unbounded until S10).
+    const jobs = await query(`SELECT id, name, status, logs, runner, exit_code, started_at, finished_at FROM ci_jobs WHERE pipeline_id=$1 ORDER BY created_at LIMIT $2`, [id, MAX_CI_DETAIL_ROWS]);
+    const artifacts = await query(`SELECT id, job_id, name, path, size_bytes FROM ci_artifacts WHERE pipeline_id=$1 LIMIT $2`, [id, MAX_CI_DETAIL_ROWS]);
     return reply.send({ pipeline: pipe.rows[0], jobs: jobs.rows, artifacts: artifacts.rows });
   });
 
@@ -482,6 +619,9 @@ export async function ciRoutes(app: FastifyInstance) {
     if (!meta) return reply.status(404).send({ error: 'not found' });
     const user = await getSessionUser(req as any);
     if (!(await canRead(meta.id, user?.id ?? null, meta.visibility))) return reply.status(404).send({ error: 'not found' });
+    // S14: 2M log bodies are the heaviest read response — 60/min.
+    const rlCiLogs = checkRateLimit(req as any, 'ci_reads', 60, 60 * 1000);
+    if (!rlCiLogs.allowed) return rateLimitReply(reply as any, rlCiLogs.resetMs);
     const res = await query(`SELECT j.logs, j.status, j.runner, j.exit_code FROM ci_jobs j JOIN ci_pipelines p ON j.pipeline_id=p.id WHERE j.id=$1 AND p.repo_id=$2`, [jobId, meta.id]);
     if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     return reply.send({ logs: res.rows[0].logs, status: res.rows[0].status, runner: res.rows[0].runner, exit_code: res.rows[0].exit_code });
@@ -496,7 +636,7 @@ export async function ciRoutes(app: FastifyInstance) {
     if (!(await canRead(meta.id, user?.id ?? null, meta.visibility))) return reply.status(404).send({ error: 'not found' });
     const pipe = await query(`SELECT id FROM ci_pipelines WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
     if (pipe.rows.length === 0) return reply.status(404).send({ error: 'not found' });
-    const res = await query(`SELECT a.id, a.job_id, a.name, a.path, a.size_bytes, j.name as job_name FROM ci_artifacts a JOIN ci_jobs j ON a.job_id=j.id WHERE a.pipeline_id=$1`, [id]);
+    const res = await query(`SELECT a.id, a.job_id, a.name, a.path, a.size_bytes, j.name as job_name FROM ci_artifacts a JOIN ci_jobs j ON a.job_id=j.id WHERE a.pipeline_id=$1 LIMIT $2`, [id, MAX_CI_DETAIL_ROWS]);
     return reply.send({ artifacts: res.rows });
   });
 
@@ -543,9 +683,11 @@ export async function ciRoutes(app: FastifyInstance) {
     const { owner, repo } = req.params as any;
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
-    const isOwner = (await query(`SELECT owner_id FROM repositories WHERE id=$1`, [meta.id])).rows[0]?.owner_id === user.id;
-    const isAdmin = (await query(`SELECT 1 FROM repository_members WHERE repo_id=$1 AND user_id=$2 AND role='admin'`, [meta.id, user.id])).rows.length > 0;
-    if (!isOwner && !isAdmin) return reply.status(403).send({ error: 'forbidden' });
+    // S3: single isAdmin gate (owner + member-admin + team-admin) — ad-hoc SQL missed team-admin.
+    if (!(await isAdmin(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
+    // S14: status-check mutations gate merges — 20/min.
+    const rlCiChecks = checkRateLimit(req as any, 'ci_checks', 20, 60 * 1000);
+    if (!rlCiChecks.allowed) return rateLimitReply(reply as any, rlCiChecks.resetMs);
     const schema = z.object({ name: z.string().min(1).max(100), required: z.boolean().optional().default(true) });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
@@ -564,9 +706,10 @@ export async function ciRoutes(app: FastifyInstance) {
     const { owner, repo, id } = req.params as any;
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
-    const isOwner = (await query(`SELECT owner_id FROM repositories WHERE id=$1`, [meta.id])).rows[0]?.owner_id === user.id;
-    const isAdmin = (await query(`SELECT 1 FROM repository_members WHERE repo_id=$1 AND user_id=$2 AND role='admin'`, [meta.id, user.id])).rows.length > 0;
-    if (!isOwner && !isAdmin) return reply.status(403).send({ error: 'forbidden' });
+    // S3: single isAdmin gate (owner + member-admin + team-admin).
+    if (!(await isAdmin(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
+    const rlCiChecksDel = checkRateLimit(req as any, 'ci_checks', 20, 60 * 1000);
+    if (!rlCiChecksDel.allowed) return rateLimitReply(reply as any, rlCiChecksDel.resetMs);
     await query(`DELETE FROM ci_status_checks WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
     return reply.send({ ok: true });
   });
@@ -588,17 +731,17 @@ export async function ciRoutes(app: FastifyInstance) {
     return reply.send({ required: checks.rows, passed, latest: latest.rows[0] || null });
   });
 
-  // Secrets (admin only)
+  // Secrets (admin only) — S3: single isAdmin gate (owner + member-admin + team-admin).
   app.get('/api/repos/:owner/:repo/ci/secrets', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
     const { owner, repo } = req.params as any;
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
-    const adminCheck = await query(`SELECT 1 FROM repository_members WHERE repo_id=$1 AND user_id=$2 AND role='admin'`, [meta.id, user.id]);
-    const ownerCheck = await query(`SELECT owner_id FROM repositories WHERE id=$1`, [meta.id]);
-    const isOwner = ownerCheck.rows[0]?.owner_id === user.id;
-    if (!isOwner && adminCheck.rows.length === 0) return reply.status(403).send({ error: 'forbidden' });
+    if (!(await isAdmin(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
+    // S14: secret reads/writes are sensitive — 10/min.
+    const rlCiSecList = checkRateLimit(req as any, 'ci_secrets', 10, 60 * 1000);
+    if (!rlCiSecList.allowed) return rateLimitReply(reply as any, rlCiSecList.resetMs);
     const res = await query(`SELECT key, created_at FROM ci_secrets WHERE repo_id=$1`, [meta.id]);
     return reply.send({ secrets: res.rows });
   });
@@ -609,10 +752,9 @@ export async function ciRoutes(app: FastifyInstance) {
     const { owner, repo } = req.params as any;
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
-    const adminCheck = await query(`SELECT 1 FROM repository_members WHERE repo_id=$1 AND user_id=$2 AND role='admin'`, [meta.id, user.id]);
-    const ownerCheck = await query(`SELECT owner_id FROM repositories WHERE id=$1`, [meta.id]);
-    const isOwner = ownerCheck.rows[0]?.owner_id === user.id;
-    if (!isOwner && adminCheck.rows.length === 0) return reply.status(403).send({ error: 'forbidden' });
+    if (!(await isAdmin(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
+    const rlCiSecCreate = checkRateLimit(req as any, 'ci_secrets', 10, 60 * 1000);
+    if (!rlCiSecCreate.allowed) return rateLimitReply(reply as any, rlCiSecCreate.resetMs);
     const schema = z.object({ key: z.string().min(1).max(100).regex(/^[A-Z_][A-Z0-9_]*$/), value: z.string().min(1).max(5000) });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
@@ -627,16 +769,48 @@ export async function ciRoutes(app: FastifyInstance) {
     return reply.status(201).send({ ok: true });
   });
 
+  // S9: rotation — re-encrypt every repo secret under the CURRENT key. Required after
+  // SECRET_ENCRYPTION_KEY rotation (S1 mandates a distinct key; rotating it orphans
+  // old ciphertext), and heals any remaining legacy plaintext rows in bulk.
+  // Returns counts only — never values.
+  app.post('/api/repos/:owner/:repo/ci/secrets/rotate', async (req, reply) => {
+    const user = await requireAuth(req, reply);
+    if (!user) return;
+    const { owner, repo } = req.params as any;
+    const meta = await getRepoMeta(owner, repo);
+    if (!meta) return reply.status(404).send({ error: 'not found' });
+    if (!(await isAdmin(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
+    const rlCiRotate = checkRateLimit(req as any, 'ci_secrets', 10, 60 * 1000);
+    if (!rlCiRotate.allowed) return rateLimitReply(reply as any, rlCiRotate.resetMs);
+    const rows = await query(`SELECT id, value FROM ci_secrets WHERE repo_id=$1`, [meta.id]);
+    let rotated = 0;
+    let skipped = 0;
+    for (const r of rows.rows) {
+      try {
+        // S9: strict accounting — v1 rows must decrypt under the current key
+        // (corrupt/wrong-key rows are skipped, not silently re-wrapped);
+        // legacy plaintext heals by re-encryption.
+        const raw = String(r.value);
+        const plain = isEncryptedValue(raw) ? decryptSecret(raw) : raw;
+        await query(`UPDATE ci_secrets SET value=$1 WHERE id=$2`, [encryptSecret(plain), r.id]);
+        rotated++;
+      } catch {
+        skipped++;
+      }
+    }
+    await auditLog({ userId: user.id, action: 'ci.secret_rotate', target: `${owner}/${repo}`, req });
+    return reply.send({ ok: true, rotated, skipped });
+  });
+
   app.delete('/api/repos/:owner/:repo/ci/secrets/:key', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
     const { owner, repo, key } = req.params as any;
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
-    const adminCheck = await query(`SELECT 1 FROM repository_members WHERE repo_id=$1 AND user_id=$2 AND role='admin'`, [meta.id, user.id]);
-    const ownerCheck = await query(`SELECT owner_id FROM repositories WHERE id=$1`, [meta.id]);
-    const isOwner = ownerCheck.rows[0]?.owner_id === user.id;
-    if (!isOwner && adminCheck.rows.length === 0) return reply.status(403).send({ error: 'forbidden' });
+    if (!(await isAdmin(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
+    const rlCiSecDel = checkRateLimit(req as any, 'ci_secrets', 10, 60 * 1000);
+    if (!rlCiSecDel.allowed) return rateLimitReply(reply as any, rlCiSecDel.resetMs);
     await query(`DELETE FROM ci_secrets WHERE repo_id=$1 AND key=$2`, [meta.id, key]);
     await auditLog({ userId: user.id, action: 'ci.secret_delete', target: `${owner}/${repo}:${key}`, req });
     return reply.send({ ok: true });

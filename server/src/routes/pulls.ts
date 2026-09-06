@@ -2,10 +2,11 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
-import { query } from '../db';
+import { query, getClient } from '../db';
 import { getSessionUser, requireAuth } from '../middleware/auth';
 import { canRead, canWrite } from '../lib/permissions';
 import { repoPathFor, execItehaas } from '../lib/vcs';
+import { isValidFilePath, isValidBranchRef } from './repos';
 
 function validateOwnerRepo(o: string, r: string) {
   return /^[a-zA-Z0-9._-]{1,100}$/.test(o) && /^[a-zA-Z0-9._-]{1,100}$/.test(r);
@@ -17,21 +18,36 @@ async function getRepoMeta(owner: string, repo: string) {
   return res.rows[0] as { id: string; visibility: string; default_branch: string };
 }
 
-async function copyMissingObjects(sourcePath: string, targetPath: string): Promise<number> {
+export async function copyMissingObjects(sourcePath: string, targetPath: string): Promise<number> {
   const srcObjects = require('path').join(sourcePath, '.itehaas', 'objects');
   const dstObjects = require('path').join(targetPath, '.itehaas', 'objects');
   const fs = require('fs');
+  const pathMod = require('path');
   let copied = 0;
   if (!fs.existsSync(srcObjects)) return 0;
+  // S4: lstat-based walk — never follow symlinks out of the CAS; strictly validate
+  // fanout names (2-hex dir, 38-hex SHA-1 or 62-hex SHA-256 file). A forked repo with
+  // a planted symlink (objects/ab -> /etc) must not cause arbitrary file copy-in.
+  const isHex = (s: string) => /^[0-9a-f]+$/.test(s);
   for (const a of fs.readdirSync(srcObjects)) {
     if (a === 'pack') continue;
-    const aPath = require('path').join(srcObjects, a);
-    if (!fs.statSync(aPath).isDirectory() || a.length !== 2) continue;
-    for (const b of fs.readdirSync(aPath)) {
-      const srcFile = require('path').join(aPath, b);
-      const dstFile = require('path').join(dstObjects, a, b);
+    if (a.length !== 2 || !isHex(a)) continue;
+    const aPath = pathMod.join(srcObjects, a);
+    let aStat: any;
+    try { aStat = fs.lstatSync(aPath); } catch { continue; }
+    if (aStat.isSymbolicLink() || !aStat.isDirectory()) continue;
+    let entries: string[];
+    try { entries = fs.readdirSync(aPath); } catch { continue; }
+    for (const b of entries) {
+      if (b.startsWith('.tmp-')) continue;
+      if ((b.length !== 62 && b.length !== 38) || !isHex(b)) continue;
+      const srcFile = pathMod.join(aPath, b);
+      const dstFile = pathMod.join(dstObjects, a, b);
+      let fStat: any;
+      try { fStat = fs.lstatSync(srcFile); } catch { continue; }
+      if (fStat.isSymbolicLink() || !fStat.isFile()) continue;
       if (!fs.existsSync(dstFile)) {
-        fs.mkdirSync(require('path').dirname(dstFile), { recursive: true });
+        fs.mkdirSync(pathMod.dirname(dstFile), { recursive: true });
         fs.copyFileSync(srcFile, dstFile);
         copied++;
       }
@@ -94,6 +110,11 @@ export async function pullRoutes(app: FastifyInstance) {
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { title, body, source_branch, target_branch, source_repo, draft } = parsed.data as any;
+    // S3: branch names flow into `fork/` ref joins and VCS subprocess args — the schema
+    // regex alone allows .., //, @{ and leading dots. Enforce strict ref validation.
+    if (!isValidBranchRef(source_branch) || !isValidBranchRef(target_branch)) {
+      return reply.status(400).send({ error: 'invalid branch name' });
+    }
     const isCrossFork = !!source_repo;
     const isDraft = !!draft;
 
@@ -251,14 +272,32 @@ export async function pullRoutes(app: FastifyInstance) {
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
     if (!(await canWrite(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
-    // S15 / SEC-019: Repository-level advisory lock for merge operations to eliminate working tree collisions
-    const { hashStringToInt: hashIntMerge } = await import('../db');
-    const mergeLockKey = hashIntMerge('repo-merge:' + meta.id);
-    const mergeLockRes = await query('SELECT pg_try_advisory_lock($1) as locked', [mergeLockKey]);
-    if (!mergeLockRes.rows[0]?.locked) {
+    // S14: merge runs checkout+merge subprocesses under a global lock — 10/min.
+    const { checkRateLimit: crMerge, rateLimitReply: rlrMerge } = await import('../lib/rateLimit');
+    const rlMerge = crMerge(req as any, 'merge', 10, 60 * 1000);
+    if (!rlMerge.allowed) return rlrMerge(reply as any, rlMerge.resetMs);
+    // S15 / SEC-019: repository-level advisory lock, session-pinned and keyed per
+    // repo — SHARED with push/delete so a merge can never interleave with a ref
+    // write or repo deletion on the same working tree (previously merge used a
+    // different key and raced pushes; unlocks also leaked across pool backends).
+    // The lock lives on ONE pooled client for the whole merge (see repos.ts).
+    const { advisoryLockKeys: mergeKeys, lockClientAdvisory: lockMerge, unlockClientAdvisory: unlockMerge } = await import('../db');
+    const mergeLockKey = mergeKeys(meta.id);
+    const mergeLockClient = await getClient();
+    let releaseMergeLock: (() => Promise<void>) | null = null;
+    try {
+      if (!(await lockMerge(mergeLockClient, mergeLockKey))) {
+        mergeLockClient.release();
+        return reply.status(423).send({ error: 'merge locked, retry' });
+      }
+      releaseMergeLock = async () => {
+        await unlockMerge(mergeLockClient, mergeLockKey);
+        mergeLockClient.release();
+      };
+    } catch {
+      try { mergeLockClient.release(); } catch {}
       return reply.status(423).send({ error: 'merge locked, retry' });
     }
-    let mergeLockHeld = true;
     try {
     const prRes = await query(`SELECT source_branch, target_branch, status, is_draft, title, body FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
     if (prRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
@@ -307,60 +346,75 @@ export async function pullRoutes(app: FastifyInstance) {
       return reply.status(500).send({ error: mergeRes.stderr || mergeRes.stdout });
     }
     // If merge succeeded, check if it was fast-forward or merge commit
-    await query(`UPDATE pull_requests SET status='merged', updated_at=now() WHERE id=$1`, [id]);
-    await query(`INSERT INTO activity (repo_id, user_id, action, payload) VALUES ($1,$2,'pr_merge',$3)`, [meta.id, user.id, JSON.stringify({ pr_id: id, source_branch })]);
-    // Close keywords: parse title/body for fixes #<id> (supports UUID prefix and sequential issue numbers)
+    // S8: atomic merge completion — status + activity + close-keywords commit together
+    // so a mid-write failure cannot leave a merged PR with dangling open issues
+    // (or vice versa). FS merge already succeeded; only DB writes are transactional.
+    const mclient = await getClient();
     try {
-      const text = `${prRes.rows[0].title} ${prRes.rows[0].body}`;
-      // Expanded keywords: fix/fixes/fixed, close/closes/closed, resolve/resolves/resolved (case-insensitive, optional colon)
-      const regex = /(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s*:?\s+#([0-9a-f-]{4,36})/gi;
-      let m: RegExpExecArray | null;
-      const handledIds = new Set<string>();
-      while ((m = regex.exec(text)) !== null) {
-        const prefix = m[1].toLowerCase();
-        // UUID prefix (hex + dashes) — match id::text LIKE prefix%
-        const iss = await query(`SELECT id FROM issues WHERE repo_id=$1 AND id::text ILIKE $2 AND status='open'`, [meta.id, prefix + '%']);
-        for (const row of iss.rows) {
-          if (!handledIds.has(row.id)) {
-            await query(`UPDATE issues SET status='closed', updated_at=now() WHERE id=$1`, [row.id]);
-            handledIds.add(row.id);
+      await mclient.query('BEGIN');
+      await mclient.query(`UPDATE pull_requests SET status='merged', updated_at=now() WHERE id=$1`, [id]);
+      await mclient.query(`INSERT INTO activity (repo_id, user_id, action, payload) VALUES ($1,$2,'pr_merge',$3)`, [meta.id, user.id, JSON.stringify({ pr_id: id, source_branch })]);
+      // Close keywords: parse title/body for fixes #<id> (supports UUID prefix and sequential issue numbers)
+      try {
+        const text = `${prRes.rows[0].title} ${prRes.rows[0].body}`;
+        // Expanded keywords: fix/fixes/fixed, close/closes/closed, resolve/resolves/resolved (case-insensitive, optional colon)
+        const regex = /(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s*:?\s+#([0-9a-f-]{4,36})/gi;
+        let m: RegExpExecArray | null;
+        const handledIds = new Set<string>();
+        while ((m = regex.exec(text)) !== null) {
+          const prefix = m[1].toLowerCase();
+          // UUID prefix (hex + dashes) — match id::text LIKE prefix%
+          const iss = await mclient.query(`SELECT id FROM issues WHERE repo_id=$1 AND id::text ILIKE $2 AND status='open'`, [meta.id, prefix + '%']);
+          for (const row of iss.rows) {
+            if (!handledIds.has(row.id)) {
+              await mclient.query(`UPDATE issues SET status='closed', updated_at=now() WHERE id=$1`, [row.id]);
+              handledIds.add(row.id);
+            }
           }
         }
-      }
-      // Numeric #123 — map to sequential issue number ordered by created_at (GitHub-style)
-      const regexNum = /(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s*:?\s+#([0-9]{1,6})\b/gi;
-      let m2: RegExpExecArray | null;
-      while ((m2 = regexNum.exec(text)) !== null) {
-        const num = parseInt(m2[1], 10);
-        if (isNaN(num) || num < 1) continue;
-        // Find nth open issue (1-indexed) by creation order
-        const numbered = await query(
-          `WITH ordered AS (SELECT id, ROW_NUMBER() OVER (ORDER BY created_at) as rn FROM issues WHERE repo_id=$1 AND status='open') SELECT id FROM ordered WHERE rn=$2`,
-          [meta.id, num]
-        );
-        // Fallback: if numeric doesn't map to rn, close oldest open issue for MVP (e.g., fixes #1 when only 1 issue)
-        const target = numbered.rows[0] ?? (await query(`SELECT id FROM issues WHERE repo_id=$1 AND status='open' ORDER BY created_at LIMIT 1`, [meta.id])).rows[0];
-        if (target && !handledIds.has(target.id)) {
-          await query(`UPDATE issues SET status='closed', updated_at=now() WHERE id=$1`, [target.id]);
-          handledIds.add(target.id);
+        // Numeric #123 — map to sequential issue number ordered by created_at (GitHub-style).
+        // S3: only close when the number maps to a real open issue. Never fall back to
+        // closing the oldest open issue — a wrong number must not close the wrong issue.
+        const regexNum = /(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s*:?\s+#([0-9]{1,6})\b/gi;
+        let m2: RegExpExecArray | null;
+        while ((m2 = regexNum.exec(text)) !== null) {
+          const num = parseInt(m2[1], 10);
+          if (isNaN(num) || num < 1) continue;
+          // Find nth open issue (1-indexed) by creation order
+          const numbered = await mclient.query(
+            `WITH ordered AS (SELECT id, ROW_NUMBER() OVER (ORDER BY created_at) as rn FROM issues WHERE repo_id=$1 AND status='open') SELECT id FROM ordered WHERE rn=$2`,
+            [meta.id, num]
+          );
+          const target = numbered.rows[0];
+          if (target && !handledIds.has(target.id)) {
+            await mclient.query(`UPDATE issues SET status='closed', updated_at=now() WHERE id=$1`, [target.id]);
+            handledIds.add(target.id);
+          }
         }
-      }
-    } catch {}
+      } catch {}
+      await mclient.query('COMMIT');
+    } catch (e) {
+      try { await mclient.query('ROLLBACK'); } catch {}
+      throw e;
+    } finally {
+      mclient.release();
+    }
     return reply.send({ ok: true, output: mergeRes.stdout });
     } finally {
-      if (mergeLockHeld) {
-        await query('SELECT pg_advisory_unlock($1)', [mergeLockKey]).catch(()=>{});
-      }
+      await releaseMergeLock();
     }
   });
 
-  // Comments
+  // Comments — S3: scope children to parent repo (BOLA).
   app.get('/api/repos/:owner/:repo/pulls/:id/comments', async (req, reply) => {
     const { owner, repo, id } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid' });
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
     const user = await getSessionUser(req as any);
     if (!(await canRead(meta.id, user?.id ?? null, meta.visibility))) return reply.status(404).send({ error: 'not found' });
+    const parent = await query(`SELECT id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
+    if (parent.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const res = await query(`SELECT c.id, c.body, c.created_at, u.username as author FROM pr_comments c JOIN users u ON c.author_id=u.id WHERE c.pr_id=$1 ORDER BY c.created_at`, [id]);
     return reply.send({ comments: res.rows });
   });
@@ -372,6 +426,7 @@ export async function pullRoutes(app: FastifyInstance) {
     const rlCom2 = crCom2(req as any, 'comments', 30, 60 * 1000);
     if (!rlCom2.allowed) return rlrCom2(reply as any, rlCom2.resetMs);
     const { owner, repo, id } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid' });
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
     if (!(await canRead(meta.id, user.id, meta.visibility))) return reply.status(404).send({ error: 'not found' });
@@ -427,7 +482,8 @@ export async function pullRoutes(app: FastifyInstance) {
     if (parsed.data.is_draft !== undefined) { fields.push(`is_draft = $${idx++}`); vals.push(parsed.data.is_draft); }
     if (fields.length === 0) return reply.status(400).send({ error: 'no fields' });
     vals.push(id);
-    const res = await query(`UPDATE pull_requests SET ${fields.join(', ')}, updated_at=now() WHERE id=$${idx} RETURNING *`, vals);
+    const res = await query(`UPDATE pull_requests SET ${fields.join(', ')}, updated_at=now() WHERE id=$${idx} AND repo_id=$${idx+1} RETURNING *`, [...vals, meta.id]);
+    if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     return reply.send({ pull: res.rows[0] });
   });
 
@@ -441,17 +497,21 @@ export async function pullRoutes(app: FastifyInstance) {
     const prRes = await query(`SELECT author_id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
     if (prRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     if (prRes.rows[0].author_id !== user.id && !(await canWrite(meta.id, user.id))) return reply.status(403).send({ error: 'forbidden' });
-    await query(`UPDATE pull_requests SET is_draft=false, updated_at=now() WHERE id=$1`, [id]);
+    const updated = await query(`UPDATE pull_requests SET is_draft=false, updated_at=now() WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
+    if (updated.rowCount === 0) return reply.status(404).send({ error: 'not found' });
     return reply.send({ ok: true });
   });
 
-  // Requested reviewers
+  // Requested reviewers — S3: scope children to parent repo (BOLA).
   app.get('/api/repos/:owner/:repo/pulls/:id/reviewers', async (req, reply) => {
     const { owner, repo, id } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid' });
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
     const user = await getSessionUser(req as any);
     if (!(await canRead(meta.id, user?.id ?? null, meta.visibility))) return reply.status(404).send({ error: 'not found' });
+    const parent = await query(`SELECT id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
+    if (parent.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const res = await query(`SELECT u.username, r.requested_by, r.created_at FROM pr_requested_reviewers r JOIN users u ON r.user_id=u.id WHERE r.pr_id=$1`, [id]);
     return reply.send({ reviewers: res.rows });
   });
@@ -459,12 +519,22 @@ export async function pullRoutes(app: FastifyInstance) {
   app.post('/api/repos/:owner/:repo/pulls/:id/reviewers', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: reviewer-request spam (fires notifications) — 20/min.
+    const { checkRateLimit: crRev, rateLimitReply: rlrRev } = await import('../lib/rateLimit');
+    const rlRev = crRev(req as any, 'reviews', 20, 60 * 1000);
+    if (!rlRev.allowed) return rlrRev(reply as any, rlRev.resetMs);
     const { owner, repo, id } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid' });
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
     if (!(await canRead(meta.id, user.id, meta.visibility))) return reply.status(404).send({ error: 'not found' });
-    const prRes = await query(`SELECT id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
+    const prRes = await query(`SELECT id, author_id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
     if (prRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
+    // S3: requesting reviewers is a maintainer/author action — readers must not spam
+    // review requests + notifications on PRs they don't own.
+    if (prRes.rows[0].author_id !== user.id && !(await canWrite(meta.id, user.id))) {
+      return reply.status(403).send({ error: 'forbidden: only the PR author or writers can request reviewers' });
+    }
     const schema = z.object({ username: z.string().min(3).max(32).regex(/^[a-zA-Z0-9._-]+$/) });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
@@ -510,6 +580,9 @@ export async function pullRoutes(app: FastifyInstance) {
   app.post('/api/repos/:owner/:repo/pulls/:id/reviews', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    const { checkRateLimit: crRevs, rateLimitReply: rlrRevs } = await import('../lib/rateLimit');
+    const rlRevs = crRevs(req as any, 'reviews', 20, 60 * 1000);
+    if (!rlRevs.allowed) return rlrRevs(reply as any, rlRevs.resetMs);
     const { owner, repo, id } = req.params as any;
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
@@ -522,9 +595,14 @@ export async function pullRoutes(app: FastifyInstance) {
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { decision, body } = parsed.data;
     // Check PR exists
-    const prRes = await query(`SELECT status, is_draft FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
+    const prRes = await query(`SELECT status, is_draft, author_id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
     if (prRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     if (prRes.rows[0].status !== 'open') return reply.status(400).send({ error: 'pr not open' });
+    // S3: 4-eyes — the PR author cannot approve/request-changes on their own PR.
+    // (Comment reviews remain allowed for author replies.)
+    if (prRes.rows[0].author_id === user.id && decision !== 'commented') {
+      return reply.status(403).send({ error: 'forbidden: authors cannot approve their own pull request' });
+    }
     // Insert review
     const res = await query(`INSERT INTO pr_reviews (pr_id, reviewer_id, decision, body) VALUES ($1,$2,$3,$4) RETURNING id, decision, body, created_at`, [id, user.id, decision, body]);
     // If approved, remove from requested
@@ -543,21 +621,27 @@ export async function pullRoutes(app: FastifyInstance) {
 
   app.get('/api/repos/:owner/:repo/pulls/:id/reviews', async (req, reply) => {
     const { owner, repo, id } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid' });
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
     const user = await getSessionUser(req as any);
     if (!(await canRead(meta.id, user?.id ?? null, meta.visibility))) return reply.status(404).send({ error: 'not found' });
+    const parent = await query(`SELECT id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
+    if (parent.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const res = await query(`SELECT r.id, r.decision, r.body, r.created_at, u.username as reviewer FROM pr_reviews r JOIN users u ON r.reviewer_id=u.id WHERE r.pr_id=$1 ORDER BY r.created_at`, [id]);
     return reply.send({ reviews: res.rows });
   });
 
-  // Line-level review comments
+  // Line-level review comments — S3: scope children to parent repo (BOLA).
   app.get('/api/repos/:owner/:repo/pulls/:id/review_comments', async (req, reply) => {
     const { owner, repo, id } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid' });
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
     const user = await getSessionUser(req as any);
     if (!(await canRead(meta.id, user?.id ?? null, meta.visibility))) return reply.status(404).send({ error: 'not found' });
+    const parent = await query(`SELECT id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
+    if (parent.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const res = await query(`SELECT c.id, c.body, c.path, c.line, c.side, c.commit_hash, c.created_at, u.username as author FROM pr_review_comments c JOIN users u ON c.author_id=u.id WHERE c.pr_id=$1 ORDER BY c.created_at`, [id]);
     return reply.send({ comments: res.rows });
   });
@@ -565,7 +649,12 @@ export async function pullRoutes(app: FastifyInstance) {
   app.post('/api/repos/:owner/:repo/pulls/:id/review_comments', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: comment cost class — 30/min shared with issue/PR comments.
+    const { checkRateLimit: crRevCom, rateLimitReply: rlrRevCom } = await import('../lib/rateLimit');
+    const rlRevCom = crRevCom(req as any, 'comments', 30, 60 * 1000);
+    if (!rlRevCom.allowed) return rlrRevCom(reply as any, rlRevCom.resetMs);
     const { owner, repo, id } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid' });
     const meta = await getRepoMeta(owner, repo);
     if (!meta) return reply.status(404).send({ error: 'not found' });
     if (!(await canRead(meta.id, user.id, meta.visibility))) return reply.status(404).send({ error: 'not found' });
@@ -579,6 +668,8 @@ export async function pullRoutes(app: FastifyInstance) {
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { body, path: filePath, line, side, commit_hash } = parsed.data;
+    // S3: review paths are attacker-controlled display data — reject traversal/control entries.
+    if (!isValidFilePath(filePath)) return reply.status(400).send({ error: 'invalid path' });
     const prRes = await query(`SELECT id FROM pull_requests WHERE id=$1 AND repo_id=$2`, [id, meta.id]);
     if (prRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const res = await query(`INSERT INTO pr_review_comments (pr_id, author_id, body, path, line, side, commit_hash) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, body, path, line, side, commit_hash, created_at`, [id, user.id, body, filePath, line ?? null, side, commit_hash ?? null]);

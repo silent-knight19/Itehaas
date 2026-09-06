@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { query } from '../db';
 import { getSessionUser } from '../middleware/auth';
+import { escapeLikePattern } from '../lib/budgets';
 
 export async function searchRoutes(app: FastifyInstance) {
   // Global search: GET /api/search?q=hello&type=repos|issues|pulls|users&limit=20 — S7 bounded, S14 rate-limited
@@ -12,7 +13,8 @@ export async function searchRoutes(app: FastifyInstance) {
     const { q, type, limit, offset } = req.query as any;
     if (!q || typeof q !== 'string' || q.trim().length < 2) return reply.status(400).send({ error: 'query too short (min 2 chars)' });
     if (q.trim().length > 100) return reply.status(400).send({ error: 'query too long (max 100 chars)' });
-    const search = `%${q.trim()}%`;
+    // S7: escape LIKE wildcards — `q=%%` must not become a full-table scan.
+    const search = `%${escapeLikePattern(q.trim())}%`;
     const lim = Math.min(Math.max(parseInt(limit ?? '20', 10) || 20, 1), 20); // S7: cap 20 not 50
     const off = Math.max(parseInt(offset ?? '0', 10) || 0, 0);
     if (off > 10000) return reply.status(400).send({ error: 'offset too large' });
@@ -26,12 +28,13 @@ export async function searchRoutes(app: FastifyInstance) {
 
     if (!t || t === 'repos' || t === 'repositories') {
       // Repositories: name ILIKE or description ILIKE, with visibility filter
+      // S3: team members must find team repos too (direct + team permission).
       let sql: string;
       let params: any[];
       if (userId) {
         sql = `SELECT r.id, r.name, r.description, r.visibility, r.updated_at, u.username as owner
                FROM repositories r JOIN users u ON r.owner_id=u.id
-               WHERE (r.visibility='public' OR r.owner_id=$1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id=r.id AND m.user_id=$1))
+               WHERE (r.visibility='public' OR r.owner_id=$1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id=r.id AND m.user_id=$1) OR EXISTS (SELECT 1 FROM team_members tm JOIN team_repositories tr ON tm.team_id=tr.team_id WHERE tm.user_id=$1 AND tr.repo_id=r.id))
                  AND (r.name ILIKE $2 OR r.description ILIKE $2 OR u.username ILIKE $2)
                 ORDER BY r.updated_at DESC LIMIT $3 OFFSET $4`;
         params = [userId, search, lim, off];
@@ -52,7 +55,7 @@ export async function searchRoutes(app: FastifyInstance) {
       if (userId) {
         sql = `SELECT i.id, i.title, i.body, i.status, i.repo_id, r.name as repo, u.username as repo_owner
                FROM issues i JOIN repositories r ON i.repo_id=r.id JOIN users u ON r.owner_id=u.id
-               WHERE (r.visibility='public' OR r.owner_id=$1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id=r.id AND m.user_id=$1))
+               WHERE (r.visibility='public' OR r.owner_id=$1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id=r.id AND m.user_id=$1) OR EXISTS (SELECT 1 FROM team_members tm JOIN team_repositories tr ON tm.team_id=tr.team_id WHERE tm.user_id=$1 AND tr.repo_id=r.id))
                  AND (i.title ILIKE $2 OR i.body ILIKE $2)
                ORDER BY i.updated_at DESC LIMIT $3 OFFSET $4`;
         params = [userId, search, lim, off];
@@ -73,7 +76,7 @@ export async function searchRoutes(app: FastifyInstance) {
       if (userId) {
         sql = `SELECT pr.id, pr.title, pr.body, pr.status, pr.repo_id, r.name as repo, u.username as repo_owner
                FROM pull_requests pr JOIN repositories r ON pr.repo_id=r.id JOIN users u ON r.owner_id=u.id
-               WHERE (r.visibility='public' OR r.owner_id=$1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id=r.id AND m.user_id=$1))
+               WHERE (r.visibility='public' OR r.owner_id=$1 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id=r.id AND m.user_id=$1) OR EXISTS (SELECT 1 FROM team_members tm JOIN team_repositories tr ON tm.team_id=tr.team_id WHERE tm.user_id=$1 AND tr.repo_id=r.id))
                  AND (pr.title ILIKE $2 OR pr.body ILIKE $2)
                ORDER BY pr.updated_at DESC LIMIT $3 OFFSET $4`;
         params = [userId, search, lim, off];

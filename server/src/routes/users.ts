@@ -5,6 +5,7 @@ import { getSessionUser, requireAuth } from '../middleware/auth';
 import { validateBio } from '../lib/auth';
 import { execItehaas, repoPathFor } from '../lib/vcs';
 import { checkRateLimit, rateLimitReply } from '../lib/rateLimit';
+import { escapeLikePattern, MAX_LIST_OFFSET } from '../lib/budgets';
 
 const USERNAME_REGEX = /^[a-zA-Z0-9._-]{3,32}$/;
 const RESERVED = new Set(['login','register','api','health','settings','explore','_next','admin','root','owner','repo']);
@@ -53,21 +54,52 @@ export async function userRoutes(app: FastifyInstance) {
     const reposOwnedRes = await query(`SELECT count(*)::int as c FROM repositories WHERE owner_id = $1`, [user.id]);
     const reposOwned = reposOwnedRes.rows[0].c;
 
-    const starsReceivedRes = await query(
-      `SELECT count(*)::int as c FROM stars s JOIN repositories r ON s.repo_id = r.id WHERE r.owner_id = $1`,
-      [user.id]
-    );
-    const starsReceived = starsReceivedRes.rows[0].c;
+    const sessionUser = await getSessionUser(req as any);
+    const isSelf = sessionUser?.id === user.id;
+
+    // S3: stars/activity on private repos must not leak volume to strangers.
+    // Self sees everything; others only see counts attributable to repos they can read.
+    let starsReceived: number;
+    let activityCount: number;
+    if (isSelf) {
+      const starsReceivedRes = await query(
+        `SELECT count(*)::int as c FROM stars s JOIN repositories r ON s.repo_id = r.id WHERE r.owner_id = $1`,
+        [user.id]
+      );
+      starsReceived = starsReceivedRes.rows[0].c;
+      const activityCountRes = await query(`SELECT count(*)::int as c FROM activity WHERE user_id = $1`, [user.id]);
+      activityCount = activityCountRes.rows[0].c;
+    } else {
+      const viewerId = sessionUser?.id ?? null;
+      if (!viewerId) {
+        const starsReceivedRes = await query(
+          `SELECT count(*)::int as c FROM stars s JOIN repositories r ON s.repo_id = r.id WHERE r.owner_id = $1 AND r.visibility = 'public'`,
+          [user.id]
+        );
+        starsReceived = starsReceivedRes.rows[0].c;
+        const activityCountRes = await query(
+          `SELECT count(*)::int as c FROM activity a JOIN repositories r ON a.repo_id = r.id WHERE a.user_id = $1 AND r.visibility = 'public'`,
+          [user.id]
+        );
+        activityCount = activityCountRes.rows[0].c;
+      } else {
+        const starsReceivedRes = await query(
+          `SELECT count(*)::int as c FROM stars s JOIN repositories r ON s.repo_id = r.id
+           WHERE r.owner_id = $1 AND (r.visibility = 'public' OR r.owner_id = $2 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id = r.id AND m.user_id = $2))`,
+          [user.id, viewerId]
+        );
+        starsReceived = starsReceivedRes.rows[0].c;
+        const activityCountRes = await query(
+          `SELECT count(*)::int as c FROM activity a JOIN repositories r ON a.repo_id = r.id
+           WHERE a.user_id = $1 AND (r.visibility = 'public' OR r.owner_id = $2 OR EXISTS (SELECT 1 FROM repository_members m WHERE m.repo_id = r.id AND m.user_id = $2))`,
+          [user.id, viewerId]
+        );
+        activityCount = activityCountRes.rows[0].c;
+      }
+    }
 
     const starsGivenRes = await query(`SELECT count(*)::int as c FROM stars WHERE user_id = $1`, [user.id]);
     const starsGiven = starsGivenRes.rows[0].c;
-
-    // Optional: count activity items authored (if needed for frontend)
-    const activityCountRes = await query(`SELECT count(*)::int as c FROM activity WHERE user_id = $1`, [user.id]);
-    const activityCount = activityCountRes.rows[0].c;
-
-    const sessionUser = await getSessionUser(req as any);
-    const isSelf = sessionUser?.id === user.id;
 
     return reply.send({
       user: {
@@ -150,6 +182,10 @@ export async function userRoutes(app: FastifyInstance) {
     if (!username) return;
     const target = await getUserRow(username);
     if (!target) return reply.status(404).send({ error: 'not found' });
+    // S14: profile-list reads (some fan out to VCS) — 60/min.
+    { const { checkRateLimit: crU, rateLimitReply: rlrU } = await import('../lib/rateLimit');
+      const rlU = crU(req as any, 'users', 60, 60 * 1000);
+      if (!rlU.allowed) return rlrU(reply as any, rlU.resetMs); }
 
     const viewer = await getSessionUser(req as any);
     const viewerId = viewer?.id ?? null;
@@ -160,6 +196,8 @@ export async function userRoutes(app: FastifyInstance) {
     const search = q?.search ? String(q.search).trim() : null;
     const limit = Math.min(Math.max(parseInt(q?.limit ?? '50', 10) || 50, 1), 100);
     const offset = Math.max(parseInt(q?.offset ?? '0', 10) || 0, 0);
+    // S7: deep-offset guard (consistent with issues/pulls/search budgets).
+    if (offset > MAX_LIST_OFFSET) return reply.status(400).send({ error: 'offset too large' });
 
     // Build where: repos where owner is target OR target is member? Spec says owned or collaborated
     // For profile, show owned + member repos, but filtered by visibility+viewer permissions
@@ -219,8 +257,9 @@ export async function userRoutes(app: FastifyInstance) {
     }
 
     if (search) {
+      // S7: escape LIKE wildcards so short queries cannot become full scans.
       where += ` AND (r.name ILIKE $${pIdx} OR r.description ILIKE $${pIdx} OR u.username ILIKE $${pIdx})`;
-      params.push(`%${search}%`);
+      params.push(`%${escapeLikePattern(search)}%`);
       pIdx++;
     }
 
@@ -261,12 +300,17 @@ export async function userRoutes(app: FastifyInstance) {
     if (!username) return;
     const target = await getUserRow(username);
     if (!target) return reply.status(404).send({ error: 'not found' });
+    { const { checkRateLimit: crUS, rateLimitReply: rlrUS } = await import('../lib/rateLimit');
+      const rlUS = crUS(req as any, 'users', 60, 60 * 1000);
+      if (!rlUS.allowed) return rlrUS(reply as any, rlUS.resetMs); }
     const viewer = await getSessionUser(req as any);
     const viewerId = viewer?.id ?? null;
     const q = req.query as any;
     const search = q?.search ? String(q.search).trim() : null;
     const limit = Math.min(Math.max(parseInt(q?.limit ?? '50', 10) || 50, 1), 100);
     const offset = Math.max(parseInt(q?.offset ?? '0', 10) || 0, 0);
+    // S7: deep-offset guard.
+    if (offset > MAX_LIST_OFFSET) return reply.status(400).send({ error: 'offset too large' });
 
     let where = `s.user_id = $1`;
     const params: any[] = [target.id];
@@ -285,8 +329,9 @@ export async function userRoutes(app: FastifyInstance) {
     } // else own stars: show all
 
     if (search) {
+      // S7: escape LIKE wildcards.
       where += ` AND (r.name ILIKE $${idx} OR r.description ILIKE $${idx} OR u.username ILIKE $${idx})`;
-      params.push(`%${search}%`);
+      params.push(`%${escapeLikePattern(search)}%`);
       idx++;
     }
 
@@ -312,6 +357,9 @@ export async function userRoutes(app: FastifyInstance) {
     if (!username) return;
     const target = await getUserRow(username);
     if (!target) return reply.status(404).send({ error: 'not found' });
+    { const { checkRateLimit: crUA, rateLimitReply: rlrUA } = await import('../lib/rateLimit');
+      const rlUA = crUA(req as any, 'users', 60, 60 * 1000);
+      if (!rlUA.allowed) return rlrUA(reply as any, rlUA.resetMs); }
     const q = req.query as any;
     const limit = Math.min(Math.max(parseInt(q?.limit ?? '30', 10) || 30, 1), 100);
 

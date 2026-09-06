@@ -80,6 +80,15 @@ export function decryptSecret(ciphertextStr: string, rootKey?: string): string {
 }
 
 /**
+ * Whether a stored value is versioned ciphertext (vs legacy plaintext).
+ * Plaintext rows predate at-rest encryption; runPipeline heals them on read
+ * (see ci.ts) and POST /ci/secrets/rotate heals them in bulk.
+ */
+export function isEncryptedValue(v: string): boolean {
+  return typeof v === 'string' && v.startsWith('v1:');
+}
+
+/**
  * Try decrypting, and if that fails, return the raw value (for legacy plaintext).
  */
 export function decryptSecretSafe(ciphertext: string, rootKey?: string): string {

@@ -7,12 +7,14 @@ import {
   validateDatabaseUrl,
   validateReposRoot,
   validateItehaasBin,
+  validatePort,
   AppConfig,
 } from '../config';
 
 describe('S1 Security Baseline & Fail-Closed Boot', () => {
   const validProdSecret = 'super-secure-production-random-auth-key-at-least-32-chars-long';
-  const validProdDb = 'postgres://prod_user:StrongSecretPassword123!@db.internal:5432/itehaas_prod';
+  const validProdSek = 'distinct-secret-encryption-key-9f8e7d6c5b4a39485769788796a5b4c';
+  const validProdDb = 'postgres://prod_user:Str0ng!X7q2$Z9mV4kQ8@db.internal:5432/itehaas_prod';
   const validReposRoot = path.join(__dirname, '../../../data/repos');
   const validBin = path.join(__dirname, '../../../target/debug/itehaas');
 
@@ -24,6 +26,7 @@ describe('S1 Security Baseline & Fail-Closed Boot', () => {
       reposRoot: validReposRoot,
       itehaasBin: validBin,
       cookieSecret: validProdSecret,
+      secretEncryptionKey: validProdSek,
       nodeEnv: 'production',
       isProd: true,
     };
@@ -43,7 +46,7 @@ describe('S1 Security Baseline & Fail-Closed Boot', () => {
     it('weak secret (length < 32) -> startup failure in production', () => {
       const cfg = getBaseProdConfig();
       cfg.cookieSecret = 'short-secret';
-      expect(() => validateStartupConfig(cfg, { NODE_ENV: 'production' })).toThrow(
+      expect(() => validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: validProdSek })).toThrow(
         /COOKIE_SECRET too short in production \(min 32 chars/
       );
     });
@@ -62,7 +65,7 @@ describe('S1 Security Baseline & Fail-Closed Boot', () => {
       for (const pat of patterns) {
         const cfg = getBaseProdConfig();
         cfg.cookieSecret = `random-padding-prefix-12345-${pat}-random-padding-suffix-67890`;
-        expect(() => validateStartupConfig(cfg, { NODE_ENV: 'production' })).toThrow(
+        expect(() => validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: validProdSek })).toThrow(
           /contains insecure default pattern/
         );
       }
@@ -82,28 +85,28 @@ describe('S1 Security Baseline & Fail-Closed Boot', () => {
     it('production debug setting (DEBUG=true) -> startup failure', () => {
       const cfg = getBaseProdConfig();
       expect(() =>
-        validateStartupConfig(cfg, { NODE_ENV: 'production', DEBUG: 'true' })
+        validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: validProdSek, DEBUG: 'true' })
       ).toThrow(/DEBUG mode is forbidden in production environment/);
     });
 
     it('production debug setting (ITEHAAS_DEBUG=1) -> startup failure', () => {
       const cfg = getBaseProdConfig();
       expect(() =>
-        validateStartupConfig(cfg, { NODE_ENV: 'production', ITEHAAS_DEBUG: '1' })
+        validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: validProdSek, ITEHAAS_DEBUG: '1' })
       ).toThrow(/DEBUG mode is forbidden in production environment/);
     });
 
     it('production verbose log level (LOG_LEVEL=debug) -> startup failure', () => {
       const cfg = getBaseProdConfig();
       expect(() =>
-        validateStartupConfig(cfg, { NODE_ENV: 'production', LOG_LEVEL: 'debug' })
+        validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: validProdSek, LOG_LEVEL: 'debug' })
       ).toThrow(/Verbose LOG_LEVEL="debug" is forbidden in production/);
     });
 
     it('production verbose log level (LOG_LEVEL=trace) -> startup failure', () => {
       const cfg = getBaseProdConfig();
       expect(() =>
-        validateStartupConfig(cfg, { NODE_ENV: 'production', LOG_LEVEL: 'trace' })
+        validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: validProdSek, LOG_LEVEL: 'trace' })
       ).toThrow(/Verbose LOG_LEVEL="trace" is forbidden in production/);
     });
   });
@@ -191,7 +194,7 @@ describe('S1 Security Baseline & Fail-Closed Boot', () => {
     it('binding to 0.0.0.0 in production -> startup failure without override', () => {
       const cfg = getBaseProdConfig();
       cfg.host = '0.0.0.0';
-      expect(() => validateStartupConfig(cfg, { NODE_ENV: 'production' })).toThrow(
+      expect(() => validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: validProdSek })).toThrow(
         /Binding to 0.0.0.0 is forbidden in production/
       );
     });
@@ -201,7 +204,7 @@ describe('S1 Security Baseline & Fail-Closed Boot', () => {
       cfg.host = '0.0.0.0';
       // Should not throw when explicit override is provided
       expect(() =>
-        validateStartupConfig(cfg, { NODE_ENV: 'production', ALLOW_ALL_INTERFACES: 'true' })
+        validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: validProdSek, ALLOW_ALL_INTERFACES: 'true' })
       ).not.toThrow();
     });
   });
@@ -209,7 +212,7 @@ describe('S1 Security Baseline & Fail-Closed Boot', () => {
   describe('7. Valid Configurations', () => {
     it('valid production configuration passes validation', () => {
       const cfg = getBaseProdConfig();
-      expect(() => validateStartupConfig(cfg, { NODE_ENV: 'production' })).not.toThrow();
+      expect(() => validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: validProdSek })).not.toThrow();
     });
 
     it('valid test environment passes validation with dev defaults', () => {
@@ -220,10 +223,102 @@ describe('S1 Security Baseline & Fail-Closed Boot', () => {
         reposRoot: validReposRoot,
         itehaasBin: validBin,
         cookieSecret: 'dev-secret-change-me',
+        secretEncryptionKey: 'dev-secret-change-me-fallback-test-only-0000',
         nodeEnv: 'test',
         isProd: false,
       };
       expect(() => validateStartupConfig(testCfg, { NODE_ENV: 'test' })).not.toThrow();
+    });
+  });
+
+  describe('8. S1-fresh hardening (explicit SEK, DB password, any-bind, port)', () => {
+    it('missing SECRET_ENCRYPTION_KEY -> startup failure in production even with COOKIE_SECRET set', () => {
+      const cfg = getBaseProdConfig();
+      expect(() =>
+        validateStartupConfig(cfg, { NODE_ENV: 'production' })
+      ).toThrow(/SECRET_ENCRYPTION_KEY is required in production/);
+    });
+
+    it('SECRET_ENCRYPTION_KEY coupled to COOKIE_SECRET -> startup failure in production', () => {
+      const cfg = getBaseProdConfig();
+      cfg.secretEncryptionKey = cfg.cookieSecret;
+      expect(() =>
+        validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: cfg.cookieSecret })
+      ).toThrow(/must be distinct from COOKIE_SECRET/);
+    });
+
+    it('weak SECRET_ENCRYPTION_KEY (<32) -> startup failure in production', () => {
+      const cfg = getBaseProdConfig();
+      cfg.secretEncryptionKey = 'short';
+      expect(() =>
+        validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: 'short' })
+      ).toThrow(/SECRET_ENCRYPTION_KEY too short/);
+    });
+
+    it('createConfig without SECRET_ENCRYPTION_KEY still fails closed at validateStartupConfig', () => {
+      const cfg = createConfig({
+        NODE_ENV: 'production',
+        DATABASE_URL: validProdDb,
+        COOKIE_SECRET: validProdSecret,
+        REPOS_ROOT: validReposRoot,
+        ITEHAAS_BIN: validBin,
+      } as any);
+      // Coupled fallback value passes createConfig but must fail validation without explicit env.
+      expect(() =>
+        validateStartupConfig(cfg, { NODE_ENV: 'production' })
+      ).toThrow(/SECRET_ENCRYPTION_KEY is required/);
+    });
+
+    it('invalid DB configuration (missing password) -> startup failure in production', () => {
+      expect(() =>
+        validateDatabaseUrl('postgres://prod_user@db.internal:5432/itehaas_prod', true)
+      ).toThrow(/must include a password/);
+    });
+
+    it('invalid DB configuration (short password) -> startup failure in production', () => {
+      expect(() =>
+        validateDatabaseUrl('postgres://prod_user:short1@db.internal:5432/itehaas_prod', true)
+      ).toThrow(/password too short/);
+    });
+
+    it('invalid DB configuration (weak password pattern) -> startup failure in production', () => {
+      expect(() =>
+        validateDatabaseUrl('postgres://prod_user:CHANGEME12345@db.internal:5432/itehaas_prod', true)
+      ).toThrow(/weak pattern/);
+    });
+
+    it('binding to :: in production -> startup failure without override', () => {
+      const cfg = getBaseProdConfig();
+      cfg.host = '::';
+      expect(() => validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: validProdSek })).toThrow(
+        /Binding to :: is forbidden/
+      );
+    });
+
+    it('binding to :: in production allowed with explicit override', () => {
+      const cfg = getBaseProdConfig();
+      cfg.host = '::';
+      expect(() =>
+        validateStartupConfig(cfg, { NODE_ENV: 'production', SECRET_ENCRYPTION_KEY: validProdSek, ALLOW_ALL_INTERFACES: 'true' })
+      ).not.toThrow();
+    });
+
+    it('invalid port (0, 99999, NaN) -> startup failure', () => {
+      expect(() => validatePort(0)).toThrow(/PORT must be an integer 1-65535/);
+      expect(() => validatePort(99999)).toThrow(/PORT must be an integer 1-65535/);
+      expect(() => validatePort(NaN)).toThrow(/PORT must be an integer 1-65535/);
+      expect(() => validatePort(3001)).not.toThrow();
+    });
+
+    it('world-writable REPOS_ROOT parent -> startup failure in production', () => {
+      const dir = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'itehaas-s1-'));
+      try {
+        fs.chmodSync(dir, 0o777);
+        const child = path.join(dir, 'repos');
+        expect(() => validateReposRoot(child, true)).toThrow(/world-writable/);
+      } finally {
+        try { fs.chmodSync(dir, 0o755); fs.rmdirSync(dir); } catch {}
+      }
     });
   });
 });

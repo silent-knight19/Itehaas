@@ -11,9 +11,13 @@ import { repoPathFor, execItehaas } from '../lib/vcs';
 import { getSessionUser, requireAuth } from '../middleware/auth';
 import { canRead, canWrite, isAdmin, isOwner } from '../lib/permissions';
 import { auditLog } from '../lib/audit';
+import { parsePagination, getRepoDiskUsage, repoQuotaBytes } from '../lib/budgets';
 
 function validateOwnerRepo(owner: string, repo: string): boolean {
-  return /^[a-zA-Z0-9._-]{1,100}$/.test(owner) && /^[a-zA-Z0-9._-]{1,100}$/.test(repo);
+  if (!/^[a-zA-Z0-9._-]{1,100}$/.test(owner) || !/^[a-zA-Z0-9._-]{1,100}$/.test(repo)) return false;
+  // S4: dot-segments are never valid identities (aliasing + traversal).
+  if (owner === '.' || owner === '..' || repo === '.' || repo === '..') return false;
+  return true;
 }
 
 const WINDOWS_RESERVED_NAMES = new Set([
@@ -40,6 +44,10 @@ export function isValidFilePath(p: string): boolean {
   }
   if (cur.includes('\0') || cur.includes('\\')) return false;
   if (path.isAbsolute(cur)) return false;
+  // S4: reject control/format characters (terminal/log injection, FS normalization tricks).
+  // Covers C0/C1 controls, DEL, BOM/ZWNBSP, bidi overrides — all attacker-controlled names.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f-\x9f\u00ad\u200e\u200f\ufeff]/.test(cur)) return false;
   const parts = cur.split('/');
   for (const part of parts) {
     if (part === '' || part === '.' || part === '..') return false;
@@ -58,6 +66,8 @@ export function isValidFilePath(p: string): boolean {
 export function isValidBranchRef(branch: string): boolean {
   if (!branch || branch.length > 100) return false;
   if (branch.includes('\0') || branch.includes('\\') || branch.includes(' ')) return false;
+  // S15: leading dashes would parse as CLI flags in positional args (`log --rev -x`).
+  if (branch.startsWith('-')) return false;
   if (branch.startsWith('/') || branch.endsWith('/') || branch.includes('//')) return false;
   if (branch.includes('..') || branch.includes('~') || branch.includes('^') || branch.includes(':') || branch.includes('?') || branch.includes('*') || branch.includes('[') || branch.includes('@{') || branch.endsWith('.lock')) return false;
   for (const part of branch.split('/')) {
@@ -65,6 +75,67 @@ export function isValidBranchRef(branch: string): boolean {
   }
   if (!/^[a-zA-Z0-9._\/-]+$/.test(branch)) return false;
   return true;
+}
+
+// S13: shared remote-URL policy — used at creation time AND at fetch/push/pull
+// execution time (stale `file://` remotes predating the creation gate must not
+// become usable just because they sit in `.itehaas/config`). Returns an error
+// message when blocked, null when allowed.
+export function validateRemoteUrl(url: string): string | null {
+  // SEC-007: Reject filesystem remotes (file://, local paths) to prevent cross-tenant repository exfiltration
+  if (!/^https?:\/\//i.test(url)) {
+    return 'invalid remote url: must be http:// or https://';
+  }
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      return 'invalid remote url protocol';
+    }
+    if (u.username || u.password) {
+      return 'credentials in remote url are not permitted';
+    }
+    const rawHost = u.hostname.toLowerCase();
+    const h = rawHost.replace(/^\[|\]$/g, '');
+    const isPrivate = h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '::'
+      || h === '0.0.0.0' || h === 'metadata.google.internal' || h.endsWith('.internal') || h.endsWith('.local')
+      || h.startsWith('10.') || h.startsWith('192.168.') || h.startsWith('169.254.')
+      || /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)
+      // S13: fc/fd/fe80 prefixes only match IPv6 literals (which contain ':') —
+      // plain DNS names starting with those letters (e.g. fcbank.com) are public
+      // candidates left to the Rust DNS-time check.
+      || h.startsWith('::ffff:') || (h.includes(':') && (h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80')));
+    if (isPrivate && process.env.ALLOW_PRIVATE_REMOTES !== 'true' && process.env.ALLOW_LOCALHOST_REMOTE !== 'true') {
+      return 'private or internal remote urls are forbidden';
+    }
+  } catch {
+    return 'invalid remote url';
+  }
+  return null;
+}
+
+// S13: look up the stored URL of a configured remote (single `remote -v` call).
+// Returns null when the remote is not configured.
+export async function getStoredRemoteUrl(repoPath: string, remote: string): Promise<string | null> {
+  const res = await execItehaas(['remote', '-v'], { cwd: repoPath });
+  if (res.code !== 0) return null;
+  for (const line of res.stdout.split('\n')) {
+    const m = line.trim().match(/^(\S+)\s+(\S+)\s+\(fetch\)$/);
+    if (m && m[1] === remote) return m[2];
+  }
+  return null;
+}
+
+// S17: owner-only storage permissions. Repository content (including private
+// repos) must never be world-readable on shared/multi-user hosts. Applied
+// best-effort after every mkdir we own; umask/host ACLs remain the outer layer.
+export async function secureRepoParentDirs(repoPath: string): Promise<void> {
+  try {
+    await fs.promises.mkdir(path.dirname(repoPath), { recursive: true });
+    // Harden the owner dir and the repo dir themselves (not the shared root,
+    // whose ownership may belong to the deployer, not the service user).
+    await fs.promises.chmod(path.dirname(repoPath), 0o700).catch(() => {});
+    await fs.promises.chmod(repoPath, 0o700).catch(() => {});
+  } catch {}
 }
 
 // S7: isAncestor cache (60s TTL)
@@ -114,7 +185,7 @@ export async function repoRoutes(app: FastifyInstance) {
 
     const repoPath = repoPathFor(user.username, name);
     try {
-      await fs.promises.mkdir(path.dirname(repoPath), { recursive: true });
+      await secureRepoParentDirs(repoPath);
       const res = await execItehaas(['init', repoPath]);
       if (res.code !== 0) {
         await query(`DELETE FROM repositories WHERE id = $1`, [repo.id]);
@@ -203,6 +274,10 @@ export async function repoRoutes(app: FastifyInstance) {
   app.patch('/api/repos/:owner/:repo', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: repo mutation class — 20/min.
+    const { checkRateLimit: crRepoMod, rateLimitReply: rlrRepoMod } = await import('../lib/rateLimit');
+    const rlRepoMod = crRepoMod(req as any, 'repo_modify', 20, 60 * 1000);
+    if (!rlRepoMod.allowed) return rlrRepoMod(reply as any, rlRepoMod.resetMs);
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     if (owner !== user.username) {
@@ -217,10 +292,15 @@ export async function repoRoutes(app: FastifyInstance) {
     const schema = z.object({
       description: z.string().max(500).optional(),
       visibility: z.enum(['public', 'private']).optional(),
-      default_branch: z.string().min(1).max(100).regex(/^[a-zA-Z0-9._/-]+$/).optional(),
+      default_branch: z.string().min(1).max(100).optional(),
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
+    // S3: default_branch is a ref that flows into VCSHZ operations — use the same
+    // strict ref validation as file/branch endpoints (weak regex allowed .., //, @{).
+    if (parsed.data.default_branch !== undefined && !isValidBranchRef(parsed.data.default_branch)) {
+      return reply.status(400).send({ error: 'invalid default_branch' });
+    }
     const { description, visibility, default_branch } = parsed.data;
     if (description === undefined && visibility === undefined && default_branch === undefined) {
       return reply.status(400).send({ error: 'no fields to update' });
@@ -251,6 +331,10 @@ export async function repoRoutes(app: FastifyInstance) {
     if (default_branch !== undefined) { finalFields.push(`default_branch = $${fIdx++}`); finalVals.push(default_branch); }
     finalVals.push(repoId);
     const upd = await query(`UPDATE repositories SET ${finalFields.join(', ')}, updated_at = now() WHERE id = $${fIdx} RETURNING id, name, description, visibility, default_branch, updated_at`, finalVals);
+    // S18: visibility flips change the exposure boundary — always audited.
+    if (visibility !== undefined && upd.rows[0]?.visibility !== undefined) {
+      await auditLog({ userId: user.id, action: 'repo.visibility', target: `${owner}/${repo}:${upd.rows[0].visibility}`, req });
+    }
     return reply.send({ repo: upd.rows[0] });
   });
 
@@ -258,6 +342,9 @@ export async function repoRoutes(app: FastifyInstance) {
   app.delete('/api/repos/:owner/:repo', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    const { checkRateLimit: crRepoDel, rateLimitReply: rlrRepoDel } = await import('../lib/rateLimit');
+    const rlRepoDel = crRepoDel(req as any, 'repo_modify', 20, 60 * 1000);
+    if (!rlRepoDel.allowed) return rlrRepoDel(reply as any, rlRepoDel.resetMs);
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
 
@@ -269,11 +356,24 @@ export async function repoRoutes(app: FastifyInstance) {
     const repoId = res.rows[0].id;
     if (!(await isOwner(repoId, user.id))) return reply.status(403).send({ error: 'forbidden: only the repository owner can delete this repository' });
 
-    // S15: advisory lock for delete vs push race
-    const { hashStringToInt: hashIntDel } = await import('../db');
-    const delLockKey = hashIntDel(repoId);
-    const delLockRes = await query('SELECT pg_try_advisory_lock($1) as locked', [delLockKey]);
-    if (!delLockRes.rows[0]?.locked) {
+    // S15: session-pinned advisory lock (shared per-repo key with push/merge).
+    // The lock lives on ONE pooled client: locking via pool.query and unlocking
+    // on another backend would leak it forever.
+    const { advisoryLockKeys: delKeys, lockClientAdvisory: lockDel, unlockClientAdvisory: unlockDel } = await import('../db');
+    const delLockKey = delKeys(repoId);
+    const delLockClient = await getClient();
+    let releaseDelLock: (() => Promise<void>) | null = null;
+    try {
+      if (!(await lockDel(delLockClient, delLockKey))) {
+        delLockClient.release();
+        return reply.status(423).send({ error: 'ref locked, retry' });
+      }
+      releaseDelLock = async () => {
+        await unlockDel(delLockClient, delLockKey);
+        delLockClient.release();
+      };
+    } catch {
+      try { delLockClient.release(); } catch {}
       return reply.status(423).send({ error: 'ref locked, retry' });
     }
     try {
@@ -286,7 +386,7 @@ export async function repoRoutes(app: FastifyInstance) {
         await fs.promises.rm(repoPath, { recursive: true, force: true });
       } catch {}
     } finally {
-      await query('SELECT pg_advisory_unlock($1)', [delLockKey]).catch(()=>{});
+      await releaseDelLock!();
     }
 
     return reply.send({ ok: true });
@@ -296,6 +396,10 @@ export async function repoRoutes(app: FastifyInstance) {
   app.post('/api/repos/:owner/:repo/fork', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: disk-heavy clone — 5/min per client.
+    const { checkRateLimit: crFork, rateLimitReply: rlrFork } = await import('../lib/rateLimit');
+    const rlFork = crFork(req as any, 'fork', 5, 60 * 1000);
+    if (!rlFork.allowed) return rlrFork(reply as any, rlFork.resetMs);
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
 
@@ -311,6 +415,13 @@ export async function repoRoutes(app: FastifyInstance) {
 
     const can = await canRead(upstreamId, user.id, upstream.visibility);
     if (!can) return reply.status(404).send({ error: 'not found' });
+
+    // S7: disk budget — a fork duplicates storage; refuse when the upstream alone
+    // already exceeds quota (the copy would start life over budget).
+    const upstreamDiskPath = repoPathFor(upstream.owner_name, upstreamName);
+    if (getRepoDiskUsage(upstreamDiskPath, repoQuotaBytes()) > repoQuotaBytes()) {
+      return reply.status(413).send({ error: 'repository too large to fork (disk quota exceeded)' });
+    }
 
     // Check if already forked by this user (same owner+name)
     const existing = await query(
@@ -336,10 +447,13 @@ export async function repoRoutes(app: FastifyInstance) {
       );
       forkRepo = repoRes.rows[0];
       await client.query(`INSERT INTO repository_members (repo_id, user_id, role) VALUES ($1, $2, 'admin')`, [forkRepo.id, user.id]);
-      await client.query(`INSERT INTO forks (upstream_repo_id, fork_repo_id, forked_by) VALUES ($1, $2, $3)`, [upstreamId, forkRepo.id, user.id]);
+      await client.query(`INSERT INTO forks (upstream_repo_id, fork_repo_id, forked_by) VALUES ($1,$2,$3)`, [upstreamId, forkRepo.id, user.id]);
       await client.query('COMMIT');
-    } catch (e) {
+    } catch (e: any) {
       await client.query('ROLLBACK');
+      // S15: concurrent double-fork check-then-act — the loser hits UNIQUE and
+      // gets a clean 409 instead of a 500 (fail closed, retryable).
+      if (e.code === '23505') return reply.status(409).send({ error: 'already forked' });
       throw e;
     } finally {
       client.release();
@@ -348,7 +462,7 @@ export async function repoRoutes(app: FastifyInstance) {
     const upstreamPath = repoPathFor(upstream.owner_name, upstreamName);
     const forkPath = repoPathFor(user.username, upstreamName);
     try {
-      await fs.promises.mkdir(path.dirname(forkPath), { recursive: true });
+      await secureRepoParentDirs(forkPath);
       const res = await execItehaas(['clone', upstreamPath, forkPath]);
       if (res.code !== 0) {
         // Cleanup DB on clone failure
@@ -372,14 +486,22 @@ export async function repoRoutes(app: FastifyInstance) {
     if (upstreamRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const { id: upstreamId, visibility } = upstreamRes.rows[0];
     if (!(await canRead(upstreamId, user?.id ?? null, visibility))) return reply.status(404).send({ error: 'not found' });
+    // S7: output budget — paginated, never an unbounded collection.
+    const page = parsePagination(req.query as any);
+    if ('error' in page) return reply.status(400).send({ error: page.error });
 
     const forksRes = await query(
       `SELECT r.id, r.name, r.description, r.visibility, r.updated_at, u.username as owner, f.created_at as forked_at
        FROM forks f JOIN repositories r ON f.fork_repo_id = r.id JOIN users u ON r.owner_id = u.id
-       WHERE f.upstream_repo_id = $1 ORDER BY f.created_at DESC`,
-      [upstreamId]
+       WHERE f.upstream_repo_id = $1 ORDER BY f.created_at DESC LIMIT $2 OFFSET $3`,
+      [upstreamId, page.limit, page.offset]
     );
-    return reply.send({ forks: forksRes.rows });
+    // S3: private forks must not leak via a readable upstream's listing.
+    const visibleForks = [];
+    for (const row of forksRes.rows) {
+      if (await canRead(row.id, user?.id ?? null, row.visibility)) visibleForks.push(row);
+    }
+    return reply.send({ forks: visibleForks });
   });
 
   // Network: upstream + forks
@@ -391,6 +513,9 @@ export async function repoRoutes(app: FastifyInstance) {
     if (repoRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const { id: repoId, visibility, name } = repoRes.rows[0];
     if (!(await canRead(repoId, user?.id ?? null, visibility))) return reply.status(404).send({ error: 'not found' });
+    // S7: output budget.
+    const netPage = parsePagination(req.query as any);
+    if ('error' in netPage) return reply.status(400).send({ error: netPage.error });
 
     // Check if this repo is itself a fork
     const forkInfo = await query(`SELECT f.upstream_repo_id, r.name as upstream_name, u.username as upstream_owner FROM forks f JOIN repositories r ON f.upstream_repo_id = r.id JOIN users u ON r.owner_id = u.id WHERE f.fork_repo_id = $1`, [repoId]);
@@ -408,16 +533,21 @@ export async function repoRoutes(app: FastifyInstance) {
     // If this repo is fork, ultimate is its upstream; else itself
     // For network, we want all forks of ultimate + ultimate itself
     const forksRes = await query(
-      `SELECT r.id, r.name, u.username as owner, f.created_at as forked_at
+      `SELECT r.id, r.name, r.visibility, u.username as owner, f.created_at as forked_at
        FROM forks f JOIN repositories r ON f.fork_repo_id = r.id JOIN users u ON r.owner_id = u.id
-       WHERE f.upstream_repo_id = $1 ORDER BY f.created_at`,
-      [ultimateUpstreamId]
+       WHERE f.upstream_repo_id = $1 ORDER BY f.created_at LIMIT $2 OFFSET $3`,
+      [ultimateUpstreamId, netPage.limit, netPage.offset]
     );
+    // S3: filter private forks the viewer cannot read.
+    const visibleForks = [];
+    for (const row of forksRes.rows) {
+      if (await canRead(row.id, user?.id ?? null, row.visibility)) visibleForks.push(row);
+    }
     // Get ultimate repo info
     const ultimateRes = await query(`SELECT r.id, r.name, u.username as owner FROM repositories r JOIN users u ON r.owner_id=u.id WHERE r.id=$1`, [ultimateUpstreamId]);
     const ultimate = ultimateRes.rows[0] ?? null;
 
-    return reply.send({ upstream: ultimate, forks: forksRes.rows, current: { owner, repo: name } });
+    return reply.send({ upstream: ultimate, forks: visibleForks, current: { owner, repo: name } });
   });
 
   // Members: list
@@ -430,10 +560,13 @@ export async function repoRoutes(app: FastifyInstance) {
     const { id: repoId, visibility } = res.rows[0];
     const ok = await canRead(repoId, user?.id ?? null, visibility);
     if (!ok) return reply.status(404).send({ error: 'not found' });
+    // S7: output budget.
+    const memPage = parsePagination(req.query as any);
+    if ('error' in memPage) return reply.status(400).send({ error: memPage.error });
 
     const members = await query(
-      `SELECT u.username, m.role, m.created_at FROM repository_members m JOIN users u ON m.user_id=u.id WHERE m.repo_id=$1 ORDER BY m.created_at`,
-      [repoId]
+      `SELECT u.username, m.role, m.created_at FROM repository_members m JOIN users u ON m.user_id=u.id WHERE m.repo_id=$1 ORDER BY m.created_at LIMIT $2 OFFSET $3`,
+      [repoId, memPage.limit, memPage.offset]
     );
     // include owner as admin if not in members? Owner is inserted as admin, so list covers.
     return reply.send({ members: members.rows });
@@ -443,6 +576,10 @@ export async function repoRoutes(app: FastifyInstance) {
   app.post('/api/repos/:owner/:repo/members', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: membership changes are privilege-relevant — 20/min.
+    const { checkRateLimit: crMem, rateLimitReply: rlrMem } = await import('../lib/rateLimit');
+    const rlMem = crMem(req as any, 'repo_members', 20, 60 * 1000);
+    if (!rlMem.allowed) return rlrMem(reply as any, rlMem.resetMs);
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
 
@@ -470,6 +607,8 @@ export async function repoRoutes(app: FastifyInstance) {
       if (e.code === '23505') return reply.status(409).send({ error: 'already a member' });
       throw e;
     }
+    // S18: membership grants are privilege changes — audited.
+    await auditLog({ userId: user.id, action: 'repo.member_add', target: `${owner}/${repo}:${username}:${role}`, req });
     return reply.status(201).send({ ok: true, username, role });
   });
 
@@ -477,6 +616,9 @@ export async function repoRoutes(app: FastifyInstance) {
   app.delete('/api/repos/:owner/:repo/members/:username', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    const { checkRateLimit: crMemDel, rateLimitReply: rlrMemDel } = await import('../lib/rateLimit');
+    const rlMemDel = crMemDel(req as any, 'repo_members', 20, 60 * 1000);
+    if (!rlMemDel.allowed) return rlrMemDel(reply as any, rlMemDel.resetMs);
     const { owner, repo, username } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
 
@@ -492,6 +634,7 @@ export async function repoRoutes(app: FastifyInstance) {
 
     const del = await query(`DELETE FROM repository_members WHERE repo_id=$1 AND user_id=$2`, [repoId, targetId]);
     if (del.rowCount === 0) return reply.status(404).send({ error: 'not a member' });
+    await auditLog({ userId: user.id, action: 'repo.member_remove', target: `${owner}/${repo}:${username}`, req });
     return reply.send({ ok: true });
   });
 
@@ -499,6 +642,9 @@ export async function repoRoutes(app: FastifyInstance) {
   app.patch('/api/repos/:owner/:repo/members/:username', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    const { checkRateLimit: crMemPatch, rateLimitReply: rlrMemPatch } = await import('../lib/rateLimit');
+    const rlMemPatch = crMemPatch(req as any, 'repo_members', 20, 60 * 1000);
+    if (!rlMemPatch.allowed) return rlrMemPatch(reply as any, rlMemPatch.resetMs);
     const { owner, repo, username } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
 
@@ -517,6 +663,7 @@ export async function repoRoutes(app: FastifyInstance) {
 
     const upd = await query(`UPDATE repository_members SET role=$1 WHERE repo_id=$2 AND user_id=$3 RETURNING role`, [parsed.data.role, repoId, targetId]);
     if (upd.rows.length === 0) return reply.status(404).send({ error: 'not a member' });
+    await auditLog({ userId: user.id, action: 'repo.member_role', target: `${owner}/${repo}:${username}:${parsed.data.role}`, req });
     return reply.send({ ok: true, role: upd.rows[0].role });
   });
 
@@ -598,6 +745,14 @@ export async function repoRoutes(app: FastifyInstance) {
   // Helper: isAncestor via single-process CLI merge-base (SEC-016), with S7 bounded fallback
   async function isAncestor(repoPath: string, ancestor: string, descendant: string): Promise<boolean> {
     if (ancestor === descendant) return true;
+    // S5-fresh: hashes flow from ref files + request bodies — reject malformed values
+    // before spawning any process (fail closed, no subprocess on garbage).
+    if (!/^[0-9a-f]{40}$/.test(ancestor) && !/^[0-9a-f]{64}$/.test(ancestor)) {
+      throw new Error('invalid ancestor hash');
+    }
+    if (!/^[0-9a-f]{40}$/.test(descendant) && !/^[0-9a-f]{64}$/.test(descendant)) {
+      throw new Error('invalid descendant hash');
+    }
     const cacheKey = isAncestorCacheKey(repoPath, ancestor, descendant);
     const cached = isAncestorCache.get(cacheKey);
     if (cached && Date.now() < cached.expires) return cached.value;
@@ -691,6 +846,10 @@ export async function repoRoutes(app: FastifyInstance) {
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     if (!(await canWrite(r.rows[0].id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
     // Note: canWrite returns false for private anon, but canWrite checks isOwner or role write/admin; private push needs write, else 403
+    // S14: 64M uploads with inflate+hash CPU cost — 20/min per client.
+    const { checkRateLimit: checkRLObj, rateLimitReply: rlObj } = await import('../lib/rateLimit');
+    const rlObjRes = checkRLObj(req as any, 'object_upload', 20, 60 * 1000);
+    if (!rlObjRes.allowed) return rlObj(reply as any, rlObjRes.resetMs);
 
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
@@ -703,6 +862,14 @@ export async function repoRoutes(app: FastifyInstance) {
     if (!body || !Buffer.isBuffer(body)) return reply.status(400).send({ error: 'missing body' });
     if (body.length > 64 * 1024 * 1024) return reply.status(413).send({ error: 'Object too large' });
     if (body.length === 0) return reply.status(400).send({ error: 'empty object' });
+
+    // S7: per-repository disk budget — repeated 64M pushes must not fill the host disk.
+    // Fail closed with 413; override via REPO_QUOTA_BYTES (bytes) for large monorepos.
+    const quota = repoQuotaBytes();
+    const usage = getRepoDiskUsage(repoPath, quota);
+    if (usage + body.length > quota) {
+      return reply.status(413).send({ error: 'repository disk quota exceeded' });
+    }
 
     const prefix = hash.slice(0, 2);
     const suffix = hash.slice(2);
@@ -726,9 +893,12 @@ export async function repoRoutes(app: FastifyInstance) {
       const algo = hash.length === 40 ? 'sha1' : 'sha256';
       const computedHash = crypto.createHash(algo).update(canonical).digest('hex');
       if (computedHash !== hash) {
+        // S18: corrupt/malicious object uploads are a detection signal (probing).
+        await auditLog({ userId: user.id, action: 'vcs.object_rejected', target: `${owner}/${repo}:${hash.slice(0, 12)}`, req });
         return reply.status(400).send({ error: 'Corrupt object: hash mismatch' });
       }
     } catch (e: any) {
+      await auditLog({ userId: user.id, action: 'vcs.object_rejected', target: `${owner}/${repo}:${hash.slice(0, 12)}`, req });
       return reply.status(400).send({ error: `Corrupt object: ${e.message || 'invalid zlib stream'}` });
     }
 
@@ -754,6 +924,51 @@ export async function repoRoutes(app: FastifyInstance) {
       return reply.status(500).send({ error: e.message });
     }
   });
+
+  // S15: crash-safe ref lock files. A crash between `open(wx)` and `unlink` used to
+  // leave a permanent 423 behind (fail-closed forever). Lock files now carry
+  // `pid:timestamp`; a holder that is dead or older than the staleness bound is
+  // stolen exactly once via atomic re-open (loser gets 423 and retries).
+  const REF_LOCK_STALE_MS = 120_000;
+  async function acquireRefLock(lockPath: string): Promise<fs.promises.FileHandle | null> {
+    const stamp = async (fd: fs.promises.FileHandle) => {
+      try {
+        await fd.writeFile(`${process.pid}:${Date.now()}\n`);
+      } catch {}
+      return fd;
+    };
+    const opened = await fs.promises.open(lockPath, 'wx').catch(() => null);
+    if (opened) return stamp(opened as fs.promises.FileHandle);
+    let stale = false;
+    try {
+      const content = (await fs.promises.readFile(lockPath, 'utf8')).trim();
+      const m = content.match(/^(\d+):(\d+)$/);
+      if (m) {
+        const pid = parseInt(m[1], 10);
+        const ts = parseInt(m[2], 10);
+        if (Date.now() - ts > REF_LOCK_STALE_MS) {
+          stale = true;
+        } else {
+          try {
+            process.kill(pid, 0);
+          } catch (e: any) {
+            if (e.code === 'ESRCH') stale = true; // holder pid is dead
+          }
+        }
+      } else {
+        // Pre-S15/foreign lock content: steal by age only.
+        try {
+          const st = await fs.promises.stat(lockPath);
+          if (Date.now() - st.mtimeMs > REF_LOCK_STALE_MS) stale = true;
+        } catch {}
+      }
+    } catch {}
+    if (!stale) return null;
+    await fs.promises.unlink(lockPath).catch(() => {});
+    const retry = await fs.promises.open(lockPath, 'wx').catch(() => null);
+    if (!retry) return null;
+    return stamp(retry as fs.promises.FileHandle);
+  }
 
   // Push: update ref — POST /api/repos/:owner/:repo/refs/heads/:branch
   app.post('/api/repos/:owner/:repo/refs/heads/*', async (req, reply) => {
@@ -783,20 +998,32 @@ export async function repoRoutes(app: FastifyInstance) {
     const { checkRateLimit: checkRLPush, rateLimitReply: rlPush } = await import('../lib/rateLimit');
     const rlPushRes = checkRLPush(req as any, 'push', 20, 60 * 1000);
     if (!rlPushRes.allowed) return rlPush(reply as any, rlPushRes.resetMs);
-    // S15: advisory lock for push (per-repo) to prevent concurrent isAncestor+write race
-    const { hashStringToInt } = await import('../db');
-    const lockKey = hashStringToInt(r.rows[0].id);
-    let dbLocked = false;
-    const lockRes = await query('SELECT pg_try_advisory_lock($1) as locked', [lockKey]);
-    if (!lockRes.rows[0]?.locked) {
+    // S15: session-pinned advisory lock for push (per-repo) to prevent concurrent
+    // isAncestor+write races. One key per repo shared with merge/delete so
+    // ref-mutating operations exclude each other (FSEC-021: 64-bit keys).
+    // The lock lives on ONE pooled client for the whole section: locking via
+    // pool.query and unlocking on another backend would leak it forever.
+    const { advisoryLockKeys, lockClientAdvisory, unlockClientAdvisory } = await import('../db');
+    const pushLockKey = advisoryLockKeys(r.rows[0].id);
+    const pushLockClient = await getClient();
+    let releaseDbLock: (() => Promise<void>) | null = null;
+    try {
+      if (!(await lockClientAdvisory(pushLockClient, pushLockKey))) {
+        pushLockClient.release();
+        return reply.status(423).send({ error: 'ref locked, retry' });
+      }
+      releaseDbLock = async () => {
+        await unlockClientAdvisory(pushLockClient, pushLockKey);
+        pushLockClient.release();
+      };
+    } catch {
+      try { pushLockClient.release(); } catch {}
       return reply.status(423).send({ error: 'ref locked, retry' });
     }
-    dbLocked = true;
 
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) {
-      await query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(()=>{});
-      dbLocked = false;
+      await releaseDbLock();
       return reply.status(400).send({ error: e.message });
     }
 
@@ -808,18 +1035,19 @@ export async function repoRoutes(app: FastifyInstance) {
     try {
       // Ensure parent dir exists
       await fs.promises.mkdir(path.dirname(refPath), { recursive: true });
-      lockFd = await fs.promises.open(lockPath, 'wx').catch(() => null) as any;
+      lockFd = await acquireRefLock(lockPath);
       if (!lockFd) {
-        await query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(()=>{});
-        dbLocked = false;
+        await releaseDbLock();
         return reply.status(423).send({ error: 'ref locked, retry' });
       }
 
-      // Read current hash
+      // Read current hash (algo-aware: SHA-256 64-hex or SHA-1 40-hex).
+      // S5-fresh: the old 64-only gate silently skipped the fast-forward check on
+      // SHA-1 repos (current=null → no FF verification → non-FF push accepted).
       let current: string | null = null;
       try {
         const cur = (await fs.promises.readFile(refPath, 'utf8')).trim();
-        if (/^[0-9a-f]{64}$/.test(cur)) current = cur;
+        if (/^[0-9a-f]{64}$/.test(cur) || /^[0-9a-f]{40}$/.test(cur)) current = cur;
       } catch (e: any) {
         if (e.code !== 'ENOENT') throw e;
       }
@@ -874,9 +1102,7 @@ export async function repoRoutes(app: FastifyInstance) {
         try { await lockFd.close(); } catch {}
         try { await fs.promises.unlink(lockPath); } catch {}
       }
-      if (dbLocked) {
-        await query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(()=>{});
-      }
+      await releaseDbLock();
     }
   });
 
@@ -928,6 +1154,10 @@ export async function repoRoutes(app: FastifyInstance) {
   app.post('/api/repos/:owner/:repo/watch', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: like-spam class — 30/min.
+    const { checkRateLimit: crWatch, rateLimitReply: rlrWatch } = await import('../lib/rateLimit');
+    const rlWatch = crWatch(req as any, 'stars', 30, 60 * 1000);
+    if (!rlWatch.allowed) return rlrWatch(reply as any, rlWatch.resetMs);
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
@@ -945,6 +1175,9 @@ export async function repoRoutes(app: FastifyInstance) {
   app.delete('/api/repos/:owner/:repo/watch', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    const { checkRateLimit: crUnwatch, rateLimitReply: rlrUnwatch } = await import('../lib/rateLimit');
+    const rlUnwatch = crUnwatch(req as any, 'stars', 30, 60 * 1000);
+    if (!rlUnwatch.allowed) return rlrUnwatch(reply as any, rlUnwatch.resetMs);
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     const r = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
@@ -971,7 +1204,10 @@ export async function repoRoutes(app: FastifyInstance) {
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const user = await getSessionUser(req as any);
     if (!(await canRead(r.rows[0].id, user?.id ?? null, r.rows[0].visibility))) return reply.status(404).send({ error: 'not found' });
-    const res = await query(`SELECT u.username FROM watches w JOIN users u ON w.user_id=u.id WHERE w.repo_id=$1`, [r.rows[0].id]);
+    // S7: output budget.
+    const watchPage = parsePagination(req.query as any);
+    if ('error' in watchPage) return reply.status(400).send({ error: watchPage.error });
+    const res = await query(`SELECT u.username FROM watches w JOIN users u ON w.user_id=u.id WHERE w.repo_id=$1 LIMIT $2 OFFSET $3`, [r.rows[0].id, watchPage.limit, watchPage.offset]);
     return reply.send({ watchers: res.rows.map(r=>r.username), count: res.rows.length });
   });
 
@@ -981,6 +1217,10 @@ export async function repoRoutes(app: FastifyInstance) {
   app.get('/api/repos/:owner/:repo/branches', async (req, reply) => {
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    // S14: subprocess-backed read — 60/min per client.
+    { const { checkRateLimit: crR, rateLimitReply: rlrR } = await import('../lib/rateLimit');
+      const rlR = crR(req as any, 'branches', 60, 60 * 1000);
+      if (!rlR.allowed) return rlrR(reply as any, rlR.resetMs); }
     const user = await getSessionUser(req as any);
     const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
@@ -1006,6 +1246,10 @@ export async function repoRoutes(app: FastifyInstance) {
   app.get('/api/repos/:owner/:repo/log', async (req, reply) => {
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    // S14: subprocess-backed read — 30/min per client.
+    { const { checkRateLimit: crR, rateLimitReply: rlrR } = await import('../lib/rateLimit');
+      const rlR = crR(req as any, 'vcs_log', 30, 60 * 1000);
+      if (!rlR.allowed) return rlrR(reply as any, rlR.resetMs); }
     const user = await getSessionUser(req as any);
     const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
@@ -1017,38 +1261,32 @@ export async function repoRoutes(app: FastifyInstance) {
     const maxCount = Math.min(Math.max(parseInt((req.query as any)?.max_count ?? '100', 10) || 100, 1), 200);
     const wantFull = (req.query as any)?.full === '1' || (req.query as any)?.full === 'true';
 
-    // Branch/ref override: if ?ref=<branch> is provided, temporarily redirect HEAD so that
-    // itehaas log walks from the requested branch tip rather than always from main/HEAD.
+    // Branch/ref override: resolve ?ref=<branch> WITHOUT touching `.itehaas/HEAD`.
+    // S15 (FSEC-006): the old code rewrote HEAD per request and restored it after —
+    // concurrent requests with different ?ref= corrupted each other's history view
+    // (and a crash mid-window left HEAD pointing at the wrong branch). The Rust CLI
+    // now takes `--rev`, so reads never mutate repository state.
     const refParam: string | undefined = (req.query as any)?.ref;
-    const headPath = require('path').join(repoPath, '.itehaas', 'HEAD');
-    let originalHead: string | null = null;
+    const revArgs: string[] = [];
     if (refParam && isValidBranchRef(refParam)) {
       const refFilePath = require('path').join(repoPath, '.itehaas', 'refs', 'heads', ...refParam.split('/'));
       try {
         const branchHash = require('fs').readFileSync(refFilePath, 'utf8').trim();
         if (/^[0-9a-f]{40,64}$/.test(branchHash)) {
-          originalHead = require('fs').readFileSync(headPath, 'utf8');
-          require('fs').writeFileSync(headPath, `ref: refs/heads/${refParam}\n`);
+          revArgs.push('--rev', refParam);
         }
       } catch { /* branch may not exist; fall back to current HEAD */ }
     }
 
     let logRes: { code: number | null; stdout: string; stderr: string };
-    try {
-      // Default to full hash for web (Phase 7) to enable tree browsing. Keep oneline for backwards compat if ?short=1
-      if ((req.query as any)?.short === '1') {
-        const args = ['log', '--oneline', '--max-count', String(maxCount)];
-        logRes = await execItehaas(args, { cwd: repoPath }) as any;
-      } else {
-        // Full hash mode: parse `itehaas log` (no --oneline)
-        const args = ['log', '--max-count', String(maxCount)];
-        logRes = await execItehaas(args, { cwd: repoPath }) as any;
-      }
-    } finally {
-      // Always restore the original HEAD
-      if (originalHead !== null) {
-        try { require('fs').writeFileSync(headPath, originalHead); } catch {}
-      }
+    // Default to full hash for web (Phase 7) to enable tree browsing. Keep oneline for backwards compat if ?short=1
+    if ((req.query as any)?.short === '1') {
+      const args = ['log', '--oneline', '--max-count', String(maxCount), ...revArgs];
+      logRes = await execItehaas(args, { cwd: repoPath }) as any;
+    } else {
+      // Full hash mode: parse `itehaas log` (no --oneline)
+      const args = ['log', '--max-count', String(maxCount), ...revArgs];
+      logRes = await execItehaas(args, { cwd: repoPath }) as any;
     }
 
     if (logRes.code !== 0) {
@@ -1259,6 +1497,10 @@ export async function repoRoutes(app: FastifyInstance) {
   app.get('/api/repos/:owner/:repo/commits/:hash', async (req, reply) => {
     const { owner, repo, hash } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    // S14: subprocess-backed read — 60/min per client.
+    { const { checkRateLimit: crR, rateLimitReply: rlrR } = await import('../lib/rateLimit');
+      const rlR = crR(req as any, 'vcs_read', 60, 60 * 1000);
+      if (!rlR.allowed) return rlrR(reply as any, rlR.resetMs); }
     if (!/^[0-9a-f]{4,64}$/.test(hash)) return reply.status(400).send({ error: 'invalid hash' });
     const user = await getSessionUser(req as any);
     const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
@@ -1333,6 +1575,10 @@ export async function repoRoutes(app: FastifyInstance) {
     const { owner, repo } = req.params as any;
     const { from, to } = req.query as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    // S14: subprocess-backed read — 20/min per client.
+    { const { checkRateLimit: crR, rateLimitReply: rlrR } = await import('../lib/rateLimit');
+      const rlR = crR(req as any, 'vcs_diff', 20, 60 * 1000);
+      if (!rlR.allowed) return rlrR(reply as any, rlR.resetMs); }
     if (!from || !to || typeof from !== 'string' || typeof to !== 'string') return reply.status(400).send({ error: 'from and to required' });
     if (from.length > 100 || to.length > 100 || from.includes('\0') || to.includes('\0')) return reply.status(400).send({ error: 'invalid rev' });
     const user = await getSessionUser(req as any);
@@ -1390,6 +1636,10 @@ export async function repoRoutes(app: FastifyInstance) {
     const { owner, repo } = req.params as any;
     const spec = (req.params as any)['*'] as string;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    // S14: subprocess-backed read — 20/min per client.
+    { const { checkRateLimit: crR, rateLimitReply: rlrR } = await import('../lib/rateLimit');
+      const rlR = crR(req as any, 'vcs_diff', 20, 60 * 1000);
+      if (!rlR.allowed) return rlrR(reply as any, rlR.resetMs); }
     if (!spec || typeof spec !== 'string' || spec.length > 200) return reply.status(400).send({ error: 'invalid compare spec' });
     const user = await getSessionUser(req as any);
     const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
@@ -1460,6 +1710,10 @@ export async function repoRoutes(app: FastifyInstance) {
   app.get('/api/repos/:owner/:repo/tree/:hash', async (req, reply) => {
     const { owner, repo, hash } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    // S14: subprocess-backed read — 60/min per client.
+    { const { checkRateLimit: crR, rateLimitReply: rlrR } = await import('../lib/rateLimit');
+      const rlR = crR(req as any, 'vcs_read', 60, 60 * 1000);
+      if (!rlR.allowed) return rlrR(reply as any, rlR.resetMs); }
     const user = await getSessionUser(req as any);
     const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
@@ -1566,6 +1820,10 @@ export async function repoRoutes(app: FastifyInstance) {
     const filePath = (req.params as any)['*'] as string;
     const ref = (req.query as any)?.ref as string | undefined;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    // S14: subprocess-backed read — 30/min per client.
+    { const { checkRateLimit: crR, rateLimitReply: rlrR } = await import('../lib/rateLimit');
+      const rlR = crR(req as any, 'vcs_log', 30, 60 * 1000);
+      if (!rlR.allowed) return rlrR(reply as any, rlR.resetMs); }
     if (!filePath) return reply.status(400).send({ error: 'path required' });
     if (!isValidFilePath(filePath)) return reply.status(400).send({ error: 'invalid path' });
     if (ref && !isValidBranchRef(ref)) return reply.status(400).send({ error: 'invalid ref' });
@@ -1598,6 +1856,10 @@ export async function repoRoutes(app: FastifyInstance) {
     const filePath = (req.params as any)['*'] as string;
     const ref = (req.query as any)?.ref as string | undefined;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    // S14: subprocess-backed read — 30/min per client.
+    { const { checkRateLimit: crR, rateLimitReply: rlrR } = await import('../lib/rateLimit');
+      const rlR = crR(req as any, 'vcs_log', 30, 60 * 1000);
+      if (!rlR.allowed) return rlrR(reply as any, rlR.resetMs); }
     if (!filePath) return reply.status(400).send({ error: 'path required' });
     if (!isValidFilePath(filePath)) return reply.status(400).send({ error: 'invalid path' });
     if (ref && !isValidBranchRef(ref)) return reply.status(400).send({ error: 'invalid ref' });
@@ -1638,9 +1900,31 @@ export async function repoRoutes(app: FastifyInstance) {
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { remote } = parsed.data;
+    // S13: remote name flows positionally into `fetch <remote>` — reject flag-like
+    // names that the CLI would parse as options.
+    if (remote.startsWith('-') || remote.startsWith('.')) {
+      return reply.status(400).send({ error: 'invalid remote name' });
+    }
+    // S14: server-side fetch performs network I/O — 10/min per client.
+    const { checkRateLimit: crFetch, rateLimitReply: rlrFetch } = await import('../lib/rateLimit');
+    const rlFetch = crFetch(req as any, 'fetch', 10, 60 * 1000);
+    if (!rlFetch.allowed) return rlrFetch(reply as any, rlFetch.resetMs);
 
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    // S13 (FSEC-019): execution-time gate on the STORED remote URL. Creation-time
+    // validation postdates some remotes, and host-admin edits bypass the API —
+    // re-validate here so a stale `file://` or literal-private remote can never be
+    // fetched (DNS-name remotes remain protected by the Rust SafeResolver).
+    const storedUrl = await getStoredRemoteUrl(repoPath, remote);
+    if (!storedUrl) return reply.status(404).send({ error: 'remote not found' });
+    const storedErr = validateRemoteUrl(storedUrl);
+    if (storedErr) {
+      try {
+        await auditLog({ userId: user.id, action: 'ssrf.blocked', target: `${owner}/${repo}:${remote}`, req });
+      } catch {}
+      return reply.status(403).send({ error: `remote blocked: ${storedErr} (remove and re-add the remote)` });
+    }
     const res = await execItehaas(['fetch', remote], { cwd: repoPath });
     if (res.code !== 0) return reply.status(500).send({ error: res.stderr || res.stdout });
     return reply.send({ ok: true, remote, output: res.stdout.trim() });
@@ -1666,9 +1950,31 @@ export async function repoRoutes(app: FastifyInstance) {
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { remote, branch, force } = parsed.data;
+    // S5-fresh: branch flows positionally into `push <remote> <branch>` — the schema
+    // regex alone allows .., //, @{. Enforce strict ref validation (as in S3 PR create).
+    if (branch !== undefined && !isValidBranchRef(branch)) {
+      return reply.status(400).send({ error: 'invalid branch name' });
+    }
+    // S13: flag-like remote names + execution-time stored-URL gate (see fetch).
+    if (remote.startsWith('-') || remote.startsWith('.')) {
+      return reply.status(400).send({ error: 'invalid remote name' });
+    }
+    // S14: push runs network I/O — 10/min per client (ref-update CAS has its own 20/min).
+    const { checkRateLimit: crNetPush, rateLimitReply: rlrNetPush } = await import('../lib/rateLimit');
+    const rlNetPush = crNetPush(req as any, 'fetch', 10, 60 * 1000);
+    if (!rlNetPush.allowed) return rlrNetPush(reply as any, rlNetPush.resetMs);
 
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    const storedPushUrl = await getStoredRemoteUrl(repoPath, remote);
+    if (!storedPushUrl) return reply.status(404).send({ error: 'remote not found' });
+    const storedPushErr = validateRemoteUrl(storedPushUrl);
+    if (storedPushErr) {
+      try {
+        await auditLog({ userId: user.id, action: 'ssrf.blocked', target: `${owner}/${repo}:${remote}`, req });
+      } catch {}
+      return reply.status(403).send({ error: `remote blocked: ${storedPushErr} (remove and re-add the remote)` });
+    }
     const args = ['push', remote];
     if (branch) args.push(branch);
     if (force) args.push('--force');
@@ -1700,9 +2006,30 @@ export async function repoRoutes(app: FastifyInstance) {
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { remote, branch } = parsed.data;
+    // S5-fresh: branch flows positionally into `pull <remote> <branch>` — strict ref check.
+    if (branch !== undefined && !isValidBranchRef(branch)) {
+      return reply.status(400).send({ error: 'invalid branch name' });
+    }
+    // S13: flag-like remote names + execution-time stored-URL gate (see fetch).
+    if (remote.startsWith('-') || remote.startsWith('.')) {
+      return reply.status(400).send({ error: 'invalid remote name' });
+    }
+    // S14: pull runs fetch + merge subprocesses — 10/min per client.
+    const { checkRateLimit: crPull, rateLimitReply: rlrPull } = await import('../lib/rateLimit');
+    const rlPull = crPull(req as any, 'fetch', 10, 60 * 1000);
+    if (!rlPull.allowed) return rlrPull(reply as any, rlPull.resetMs);
 
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    const storedPullUrl = await getStoredRemoteUrl(repoPath, remote);
+    if (!storedPullUrl) return reply.status(404).send({ error: 'remote not found' });
+    const storedPullErr = validateRemoteUrl(storedPullUrl);
+    if (storedPullErr) {
+      try {
+        await auditLog({ userId: user.id, action: 'ssrf.blocked', target: `${owner}/${repo}:${remote}`, req });
+      } catch {}
+      return reply.status(403).send({ error: `remote blocked: ${storedPullErr} (remove and re-add the remote)` });
+    }
     const args = ['pull', remote];
     if (branch) args.push(branch);
     const res = await execItehaas(args, { cwd: repoPath });
@@ -1735,6 +2062,10 @@ export async function repoRoutes(app: FastifyInstance) {
   app.post('/api/repos/:owner/:repo/remotes', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: remote config changes trigger network egress — 20/min.
+    const { checkRateLimit: crRemotes, rateLimitReply: rlrRemotes } = await import('../lib/rateLimit');
+    const rlRemotes = crRemotes(req as any, 'remotes', 20, 60 * 1000);
+    if (!rlRemotes.allowed) return rlrRemotes(reply as any, rlRemotes.resetMs);
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     const r = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
@@ -1745,32 +2076,20 @@ export async function repoRoutes(app: FastifyInstance) {
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { name, url } = parsed.data;
-
-    // SEC-007: Reject filesystem remotes (file://, local paths) to prevent cross-tenant repository exfiltration
-    if (!/^https?:\/\//i.test(url)) {
-      return reply.status(400).send({ error: 'invalid remote url: must be http:// or https://' });
+    // S5-fresh: remote name flows positionally into `remote add <name>` — leading-dash
+    // names (e.g. --help) would parse as CLI flags. Reject (matches DELETE guard).
+    if (name.startsWith('-') || name.startsWith('.')) {
+      return reply.status(400).send({ error: 'invalid remote name' });
     }
-    try {
-      const u = new URL(url);
-      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-        return reply.status(400).send({ error: 'invalid remote url protocol' });
-      }
-      if (u.username || u.password) {
-        return reply.status(400).send({ error: 'credentials in remote url are not permitted' });
-      }
-      const rawHost = u.hostname.toLowerCase();
-      const h = rawHost.replace(/^\[|\]$/g, '');
-      const isPrivate = h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '::'
-        || h === '0.0.0.0' || h === 'metadata.google.internal' || h.endsWith('.internal') || h.endsWith('.local')
-        || h.startsWith('10.') || h.startsWith('192.168.') || h.startsWith('169.254.')
-        || /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)
-        || h.startsWith('::ffff:') || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80');
-      if (isPrivate && process.env.ALLOW_PRIVATE_REMOTES !== 'true' && process.env.ALLOW_LOCALHOST_REMOTE !== 'true') {
-        return reply.status(400).send({ error: 'private or internal remote urls are forbidden' });
-      }
-    } catch (e: any) {
-      if (reply.sent) return;
-      return reply.status(400).send({ error: 'invalid remote url' });
+
+    // S13: shared remote-URL policy (creation-time gate; execution-time re-check
+    // in fetch/push/pull covers stale remotes predating this gate).
+    const urlErr = validateRemoteUrl(url);
+    if (urlErr) {
+      try {
+        await auditLog({ userId: user.id, action: 'ssrf.blocked', target: `${owner}/${repo}:${name}`, req });
+      } catch {}
+      return reply.status(400).send({ error: urlErr });
     }
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
@@ -1785,8 +2104,17 @@ export async function repoRoutes(app: FastifyInstance) {
   app.delete('/api/repos/:owner/:repo/remotes/:name', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    const { checkRateLimit: crRemotesDel, rateLimitReply: rlrRemotesDel } = await import('../lib/rateLimit');
+    const rlRemotesDel = crRemotesDel(req as any, 'remotes', 20, 60 * 1000);
+    if (!rlRemotesDel.allowed) return rlrRemotesDel(reply as any, rlRemotesDel.resetMs);
     const { owner, repo, name } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
+    // S5-fresh: remote name flows positionally into `remote remove <name>` — a value
+    // like `--help` would otherwise be parsed as a CLI flag (integrity confusion).
+    // Leading dots are rejected too (hidden/ref confusion).
+    if (!/^[a-zA-Z0-9._-]{1,100}$/.test(name) || name.startsWith('-') || name.startsWith('.')) {
+      return reply.status(400).send({ error: 'invalid remote name' });
+    }
     const r = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     if (!(await isAdmin(r.rows[0].id, user.id))) return reply.status(403).send({ error: 'forbidden' });

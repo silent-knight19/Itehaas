@@ -114,6 +114,14 @@ describe('S11 XSS, Markdown Sanitization, & Content Security Policy', () => {
       expect(viewerCode).toContain('javascript|data|vbscript');
       expect(viewerCode).toContain('noopener noreferrer');
     });
+
+    it('S11-fresh: MarkdownViewer guards img sources too (schema drift defense)', () => {
+      const viewerCode = fs.readFileSync('../web/components/MarkdownViewer.tsx', 'utf8');
+      // Custom img component mirroring the anchor protocol filter.
+      expect(viewerCode).toMatch(/img:\s*\(\{/);
+      expect(viewerCode).toContain('blocked image');
+      // Behavioral guarantee is covered by web/components/MarkdownViewer.test.tsx (jsdom).
+    });
   });
 
   describe('4. Safe File Serving Architecture', () => {

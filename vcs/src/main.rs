@@ -129,6 +129,10 @@ enum Commands {
         /// Follow file history (path)
         #[arg(long)]
         follow: Option<String>,
+        /// Start from this branch, tag, or commit instead of HEAD (S15: lets
+        /// readers query a branch without mutating `.itehaas/HEAD`)
+        #[arg(long)]
+        rev: Option<String>,
         /// Paths to filter (after --)
         #[arg(last = true)]
         paths: Vec<PathBuf>,
@@ -708,11 +712,12 @@ fn main() -> Result<()> {
             author,
             grep,
             follow,
+            rev,
             paths,
         } => {
             let repo = find_repo_or_cwd()?;
             cmd_log(
-                &repo, oneline, max_count, all, graph, patch, stat, name_only, since, until, author, grep, follow, paths,
+                &repo, oneline, max_count, all, graph, patch, stat, name_only, since, until, author, grep, follow, rev, paths,
             )?;
         }
         Commands::Config { key, value } => {
@@ -1258,6 +1263,9 @@ fn cmd_status(repo: &Path) -> Result<()> {
     Ok(())
 }
 
+// S15: 15 scalar log options predate this change (--rev included); bundling them
+// would churn every history call site for no security gain.
+#[allow(clippy::too_many_arguments)]
 fn cmd_log(
     repo: &Path,
     oneline: bool,
@@ -1272,6 +1280,7 @@ fn cmd_log(
     author: Option<String>,
     grep: Option<String>,
     follow: Option<String>,
+    rev: Option<String>,
     paths: Vec<PathBuf>,
 ) -> Result<()> {
     let algo = config::read_hasher(repo).map_err(|e: itehaas_lib::error::ItehaasError| anyhow::anyhow!(e.to_string()))?;
@@ -1305,6 +1314,7 @@ fn cmd_log(
         author,
         grep,
         follow,
+        rev,
         paths: path_strs,
     };
 

@@ -591,4 +591,343 @@ describe('S3 Authorization Matrix', () => {
     expect(res.json().user.email).toBeUndefined();
     await app.close();
   });
+
+  describe('S3-fresh: BOLA/IDOR adversarial', () => {
+    it('cross-repo issue comments BOLA -> 404 (known UUID via wrong repo)', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [users.bobRead] };
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'repo-A', visibility: 'public' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [{ role: 'read' }] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        // Issue belongs to repo-B, not repo-A
+        if (text.includes('SELECT id FROM issues WHERE id=$1 AND repo_id=$2')) return { rows: [] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/repos/alice/repoA/issues/issue-from-repoB/comments',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.bobRead)}` },
+      });
+      expect(res.statusCode).toBe(404);
+      await app.close();
+    });
+
+    it('cross-repo PR comments BOLA -> 404 (known UUID via wrong repo)', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [users.bobRead] };
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'repo-A', visibility: 'public', default_branch: 'main' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [{ role: 'read' }] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        if (text.includes('SELECT id FROM pull_requests WHERE id=$1 AND repo_id=$2')) return { rows: [] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/repos/alice/repoA/pulls/pr-from-repoB/comments',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.bobRead)}` },
+      });
+      expect(res.statusCode).toBe(404);
+      await app.close();
+    });
+
+    it('reader creating issue with NEW label -> 403 (no label pollution)', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [users.charlie] };
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-pub', visibility: 'public' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        if (text.includes('INSERT INTO issues')) return { rows: [{ id: 'iss-9', title: 't', body: '', status: 'open', milestone_id: null, created_at: new Date().toISOString() }] };
+        if (text.includes('SELECT id FROM labels WHERE repo_id=$1')) return { rows: [] }; // unknown label
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/pub/issues',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.charlie)}` },
+        payload: { title: 't', body: 'b', labels: ['brand-new-label'] },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error).toMatch(/label creation requires write/);
+      await app.close();
+    });
+
+    it('reader PATCH issue milestone/labels/assignees -> 403, title still allowed for author', async () => {
+      const issueRow = { author_id: 'u-charlie', repo_id: 'r-pub' };
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [users.charlie] };
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-pub', visibility: 'public' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        if (text.includes('SELECT author_id, repo_id FROM issues WHERE id=$1 AND repo_id=$2')) return { rows: [issueRow] };
+        if (text.includes('UPDATE issues SET')) return { rows: [{ id: 'iss-1', title: 'new', body: '', status: 'open', milestone_id: null, updated_at: new Date().toISOString() }] };
+        if (text.includes('SELECT i.id, i.title') && text.includes('AND i.repo_id=$2')) return { rows: [{ id: 'iss-1', title: 'new', body: '', status: 'open', milestone_id: null, updated_at: new Date().toISOString() }] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const base = { headers: { cookie: `itehaas_session=${sessionIdFor(users.charlie)}` } };
+      for (const payload of [{ milestone: 'v1' }, { labels: ['bug'] }, { assignees: ['alice'] }]) {
+        const res = await app.inject({ method: 'PATCH', url: '/api/repos/alice/pub/issues/iss-1', ...base, payload });
+        expect(res.statusCode).toBe(403);
+      }
+      const okRes = await app.inject({ method: 'PATCH', url: '/api/repos/alice/pub/issues/iss-1', ...base, payload: { title: 'new' } });
+      expect(okRes.statusCode).toBe(200);
+      await app.close();
+    });
+
+    it('reader (non-author) requesting PR reviewers -> 403; author -> 201', async () => {
+      const setup = (user: any, authorId: string) => mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [user] };
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-pub', visibility: 'public', default_branch: 'main' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        if (text.includes('SELECT id, author_id FROM pull_requests WHERE id=$1 AND repo_id=$2')) return { rows: [{ id: 'pr-1', author_id: authorId }] };
+        if (text.includes('SELECT id FROM users WHERE username=$1')) return { rows: [{ id: 'u-bob-read' }] };
+        if (text.includes('INSERT INTO pr_requested_reviewers')) return { rows: [], rowCount: 1 };
+        if (text.includes('INSERT INTO notifications')) return { rows: [], rowCount: 1 };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      setup(users.charlie, 'u-alice'); // charlie: reader, not author
+      const denied = await app.inject({
+        method: 'POST', url: '/api/repos/alice/pub/pulls/pr-1/reviewers',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.charlie)}` },
+        payload: { username: 'bob' },
+      });
+      expect(denied.statusCode).toBe(403);
+      setup(users.alice, 'u-alice'); // alice: author
+      const allowed = await app.inject({
+        method: 'POST', url: '/api/repos/alice/pub/pulls/pr-1/reviewers',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.alice)}` },
+        payload: { username: 'bob' },
+      });
+      expect(allowed.statusCode).toBe(201);
+      await app.close();
+    });
+
+    it('self-approve on own PR -> 403; self comment -> 201', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [users.alice] };
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-pub', visibility: 'public', default_branch: 'main' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [{ role: 'admin' }] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        if (text.includes('SELECT status, is_draft, author_id FROM pull_requests WHERE id=$1 AND repo_id=$2')) {
+          return { rows: [{ status: 'open', is_draft: false, author_id: 'u-alice' }] };
+        }
+        if (text.includes('INSERT INTO pr_reviews')) return { rows: [{ id: 'rev-1', decision: 'commented', body: 'x', created_at: new Date().toISOString() }] };
+        if (text.includes('SELECT author_id FROM pull_requests WHERE id=$1')) return { rows: [{ author_id: 'u-alice' }] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const denied = await app.inject({
+        method: 'POST', url: '/api/repos/alice/pub/pulls/pr-1/reviews',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.alice)}` },
+        payload: { decision: 'approved', body: 'lgtm' },
+      });
+      expect(denied.statusCode).toBe(403);
+      const allowed = await app.inject({
+        method: 'POST', url: '/api/repos/alice/pub/pulls/pr-1/reviews',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.alice)}` },
+        payload: { decision: 'commented', body: 'note' },
+      });
+      expect(allowed.statusCode).toBe(201);
+      await app.close();
+    });
+
+    it('review comment with traversal path -> 400', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [users.bobWrite] };
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-pub', visibility: 'public', default_branch: 'main' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [{ role: 'write' }] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST', url: '/api/repos/alice/pub/pulls/pr-1/review_comments',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.bobWrite)}` },
+        payload: { body: 'x', path: '../../etc/passwd' },
+      });
+      expect(res.statusCode).toBe(400);
+      await app.close();
+    });
+
+    it('milestone PATCH unknown id -> 404 (not 200 null)', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [users.alice] };
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-pub', visibility: 'public' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('UPDATE milestones SET')) return { rows: [] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'PATCH', url: '/api/repos/alice/pub/milestones/no-such-id',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.alice)}` },
+        payload: { title: 'x' },
+      });
+      expect(res.statusCode).toBe(404);
+      await app.close();
+    });
+
+    it('PATCH default_branch with traversal -> 400', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [users.alice] };
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-pub', visibility: 'private' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'PATCH', url: '/api/repos/alice/pub',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.alice)}` },
+        payload: { default_branch: '../evil' },
+      });
+      expect(res.statusCode).toBe(400);
+      await app.close();
+    });
+
+    it('forks listing hides private forks from anon', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('SELECT r.id, r.visibility FROM repositories r JOIN users u')) {
+          return { rows: [{ id: 'up-1', visibility: 'public' }] };
+        }
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        if (text.includes('FROM forks f JOIN repositories r ON f.fork_repo_id')) {
+          return { rows: [
+            { id: 'fork-pub', name: 'pub', visibility: 'public', owner: 'bob' },
+            { id: 'fork-priv', name: 'priv', visibility: 'private', owner: 'mallory' },
+          ] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({ method: 'GET', url: '/api/repos/alice/up/forks' });
+      expect(res.statusCode).toBe(200);
+      const names = res.json().forks.map((f: any) => f.name);
+      expect(names).toContain('pub');
+      expect(names).not.toContain('priv');
+      await app.close();
+    });
+
+    it('team repos listing hides private repos from anon', async () => {
+      mockQuery.mockImplementation(async (text: string) => {
+        if (text.includes('SELECT id FROM organizations WHERE name=$1')) return { rows: [{ id: 'org-1' }] };
+        if (text.includes('SELECT id FROM teams WHERE org_id=$1 AND name=$2')) return { rows: [{ id: 'team-1' }] };
+        if (text.includes('SELECT r.id, r.name, r.visibility')) {
+          return { rows: [
+            { id: 'r-pub', name: 'pub', visibility: 'public', owner: 'alice', permission: 'read' },
+            { id: 'r-priv', name: 'priv', visibility: 'private', owner: 'alice', permission: 'read' },
+          ] };
+        }
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({ method: 'GET', url: '/api/orgs/acme/teams/devs/repos' });
+      expect(res.statusCode).toBe(200);
+      const names = res.json().repos.map((r: any) => r.name);
+      expect(names).toContain('pub');
+      expect(names).not.toContain('priv');
+      await app.close();
+    });
+
+    it('team-admin can manage CI secrets (isAdmin includes team-admin)', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [users.bobRead] };
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-1', visibility: 'private' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members WHERE repo_id = $1 AND user_id = $2')) return { rows: [] };
+        if (text.includes('SELECT tr.permission FROM team_members')) return { rows: [{ permission: 'admin' }] };
+        if (text.includes('SELECT key, created_at FROM ci_secrets')) return { rows: [] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'GET', url: '/api/repos/alice/priv/ci/secrets',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.bobRead)}` },
+      });
+      expect(res.statusCode).toBe(200);
+      await app.close();
+    });
+
+    it('removing the last org owner -> 400', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [users.alice] };
+        if (text.includes('SELECT id FROM organizations WHERE name=$1')) return { rows: [{ id: 'org-1' }] };
+        if (text.includes('SELECT role FROM organization_members WHERE org_id=$1 AND user_id=$2')) return { rows: [{ role: 'owner' }] };
+        if (text.includes('SELECT id FROM users WHERE username=$1')) return { rows: [{ id: 'u-alice' }] };
+        if (text.includes("SELECT role FROM organization_members WHERE org_id=$1 AND user_id=$2") && params?.[1] === 'u-alice') {
+          return { rows: [{ role: 'owner' }] };
+        }
+        if (text.includes("SELECT count(*)::int as c FROM organization_members WHERE org_id=$1 AND role='owner'")) {
+          return { rows: [{ c: 1 }] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'DELETE', url: '/api/orgs/acme/members/alice',
+        headers: { cookie: `itehaas_session=${sessionIdFor(users.alice)}` },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(/last owner/);
+      await app.close();
+    });
+
+    it('rejecting an expired invite -> 410; stranger rejecting -> 403', async () => {
+      const mkApp = async (user: any, inv: any) => {
+        mockQuery.mockImplementation(async (text: string) => {
+          if (text.includes('FROM sessions s JOIN users u')) return { rows: [user] };
+          if (text.includes('SELECT * FROM invites WHERE token=$1')) return { rows: [inv] };
+          return { rows: [], rowCount: 0 };
+        });
+        return buildApp();
+      };
+      const expired = { id: 'inv-1', token: 'tok', status: 'pending', expires_at: new Date(Date.now() - 1000).toISOString(), invited_user_id: 'u-charlie', email: null };
+      const app1 = await mkApp(users.charlie, expired);
+      const r1 = await app1.inject({ method: 'POST', url: '/api/invites/tok/reject', headers: { cookie: `itehaas_session=${sessionIdFor(users.charlie)}` } });
+      expect(r1.statusCode).toBe(410);
+      await app1.close();
+      const owned = { id: 'inv-2', token: 'tok', status: 'pending', expires_at: new Date(Date.now() + 3600000).toISOString(), invited_user_id: 'u-alice', email: null };
+      const app2 = await mkApp(users.charlie, owned);
+      const r2 = await app2.inject({ method: 'POST', url: '/api/invites/tok/reject', headers: { cookie: `itehaas_session=${sessionIdFor(users.charlie)}` } });
+      expect(r2.statusCode).toBe(403);
+      await app2.close();
+    });
+
+    it('PR create with traversal branch names -> 400', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [users.bobWrite] };
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-pub', visibility: 'public', default_branch: 'main' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [{ role: 'write' }] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      for (const bad of ['../evil', 'a//b', 'x@{y}', '.hidden']) {
+        const res = await app.inject({
+          method: 'POST', url: '/api/repos/alice/pub/pulls',
+          headers: { cookie: `itehaas_session=${sessionIdFor(users.bobWrite)}` },
+          payload: { title: 't', source_branch: bad, target_branch: 'main' },
+        });
+        expect(res.statusCode).toBe(400);
+      }
+      await app.close();
+    });
+  });
 });

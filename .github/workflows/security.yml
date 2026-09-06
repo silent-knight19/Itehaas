@@ -4,9 +4,14 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+# S16: least-privilege automation token (was: implicit broad default).
+permissions:
+  contents: read
 jobs:
   audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -17,12 +22,16 @@ jobs:
           node-version: '20'
           cache: 'pnpm'
       - name: Install
-        run: pnpm install --frozen-lockfile || pnpm install
+        # S16: strict frozen lockfile — the old `|| pnpm install` fallback silently
+        # resolved fresh (unaudited) versions whenever the lockfile drifted.
+        run: pnpm install --frozen-lockfile
       - name: pnpm audit --prod critical
         run: pnpm audit --prod --audit-level=critical
-      - name: cargo audit (if available)
+      - name: cargo audit
         run: |
-          if command -v cargo-audit >/dev/null 2>&1; then cargo audit; else echo "cargo-audit not installed, skipping"; fi
+          cargo install cargo-audit --locked --root /tmp/cargo-audit-bin || true
+          export PATH="/tmp/cargo-audit-bin/bin:$PATH"
+          if command -v cargo-audit >/dev/null 2>&1; then cargo audit; else echo "cargo-audit unavailable, skipping"; fi
       - name: gitleaks detect
         uses: gitleaks/gitleaks-action@v2
         env:

@@ -12,6 +12,10 @@ export async function starRoutes(app: FastifyInstance) {
   app.post('/api/repos/:owner/:repo/star', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: like-spam class — 30/min.
+    { const { checkRateLimit: crSt, rateLimitReply: rlrSt } = await import('../lib/rateLimit');
+      const rlSt = crSt(req as any, 'stars', 30, 60 * 1000);
+      if (!rlSt.allowed) return rlrSt(reply as any, rlSt.resetMs); }
     const { owner, repo } = req.params as any;
     if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid' });
     const meta = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
@@ -30,6 +34,10 @@ export async function starRoutes(app: FastifyInstance) {
   app.delete('/api/repos/:owner/:repo/star', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: like-spam class — 30/min.
+    { const { checkRateLimit: crSt, rateLimitReply: rlrSt } = await import('../lib/rateLimit');
+      const rlSt = crSt(req as any, 'stars', 30, 60 * 1000);
+      if (!rlSt.allowed) return rlrSt(reply as any, rlSt.resetMs); }
     const { owner, repo } = req.params as any;
     const meta = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (meta.rows.length === 0) return reply.status(404).send({ error: 'not found' });

@@ -106,4 +106,79 @@ describe('S13 SSRF & Remote Fetch Security', () => {
     expect(res.json().ok).toBe(true);
     await app.close();
   });
+
+  describe('S13-fresh: execution-time gates (stale remotes)', () => {
+    async function mockStoredRemotes(lines: string) {
+      const vcs: any = await import('../lib/vcs');
+      return vi.spyOn(vcs, 'execItehaas').mockImplementation(async (args: string[]) => {
+        if (args[0] === 'remote') return { stdout: lines, stderr: '', code: 0 };
+        return { stdout: '', stderr: '', code: 0 };
+      });
+    }
+
+    it('fetch via stale file:// remote -> 403 + audit (never spawns fetch)', async () => {
+      const spy = await mockStoredRemotes('victim file:///data/repos/alice/private (fetch)\n');
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/repo/fetch',
+        headers: { cookie: `itehaas_session=${sessionId}` },
+        payload: { remote: 'victim' },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error).toMatch(/remote blocked/);
+      expect(spy.mock.calls.every((c) => (c[0] as string[])[0] !== 'fetch')).toBe(true);
+      spy.mockRestore();
+      await app.close();
+    });
+
+    it('push via stale literal-private remote -> 403', async () => {
+      const spy = await mockStoredRemotes('evil http://10.9.9.9/api/repos/x/y (fetch)\n');
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/repo/push',
+        headers: { cookie: `itehaas_session=${sessionId}` },
+        payload: { remote: 'evil' },
+      });
+      expect(res.statusCode).toBe(403);
+      spy.mockRestore();
+      await app.close();
+    });
+
+    it('fetch of unconfigured remote -> 404 (no subprocess beyond lookup)', async () => {
+      const spy = await mockStoredRemotes('origin https://example.com/api/repos/a/b (fetch)\n');
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/repo/fetch',
+        headers: { cookie: `itehaas_session=${sessionId}` },
+        payload: { remote: 'ghost' },
+      });
+      expect(res.statusCode).toBe(404);
+      spy.mockRestore();
+      await app.close();
+    });
+
+    it('flag-like remote name in fetch body -> 400', async () => {
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/repo/fetch',
+        headers: { cookie: `itehaas_session=${sessionId}` },
+        payload: { remote: '--help' },
+      });
+      expect(res.statusCode).toBe(400);
+      await app.close();
+    });
+
+    it('validateRemoteUrl unit: file/creds/private blocked, public allowed', async () => {
+      const { validateRemoteUrl } = await import('./repos');
+      expect(validateRemoteUrl('file:///data/repos/a/b')).toMatch(/http/);
+      expect(validateRemoteUrl('../../x')).toMatch(/http/);
+      expect(validateRemoteUrl('https://user:pass@example.com/api/repos/a/b')).toMatch(/credentials/);
+      expect(validateRemoteUrl('http://169.254.169.254/latest/meta-data')).toMatch(/private|invalid/);
+      expect(validateRemoteUrl('https://example.com/api/repos/a/b')).toBeNull();
+    });
+  });
 });

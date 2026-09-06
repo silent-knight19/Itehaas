@@ -58,6 +58,20 @@ pub fn resolve_remote_path(repo: &Path, url: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// Bounds for reachability walks (FSEC-008): a malicious graph must not cause
+/// stack overflow or unbounded work. The commit/tag walk below is iterative (heap
+/// stack, no recursion depth issue) and bounded by object count; tree nesting keeps
+/// an explicit depth cap since trees recurse.
+const MAX_REACH_DEPTH: usize = 2048;
+const MAX_REACH_OBJECTS: usize = 100_000;
+
+fn check_reach_budget(visited: &HashSet<String>) -> Result<()> {
+    if visited.len() >= MAX_REACH_OBJECTS {
+        return Err(ItehaasError::InvalidObject("reachability walk too large (exceeded 100,000 objects)".into()));
+    }
+    Ok(())
+}
+
 /// Collect all objects reachable from a commit (including trees, blobs, and parent commits)
 pub fn collect_reachable_objects(
     repo: &Path,
@@ -66,43 +80,48 @@ pub fn collect_reachable_objects(
     visited: &mut HashSet<String>,
     out: &mut Vec<Hash>,
 ) -> Result<()> {
-    let key = start_hash.hex();
-    if visited.contains(&key) {
-        return Ok(());
-    }
-    visited.insert(key.clone());
-    out.push(start_hash.clone());
-
-    let obj = store::read_object(repo, start_hash, hasher)?;
-    match obj {
-        crate::object::Object::Commit(c) => {
-            // Collect tree
-            collect_tree_objects(repo, &c.tree, hasher, visited, out)?;
-            // Collect parents
-            for p in c.parents {
-                collect_reachable_objects(repo, &p, hasher, visited, out)?;
-            }
+    // S6-fresh: iterative work-stack instead of recursion. A malicious linear chain of
+    // commits previously recursed once per commit (stack overflow); legitimate long
+    // histories must keep working, so the parent chain is NOT depth-capped — total
+    // work is bounded by the visited-object budget (each hash is read at most once).
+    let mut stack: Vec<Hash> = vec![start_hash.clone()];
+    while let Some(h) = stack.pop() {
+        check_reach_budget(visited)?;
+        let key = h.hex();
+        if visited.contains(&key) {
+            continue;
         }
-        crate::object::Object::Tree(t) => {
-            for e in t.entries {
-                if e.mode == 0o040000 {
-                    // Subtree
-                    collect_tree_objects(repo, &e.hash, hasher, visited, out)?;
-                } else {
-                    let k = e.hash.hex();
-                    if !visited.contains(&k) {
-                        visited.insert(k.clone());
-                        out.push(e.hash.clone());
+        visited.insert(key);
+        out.push(h.clone());
+
+        let obj = store::read_object(repo, &h, hasher)?;
+        match obj {
+            crate::object::Object::Commit(c) => {
+                collect_tree_objects(repo, &c.tree, hasher, visited, out, 0)?;
+                for p in c.parents {
+                    stack.push(p);
+                }
+            }
+            crate::object::Object::Tree(t) => {
+                for e in t.entries {
+                    if e.mode == 0o040000 {
+                        collect_tree_objects(repo, &e.hash, hasher, visited, out, 0)?;
+                    } else {
+                        let k = e.hash.hex();
+                        if !visited.contains(&k) {
+                            check_reach_budget(visited)?;
+                            visited.insert(k);
+                            out.push(e.hash.clone());
+                        }
                     }
                 }
             }
-        }
-        crate::object::Object::Blob(_) => {
-            // Already added
-        }
-        crate::object::Object::Tag(t) => {
-            // Tag points to an object
-            collect_reachable_objects(repo, &t.object, hasher, visited, out)?;
+            crate::object::Object::Blob(_) => {
+                // Already added
+            }
+            crate::object::Object::Tag(t) => {
+                stack.push(t.object);
+            }
         }
     }
     Ok(())
@@ -114,7 +133,15 @@ fn collect_tree_objects(
     hasher: &dyn crate::hash::Hasher,
     visited: &mut HashSet<String>,
     out: &mut Vec<Hash>,
+    depth: usize,
 ) -> Result<()> {
+    // S6-fresh: same bounds for the tree-only walk.
+    if depth > MAX_REACH_DEPTH {
+        return Err(ItehaasError::InvalidObject(format!("reachability walk too deep: {}", depth)));
+    }
+    if visited.len() >= MAX_REACH_OBJECTS {
+        return Err(ItehaasError::InvalidObject("reachability walk too large (exceeded 100,000 objects)".into()));
+    }
     let key = tree_hash.hex();
     if visited.contains(&key) {
         return Ok(());
@@ -129,10 +156,13 @@ fn collect_tree_objects(
     };
     for e in tree.entries {
         if e.mode == 0o040000 {
-            collect_tree_objects(repo, &e.hash, hasher, visited, out)?;
+            collect_tree_objects(repo, &e.hash, hasher, visited, out, depth + 1)?;
         } else {
             let k = e.hash.hex();
             if !visited.contains(&k) {
+                if visited.len() >= MAX_REACH_OBJECTS {
+                    return Err(ItehaasError::InvalidObject("reachability walk too large (exceeded 100,000 objects)".into()));
+                }
                 visited.insert(k.clone());
                 out.push(e.hash.clone());
             }

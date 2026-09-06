@@ -45,6 +45,12 @@ impl Index {
         }
     }
 
+    /// Bounds for the staging-area file (FSEC-007): the index is attacker-influenced
+    /// (a malicious checkout/clone could plant one) and parsed with serde_json into a
+    /// fully-materialized map — never parse unbounded input.
+    pub const MAX_INDEX_BYTES: usize = 32 * 1024 * 1024;
+    pub const MAX_INDEX_ENTRIES: usize = 500_000;
+
     /// Load from .itehaas/index. If missing or empty, return empty index.
     pub fn load(repo: &Path) -> Result<Self> {
         let path = repo.join(".itehaas").join("index");
@@ -55,6 +61,14 @@ impl Index {
         if data.is_empty() {
             return Ok(Self::new());
         }
+        // S6-fresh: bound before parsing (allocation bomb guard).
+        if data.len() > Self::MAX_INDEX_BYTES {
+            return Err(ItehaasError::InvalidObject(format!(
+                "index too large: {} bytes (limit {})",
+                data.len(),
+                Self::MAX_INDEX_BYTES
+            )));
+        }
         // Try JSON first; fallback: old empty handling
         let idx: Self = serde_json::from_slice(&data).map_err(|e| {
             ItehaasError::InvalidObject(format!("index corrupted: {}", e))
@@ -63,6 +77,13 @@ impl Index {
             return Err(ItehaasError::InvalidObject(format!(
                 "unsupported index version: {}",
                 idx.version
+            )));
+        }
+        if idx.entries.len() > Self::MAX_INDEX_ENTRIES {
+            return Err(ItehaasError::InvalidObject(format!(
+                "index too many entries: {} (limit {})",
+                idx.entries.len(),
+                Self::MAX_INDEX_ENTRIES
             )));
         }
         Ok(idx)

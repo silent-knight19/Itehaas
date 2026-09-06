@@ -5,11 +5,35 @@ type Bucket = { count: number; resetMs: number };
 
 const buckets = new Map<string, Bucket>();
 
-function keyFor(req: any, suffix: string): string {
-  const ip = (req.ip as string) || (req.headers['x-forwarded-for'] as string) || (req.headers['x-real-ip'] as string) || 'unknown';
+/**
+ * S14 (FSEC-002): proxy-aware client IP. `X-Forwarded-For` is attacker-controlled
+ * on direct connections, so it is only honored when the TCP peer is a configured
+ * trusted proxy (default: loopback, i.e. Tailscale-serve / local reverse proxy).
+ * Direct clients are bucketed by socket address, which cannot be spoofed.
+ * Operators MUST set TRUSTED_PROXIES to their proxy IPs and ensure the proxy
+ * overwrites (not appends) X-Forwarded-For. See docs/security/threat-model.md §6.
+ */
+function trustedProxies(): string[] {
+  const raw = process.env.TRUSTED_PROXIES;
+  if (raw === undefined || raw.trim() === '') return ['127.0.0.1', '::1', '::ffff:127.0.0.1'];
+  return raw.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+export function getClientIp(req: any): string {
+  const socketIp = (req.raw?.socket?.remoteAddress as string) || (req.socket?.remoteAddress as string) || '';
+  const trusted = trustedProxies();
+  if (socketIp && !trusted.includes(socketIp)) {
+    // Direct (untrusted) connection: XFF is hearsay — use the socket peer.
+    return socketIp.slice(0, 80);
+  }
+  const ip = (req.ip as string) || (req.headers['x-forwarded-for'] as string) || (req.headers['x-real-ip'] as string) || socketIp || 'unknown';
   // x-forwarded-for may contain list, take first
   const cleanIp = String(ip).split(',')[0].trim().slice(0, 80);
-  return `${cleanIp}:${suffix}`;
+  return cleanIp;
+}
+
+function keyFor(req: any, suffix: string): string {
+  return `${getClientIp(req)}:${suffix}`;
 }
 
 /**

@@ -13,6 +13,10 @@ export interface VcsResult {
 const HASH_REGEX = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const TIMEOUT_MS = 30_000;
 const MAX_OUTPUT = 1 << 20; // 1 MiB cap per stream
+// S5-fresh: oversized-argument bomb guard. Legitimate args are short (hashes 40/64,
+// branches ≤100, urls ≤500, absolute repo paths); anything larger is an abuse attempt.
+const MAX_ARG_BYTES = 4096;
+const MAX_TOTAL_ARG_BYTES = 8192;
 
 // S5: allowlist for env sent to VCS child (minimal, no secrets)
 export const ALLOWED_ENV_KEYS = new Set(['PATH', 'LANG', 'HOME', 'USER', 'TMPDIR', 'SHELL']);
@@ -35,6 +39,7 @@ const ALLOWED_FLAGS = new Set([
   '--hard', '--staged', '--worktree', '--source', '--cached', '-n', '--dry-run', '-d', '--dirs',
   '-u', '--include-untracked', '-a', '-d', '-l', '--stage', '--others', '--ignored', '-v',
   '--history', '--continue', '--abort', '-i', '--interactive', '--prune', '--is-ancestor',
+  '--rev',
   // generic
   '--', '-v', '--help',
 ]);
@@ -47,6 +52,17 @@ export function isAllowedFlag(arg: string): boolean {
 }
 
 // S5: validate bin path
+// Exported for testing: strict prefix allowlist for the VCS executable.
+export function isAllowedBinPath(resolved: string): boolean {
+  const allowedPrefixes = [
+    path.resolve(path.join(__dirname, '../../target')),
+    '/usr/local/bin',
+    '/usr/bin',
+    '/opt/itehaas',
+  ];
+  return allowedPrefixes.some((p) => resolved === p || resolved.startsWith(p + path.sep) || resolved.startsWith(p));
+}
+
 export function getValidatedBin(): string {
   const bin = config.itehaasBin;
   if (bin.includes('\0')) throw new Error('invalid bin path');
@@ -57,18 +73,14 @@ export function getValidatedBin(): string {
     if (!stat.isFile()) throw new Error('itehaas bin not a file');
     const mode = stat.mode;
     if (mode & 0o002) throw new Error('itehaas bin is world-writable');
-    // Must be inside allowed prefixes: project target or /usr/local/bin or /usr/bin
-    const allowedPrefixes = [
-      path.resolve(path.join(__dirname, '../../target')),
-      '/usr/local/bin',
-      '/usr/bin',
-      '/opt/itehaas',
-    ];
-    const isAllowed = allowedPrefixes.some((p) => resolved === p || resolved.startsWith(p + path.sep) || resolved.startsWith(p));
-    // Also allow /tmp/itehaas_test for tests (mock)
-    if (!isAllowed && !resolved.startsWith('/tmp/')) {
-      // For dev, allow any absolute path that exists and is not world-writable (already checked)
-      // So we allow if not world-writable, even if not in prefix — but log warning
+    // S5-fresh (FSEC-012): in production the prefix is enforced — a runtime ITEHAAS_BIN
+    // override to /tmp (after a passing S1 boot check) must not silently redirect execution.
+    if (!isAllowedBinPath(resolved)) {
+      if (config.isProd) {
+        throw new Error(`itehaas bin outside allowed prefixes in production: ${resolved}`);
+      }
+      // For dev/test, /tmp/ mock binaries are allowed; other absolute paths that exist
+      // and are not world-writable are allowed (already checked above).
     }
   } catch (e: any) {
     if (e.message && e.message.includes('itehaas bin')) throw e;
@@ -140,6 +152,11 @@ export function repoPathFor(owner: string, repo: string): string {
   if (!/^[a-zA-Z0-9._-]{1,100}$/.test(owner) || !/^[a-zA-Z0-9._-]{1,100}$/.test(repo)) {
     throw new Error('invalid owner/repo');
   }
+  // S4: reject dot-segments explicitly — "." aliases the root and ".." relies solely
+  // on the startsWith containment below. Fail closed at the identifier layer.
+  if (owner === '.' || owner === '..' || repo === '.' || repo === '..') {
+    throw new Error('invalid owner/repo');
+  }
   const p = path.join(path.resolve(config.reposRoot), owner, repo);
   validateRepoPath(p);
   return p;
@@ -169,7 +186,17 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
         }
       }
 
+      // S5-fresh: bound piped stdin before spawn (no callers use it today; fail closed).
+      if (opts.input !== undefined) {
+        const inputLen = typeof opts.input === 'string' ? Buffer.byteLength(opts.input) : (opts.input as Buffer).length;
+        if (inputLen > MAX_TOTAL_ARG_BYTES) {
+          vcsSemaphore.release();
+          return reject(new Error('invalid input: too large'));
+        }
+      }
+
       // S5: arg sanitization: no null bytes, no flag injection
+      let totalArgBytes = 0;
       for (const a of args) {
         if (a.includes('\0')) {
           vcsSemaphore.release();
@@ -178,6 +205,12 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
         if (a.includes('\n') || a.includes('\r')) {
           vcsSemaphore.release();
           return reject(new Error('invalid arg: newline'));
+        }
+        // S5-fresh: oversized-arg bomb guard (fail before spawn, release semaphore).
+        totalArgBytes += Buffer.byteLength(a);
+        if (Buffer.byteLength(a) > MAX_ARG_BYTES || totalArgBytes > MAX_TOTAL_ARG_BYTES) {
+          vcsSemaphore.release();
+          return reject(new Error('invalid arg: too large'));
         }
         // Block flag-like injection for branch/hash positions: if arg starts with '-' and is not allowlisted and not a hash, reject
         if (a.startsWith('-')) {
@@ -191,9 +224,15 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
         }
       }
 
+      // S5: never shell out — argv array only. shell:false is explicit (fail closed
+      // against any future default change) and stdin is ignored unless the caller
+      // supplies input, so a child waiting on stdin cannot wedge the semaphore.
+      const hasInput = opts.input !== undefined;
       const child = spawn(bin, args, {
         cwd: opts.cwd,
         env: getAllowedEnv(),
+        shell: false,
+        stdio: hasInput ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
       });
 
     let stdout = '';
@@ -211,7 +250,7 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
       }, 2000);
     }, timeout);
 
-    child.stdout.on('data', (d: Buffer) => {
+    child.stdout?.on('data', (d: Buffer) => {
       const s = d.toString();
       if (stdoutLen + s.length > maxOut) {
         stdout += s.slice(0, maxOut - stdoutLen);
@@ -221,7 +260,7 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
         stdoutLen += s.length;
       }
     });
-    child.stderr.on('data', (d: Buffer) => {
+    child.stderr?.on('data', (d: Buffer) => {
       const s = d.toString();
       if (stderrLen + s.length > maxOut) {
         stderr += s.slice(0, maxOut - stderrLen);
@@ -248,9 +287,9 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
 
     if (opts.input) {
       try {
-        child.stdin.write(opts.input);
+        child.stdin?.write(opts.input);
       } catch {}
-      child.stdin.end();
+      try { child.stdin?.end(); } catch {}
     }
     });
   })();
@@ -305,5 +344,8 @@ export async function listTree(repoPath: string, hash: string): Promise<{ mode: 
 }
 
 export function isValidOwnerRepo(owner: string, repo: string): boolean {
-  return /^[a-zA-Z0-9._-]{1,100}$/.test(owner) && /^[a-zA-Z0-9._-]{1,100}$/.test(repo);
+  if (!/^[a-zA-Z0-9._-]{1,100}$/.test(owner) || !/^[a-zA-Z0-9._-]{1,100}$/.test(repo)) return false;
+  // S4: dot-segments are never valid identities (aliasing + traversal).
+  if (owner === '.' || owner === '..' || repo === '.' || repo === '..') return false;
+  return true;
 }

@@ -36,7 +36,7 @@ export async function authRoutes(app: FastifyInstance) {
     await cleanupExpiredSessions();
     const schema = z.object({
       username: z.string().min(3).max(32),
-      email: z.string().email(),
+      email: z.string().max(255).email(),
       password: z.string().min(8).max(128),
     });
     const parsed = schema.safeParse(req.body);
@@ -101,9 +101,11 @@ export async function authRoutes(app: FastifyInstance) {
     const rlLogin = checkRateLimit(req as any, 'login', 5, 60 * 1000);
     if (!rlLogin.allowed) return rateLimitReply(reply, rlLogin.resetMs);
     await cleanupExpiredSessions();
+    // S2-fresh: bound input lengths BEFORE argon2 (fail fast on CPU-bomb payloads).
+    // Attack: 10MB password → argon2.verify burn. Register caps at 128; login must match.
     const schema = z.object({
-      username: z.string(),
-      password: z.string(),
+      username: z.string().min(1).max(255),
+      password: z.string().min(1).max(128),
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
@@ -114,6 +116,8 @@ export async function authRoutes(app: FastifyInstance) {
       const until = getLoginLockMs(req as any, username);
       const retrySec = Math.max(1, Math.ceil((until - Date.now()) / 1000));
       reply.header('Retry-After', String(retrySec));
+      // S18: lockout is a detection signal (credential-stuffing indicator).
+      await auditLog({ action: 'auth.lockout', target: username, req });
       return reply.status(429).send({ error: 'too many failed attempts, try again later' });
     }
 
@@ -166,8 +170,9 @@ export async function authRoutes(app: FastifyInstance) {
 
   // Logout
   app.post('/api/auth/logout', async (req, reply) => {
+    // S2-fresh: validate UUID shape before DB hit (fail closed on garbage, no oracle).
     const sessionId = (req.cookies as any)[sessionCookieName()];
-    if (sessionId) {
+    if (sessionId && /^[0-9a-fA-F-]{36}$/.test(sessionId)) {
       await query(`DELETE FROM sessions WHERE id = $1`, [sessionId]);
     }
     reply.clearCookie(sessionCookieName(), { path: '/' });
@@ -197,8 +202,12 @@ export async function authRoutes(app: FastifyInstance) {
   app.post('/api/auth/password', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S2-fresh: rate-limit current-password guessing with a valid session (5/min).
+    const rlPw = checkRateLimit(req as any, 'password_change', 5, 60 * 1000);
+    if (!rlPw.allowed) return rateLimitReply(reply, rlPw.resetMs);
+    // S2-fresh: bound currentPassword BEFORE argon2.verify (CPU-bomb guard, matches register max).
     const schema = z.object({
-      currentPassword: z.string().min(1),
+      currentPassword: z.string().min(1).max(128),
       newPassword: z.string().min(8).max(128),
     });
     const parsed = schema.safeParse(req.body);
@@ -246,6 +255,9 @@ export async function authRoutes(app: FastifyInstance) {
   app.post('/api/auth/sessions/revoke-all', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: session-nuke is sensitive — 10/min.
+    const rlRevoke = checkRateLimit(req as any, 'sessions', 10, 60 * 1000);
+    if (!rlRevoke.allowed) return rateLimitReply(reply, rlRevoke.resetMs);
     await query(`DELETE FROM sessions WHERE user_id = $1`, [user.id]);
     reply.clearCookie(sessionCookieName(), { path: '/' });
     reply.clearCookie('csrf_token', { path: '/' });

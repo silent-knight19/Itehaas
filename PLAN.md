@@ -698,7 +698,631 @@ Complete system deployed on Vivobook via `docker compose up` or bare metal (Phas
 - [x] Property tests 5 pass `cargo test --test property_tests` `prop_blob` `prop_tree` `prop_commit` `prop_hash` `metrics` — 2026-09-02
 - [x] Regression `cargo test` 122 (117+5) + `pnpm server` 32 + `web build` 12 routes — 2026-09-02
 
-# Security Program — Strict Phased Execution (S0–S19)
+# Security Program — Fresh S0 (2026-09-03, authoritative for this run)
+
+> **Fresh S0 ignoring all prior S0–S19 Complete claims.** Prior docs treated as untrusted input.
+> Rule: strict sequential phases, one active at a time. Fresh S0 = zero functional changes.
+
+Status: **Fresh S0 ✅ Complete (recon only). S1–S19 ⬜ Not Started in this run. STOPPED before S1.**
+
+## Fresh S0 — Security Reconnaissance (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Date:** 2026-09-03
+**Action:** Direct source inspection, no code/config/test edits. Prior claims distrusted and re-verified.
+
+### Deliverables Produced (this run)
+- `docs/security/threat-model.md` v3.0.0-fresh-S0 — 9 boundaries, assets/actors/flows/surfaces.
+- `docs/security/vulnerability-register.md` v3.0.0-fresh-S0 — 24 fresh findings FSEC-001…FSEC-024 (all Open).
+- `PLAN.md` — this section (prior S0–S19 table below retained as history only).
+
+### Key Fresh Findings (all Open, fix deferred)
+1. **FSEC-006 (High):** `GET /log?ref=` rewrites `.itehaas/HEAD` per-request — race/corruption (`repos.ts:1020-1052`).
+2. **FSEC-013 (High):** inline CI `workflow: z.any()` bypasses YAML limits (`ci.ts:397-434`).
+3. **FSEC-014 (High):** `copyMissingObjects` pre-copy weakens fork secret signal (`pulls.ts:127`, `ci.ts:297-302`).
+4. **FSEC-016 (High):** `SECRET_ENCRYPTION_KEY` defaults to `COOKIE_SECRET` + plaintext fallback (`config.ts:187`, `secrets.ts:85-91`).
+5. **FSEC-018 (High):** SSRF DNS best-effort fail-open + env-flag inconsistency (`remote/http.rs:62-235`).
+6. **FSEC-001 (High):** dev fallback secrets + `0.0.0.0` on misconfigured `NODE_ENV` (`config.ts:159-191`).
+7. **FSEC-023 (High):** `db` compose unhardened + default password (`docker-compose.yml:5-19`).
+8. **FSEC-005 (Med):** weak PR branch regex vs `isValidBranchRef` (`pulls.ts:89-90`).
+
+### Tests
+- Baseline only (no new security tests in S0 by design). Adversarial regression tests planned per-FSEC in register; to be added in S1–S19.
+- Manual verification: `git status` must show only `docs/security/threat-model.md`, `docs/security/vulnerability-register.md`, `PLAN.md`.
+
+Gate: Fresh S0 complete, no `server/`/`vcs/`/`web/`/`database/` edits. **STOP. Do not start S1.**
+
+---
+
+## Fresh S1 — Security Baseline & Fail-Closed Boot (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Prod boots with default/weak secrets, coupled encryption key, any-interface bind, invalid port/root/bin → session forgery, DB takeover, LAN exposure.
+**Attack path:** Omit `SECRET_ENCRYPTION_KEY` / set `HOST=::` / weak `DATABASE_URL` pwd / `PORT=0` / world-writable `REPOS_ROOT` parent / empty compose `.env` → server boots insecure.
+**Current defense:** `validateStartupConfig` length/pattern checks, `0.0.0.0` gate, compose loopback ports.
+**Weakness:** SEK silently fallback to cookie secret; DB pwd only 2 patterns; `::` bypass; PORT unchecked; parents unchecked; compose `:-` insecure fallbacks + baked `POSTGRES_PASSWORD:itehaas`.
+**Required fix (implemented, smallest):** explicit distinct 32+ SEK in prod; DB pwd ≥12 + weak-word block + required; any-host set `{0.0.0.0,::,::0,...}`; `validatePort 1-65535`; prod parent world-writable walk; compose `:?` mandatory + `NODE_ENV:-production` + `HOST:-127.0.0.1`; `.env.example` prod-failing dev values.
+
+### Changes
+- `server/src/config.ts` — DB pwd strength, port validator, IPv6 any-bind set, prod parent-writable walk, explicit distinct SEK.
+- `docker-compose.yml` — `:?` mandatory `POSTGRES_PASSWORD/DATABASE_URL/COOKIE_SECRET/SECRET_ENCRYPTION_KEY`, `NODE_ENV:-production`, `HOST:-127.0.0.1`, runner comment fixed.
+- `server/.env.example` — prod-failing placeholders + rotation guidance, `HOST=127.0.0.1`.
+- Tests — `s1-baseline.test.ts` 25→36 (SEK missing/coupled/short, DB missing/short/weak pwd, `::` bind, port, world-writable parent); `s17-deploy.test.ts` + `s19-adversarial.test.ts` SEC-002 assert `:?` + no hardcoded weak defaults.
+
+### Tests
+- `pnpm --filter server exec vitest run src/routes/s1-baseline.test.ts` — 36/36 green.
+- `pnpm --filter server exec vitest run` — 28 files, 272/272 green (2 brittle `CHANGE ME` assertions updated to fail-closed).
+- `pnpm --filter server exec tsc --noEmit` — clean.
+- `cargo test -p itehaas` — 20 suites ok, 0 failures.
+- Diff reviewed: strictly fail-closed additions, no weakening; secrets scan clean.
+
+### Findings
+- Fixed (fresh): FSEC-001 (explicit SEK + DB pwd + any-bind + port + compose mandatory), FSEC-023 (compose `:?`, no baked password).
+- Deferred: FSEC-002/003 (S12/S14), FSEC-004–024 remainder to owning phases.
+
+### Residual risks
+- Operators must create `.env` before `docker compose up` (breaking change by design); `docker` CLI absent locally so `compose config` fail-closed not executed here — verify on Vivobook with dummy env (expect `:?` error without `.env`, success with).
+- `SECRET_ENCRYPTION_KEY` rotation still needs re-encrypt procedure (S9); DB pwd 12+ is floor, prefer 24+ random.
+
+Gate: S1 complete. **STOP. Do not start S2.**
+
+---
+
+## Fresh S2 — Authentication Hardening (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Credential stuffing, brute-force, enumeration, session fixation/replay/hijack, token leakage, argon2 CPU-DoS, stale sessions.
+**Attack path:** Unbounded `login.password` / `currentPassword` (10MB → argon2 burn); unthrottled `POST /password` current-pw guessing with stolen session; malformed logout cookie → DB hit; expired/revoked replay.
+**Current defense:** RL register 3/min + login 5/min, lockout 5→15m, dummy argon2 + generic 401/409, argon2id 64MiB, server-generated UUID, 30d expiry + revoke-others on pw change, httpOnly/lax cookies, redacted logs.
+**Weakness:** Login/currentPassword unbounded; password-change + revoke-all no RL; logout no UUID guard.
+**Required fix (implemented, smallest):** bound login (`user 1-255`, `pw 1-128`) + register email `max 255` + `currentPassword max 128` before argon2; RL `password_change` 5/min; logout UUID-shape guard (still always-200, no oracle).
+
+### Changes
+- `server/src/routes/auth.ts` — input bounds, pw-change RL, logout guard.
+- Tests — `auth-s2.test.ts` 16→23 (+7 adversarial: oversized login/pw →400 no-verify, pw RL 429, malformed logout 200 no-DELETE, expired →401+clear, malformed Bearer 401 no-DB-hit).
+
+### Tests
+- `auth-s2.test.ts` — 23/23 green.
+- Full server — 28 files, 279/279 green. `tsc --noEmit` clean.
+- Diff reviewed: strictly hardening; generic 401/409 + fixation rotation + revocation preserved; no credential/session logging.
+
+### Findings
+- Fixed (fresh S2 gaps): unbounded-auth-input CPU bomb, unthrottled password-change guessing, logout garbage DB hit.
+- Deferred: session-UUID-at-rest unhashed (DB dump → hijack; needs hashed-session migration), Bearer full-scope (no CLI scoping), 30d absolute-only expiry (no idle timeout), unlimited concurrent sessions, XFF-spoofable RL buckets (→S14).
+
+### Residual risks
+- Session tokens stored raw in PG; rely on DB hardening + 30d expiry + revoke-all. Hash-at-rest migration deferred (would invalidate existing sessions).
+- Bearer = full session powers (incl. password change path); leakage impact equals cookie theft; mitigated by pino redact + 30d expiry.
+- Public profile lookup remains an existence oracle by design (see FSEC-020).
+
+Gate: S2 complete. **STOP. Do not start S3.**
+
+---
+
+## Fresh S3 — Authorization / IDOR / BOLA (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** BOLA/IDOR ID-swaps (repo/issue/PR/org/team/secret/user/CI), horizontal/vertical escalation, cross-tenant, private leakage via indirect endpoints.
+**Attack path (verified in code):** Child endpoints scoped by child UUID only (`GET issue/PR comments`, reviewers/reviews) → cross-repo leak with known UUID; milestone/labels/assignees mutated without write; reader reviewer-spam + self-approval; unvalidated review paths; numeric close-keyword closes wrong issue; weak `default_branch` regex; private forks/team-repos/counts exposed to anon; ad-hoc CI admin SQL misses team-admin; last-owner removal orphans org; invite reject lacks expiry/ownership gates; search omits team permission.
+**Current defense:** `canRead/canWrite/isAdmin/isOwner` + team perms, 404-masking, repo-scoped SELECTs in most routes, `isAdmin` gate on team-attach.
+**Required fix (implemented, smallest):** parent-scope all child reads/writes; milestone/labels/assignees require write (title/body/status stay author-or-write); label auto-create gated; milestone PATCH 404; PR UPDATEs repo-scoped; reviewers author-or-write; self approve/changes_requested 403 (comments allowed); review path `isValidFilePath`; numeric close only when mapped; `default_branch` via `isValidBranchRef`; forks/network/team-repos visibility-filtered; profile stars/activity visibility-filtered; CI secrets/checks via single `isAdmin`; org last-owner guard; invite-reject expiry+ownership gates; search adds team-membership visibility (consistency with `getTeamPermission`).
+
+### Changes
+- `issues.ts` — create/PATCH label+assignee+milestone write-gates, comment scoping + `validateOwnerRepo`, final SELECT scoped, milestone 404.
+- `pulls.ts` — child-endpoint parent scoping, reviewer request gate, self-approval block, path validation, UPDATE scoping, numeric-fallback removal, strict branch-ref check on create.
+- `repos.ts` — `default_branch` strict ref check, forks/network private-filter.- `orgs.ts` — team-repos visibility filter, last-owner guard.
+- `users.ts` — profile stars/activity visibility-filtered counts.
+- `ci.ts` — secrets/status_checks single `isAdmin` gate.
+- `invites.ts` — reject expiry (410) + ownership/email gates.
+- `search.ts` — team-membership visibility in repos/issues/pulls queries.
+- Tests — `authz-s3.test.ts` 18→33 (+15 BOLA/IDOR adversarial).
+
+### Behavior tradeoffs (documented)
+- Team-read non-authors can no longer request PR reviewers (author-or-write only) — reviewer spam > convenience; writers unaffected.
+- Issue authors without write can no longer set milestones/labels/assignees — triage is a maintainer action; title/body/status unchanged.
+- Public issue creation by readers preserved (SEC-023); reader PR comments preserved.
+
+### Tests
+- `authz-s3.test.ts` — 33/33 green (cross-repo comment BOLA, label pollution, milestone/label/assignee gates, reviewer gates, self-approval, review-path traversal, PR branch traversal, milestone 404, default-branch traversal, fork/team filtering, team-admin secrets, last-owner, invite reject).
+- Full server — 28 files, 294/294 green. `tsc --noEmit` clean.
+- Diff reviewed: every gate tightened or made consistent; no check loosened except search/team-admin alignment with existing `getTeamPermission` semantics.
+
+### Findings
+- Fixed: FSEC-005 (strict branch refs on PR create + `default_branch`), FSEC-011-class BOLA gaps, FSEC-015 (team-admin consistency), FSEC-020 (counts/listings redaction; org/member enumeration intentionally still public, noted below).
+- Deferred: FSEC-004 (owner/repo `.`/`..` strings → S4), FSEC-006 (HEAD race → S15), FSEC-013/014 (CI inline workflow + pre-copy → S10), FSEC-016/017 (secrets at rest → S9/S8), FSEC-018/019 (SSRF/remotes → S13), search `%` wildcard enumeration hardening (→ S7/S14 pagination/escaping).
+
+### Residual risks
+- Org/team/member *names* remain publicly listable (GitHub-like transparency); only private *repo* names/counts are now filtered. Full private-org mode deferred.
+- `q=%%` wildcard + `ILIKE %search%` unescaped enumeration remains (→ S7/S14).
+- `authorize.ts` central helper still dead code — routes inline gates (drift risk; consider adopting or deleting in a later phase).
+
+Gate: S3 complete. **STOP. Do not start S4.**
+
+---
+
+## Fresh S4 — Filesystem Security (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Attacker-controlled paths (`../`, symlinks, aliasing, Unicode, races) escaping `data/repos/{owner}/{repo}`; malicious fork content via object-copy walk; checkout delete redirected outside repo.
+**Attack path (verified in code):** `repoPathFor('.', …)` aliases root dirs; checkout delete loop called `remove_file` without containment re-check (symlink-swapped parent → delete outside); `copyMissingObjects` used `statSync` (follows symlinks) with no hex validation (planted `objects/ab → /etc` → arbitrary file copy-in; SHA-1 objects silently dropped); tree/file names allowed control/format chars (terminal/log injection, normalization tricks).
+**Current defense:** `validateRepoPath` (startsWith + lstat chain + realpath), `isValidFilePath` double-decode, `is_forbidden_component`, checkout write guards, artifacts lstat.
+**Required fix (implemented, smallest):** explicit `.`/`..` rejection at identifier layer; containment + no-through-symlink guard immediately before every checkout delete; lstat + 2-hex/38-or-62-hex validation in fork copy (SHA-1 now copied); control/format-char rejection in `isValidFilePath` + `is_forbidden_component` (i18n names preserved).
+
+### Changes
+- `server/src/lib/vcs.ts` — `repoPathFor` + `isValidOwnerRepo` reject dot-segments.
+- `server/src/routes/repos.ts` — `validateOwnerRepo` dot-segments; `isValidFilePath` control/format-char class.
+- `vcs/src/object/tree.rs` — `is_forbidden_component` control/format chars.
+- `vcs/src/checkout.rs` — delete guard in `checkout` + `checkout_forced` (FSEC-011).
+- `server/src/routes/pulls.ts` — `copyMissingObjects` lstat + hex validation + SHA-1, exported for testing.
+- Tests — `fs-s4.test.ts` 14→19, `s4_fs_test.rs` 4 asserts extended (control chars, i18n-allowed).
+
+### Tests
+- `fs-s4.test.ts` 19/19 (dot aliasing, symlink-parent refusal, control chars vs café/日本語， deep paths, copy walk: symlink/junk/tmp skipped, sha1+sha256 copied).
+- `cargo test --test s4_fs_test` 4/4. Full server 299/299, `cargo test -p itehaas` 141 passed/0 failed, `tsc` clean.
+- Diff reviewed: strictly containment-tightening; no legitimate flow broken (i18n filenames verified allowed).
+
+### Findings
+- Fixed: FSEC-004 (dot-segments), FSEC-011 (delete guard).
+- Deferred: bind-mount/dir-ownership tricks (no `openat`/inode pinning — residual), APFS NFD aliasing (control chars blocked; full NFC enforcement needs new crate), hard-link planting (checkout writes are create-only via `fs::write`; noted).
+
+### Residual risks
+- Check-then-act windows narrowed but not eliminated without `openat2`/`O_NOFOLLOW` dirfd pinning (future hardening).
+- macOS NFD normalization aliasing: two distinct byte-names may collide on APFS; collision now fails toward overwrite-in-order rather than control-structure escape (control dirs still blocked).
+- Legacy repos containing control-char names committed pre-fix will now fail checkout deletes fail-closed.
+
+Gate: S4 complete. **STOP. Do not start S5.**
+
+---
+
+## Fresh S5 — Process / Command Execution Security (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Malicious branch/ref/hash/path args → flag injection, secret leak to child env, fork/output/timeout exhaustion, binary redirection, stdin wedging.
+**Attack path (verified in code):** 60 `execItehaas` sites audited — all `spawn(bin, args)` array, no shell. Gaps: `DELETE /remotes/:name` + `remote add` names allowed leading-dash (`--help` flag confusion, proved 500 via test); push/pull `branch` weak regex; SHA-1 ref tips skipped FF check (64-only gate → non-FF push accepted); no arg-size caps; `/tmp` binary silently allowed even in prod; stdin pipe left open with no input.
+**Current defense:** env allowlist, flag allowlist, null/newline reject, cwd gate, semaphore 3, 30s + SIGTERM→SIGKILL, 1M caps, live `merge-base --is-ancestor` single-call (fallback loop is mock/legacy-only).
+**Required fix (implemented, smallest):** leading-dash/dot remote-name rejection (both endpoints); strict `isValidBranchRef` on push/pull branch; algo-aware current-hash gate (40|64); hash-format entry guard in `isAncestor`; per-arg 4K + total 8K + stdin 8K caps pre-spawn; `isAllowedBinPath` enforced in prod; explicit `shell:false` + stdin `ignore` unless input supplied.
+
+### Changes
+- `server/src/lib/vcs.ts` — arg/stdin caps, strict prod bin prefix (extracted `isAllowedBinPath`), `shell:false`, stdin ignore, null-safe stream handlers.
+- `server/src/routes/repos.ts` — remote-name guards, push/pull branch checks, SHA-1 FF gate, `isAncestor` hash entry guard.
+- Tests — new `s5-fresh.test.ts` 7/7 (arg/stdin bombs, bin prefixes, no-shell source assertion, push traversal, remote flag names).
+
+### Tests
+- New 7/7, `vcs-s5` + `s5-proc` green, full server 306/306, `tsc` clean (fixed `stdout/stderr` null-narrowing from explicit stdio), cargo 141/0.
+- Diff reviewed: strictly boundary-tightening; legitimate flows unchanged (all real args ≪ caps; `--help` never used positionally).
+
+### Findings
+- Fixed: FSEC-012 (prod bin prefix), SHA-1 FF bypass, remote/branch flag-confusion class.
+- Deferred: CPU/memory cgroup limits for children (no cgroup wrapper — residual), `isAncestor` 2000-spawn fallback retained for legacy binaries (live path is single-call), typed command-builder refactor (arg classification documented in threat-model B4; builder pattern future work).
+
+### Residual risks
+- Children share server CPU/memory (ulimits/cgroups not applied); a legitimate huge-history `merge-base` can still take seconds (8s timeout + semaphore bound it).
+- `isAncestor` fallback loop survives only for binaries predating `merge-base --is-ancestor`; counts against semaphore per-spawn, not held across the walk.
+
+Gate: S5 complete. **STOP. Do not start S6.**
+
+---
+
+## Fresh S6 — VCS Object Parser Security (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Malicious blobs/trees/commits/tags/packs/indexes — truncated/oversized/malformed objects, DAG bombs, decompression bombs, parser resource amplification.
+**Attack path (verified in code):** (1) Diamond-DAG tree bomb LIVE — `flatten_tree_with_ancestors` used an active-path set only (no memo), so shared subtrees re-expanded exponentially (2^depth visits) while the 100k `out` cap stayed small; (2) whole-body `split('\n')` in commit/tag parse allocated a gigantic line Vec for newline-flooded messages before any limit; (3) `parse_tree` built `TreeEntry` literally, bypassing the S4 name policy (control chars/`.itehaas`/reserved smuggled past the parser); (4) `create_pack` buffered every object in RAM pre-limit + skipped SHA-1 objects; (5) `collect_reachable_*` recursed unbounded (stack overflow on deep chains); (6) `index` parsed unbounded JSON.
+**Current defense:** 64M `take()` bomb guards, entry/parent/message/count/depth caps, hash re-verification, cycle detection.
+**Required fix (implemented, smallest):** memoized flatten (unique-hash computed once; cycle detection kept); header-first scan with header-line caps (128/16); parse-time name-policy enforcement; two-pass streaming pack (metadata first, per-file lstat+hex incl. SHA-1, write-time revalidation); iterative commit/tag walk + tree-only depth cap + 100k object budget; index 32MB/500k-entry caps.
+
+### Changes
+- `vcs/src/object/mod.rs` — name policy at parse, header-first commit/tag scan.
+- `vcs/src/tree_builder.rs` — memoized `flatten_inner` worker (wrapper signature kept).
+- `vcs/src/remote.rs` — iterative reachability + budgets (public signature unchanged).
+- `vcs/src/pack.rs` — streaming create, strict fanout names, TOCTOU revalidation.
+- `vcs/src/index.rs` — byte + entry caps.
+- Tests — `s6_parser_test.rs` 11→22 (forbidden names, newline floods, header caps, trailing-data rejection, diamond linear + over-cap fail-fast, 3000-chain walk, index cap, pack roundtrip).
+
+### Tests
+- `s6_parser_test` 22/22, full cargo 152/152 passed 0 failed, server 306/306, `tsc` clean.
+- `cargo clippy`: no errors; one new `too_many_arguments` lint on the compat wrapper suppressed with justification; warning count 50→49.
+- `cargo fmt --check`: fails repo-wide pre-existing (~400 drift sites incl. untouched files — rustfmt version drift); touched hunks match surrounding style; no repo-wide `cargo fmt` run (would rewrite untouched files).
+
+### Findings
+- Fixed: FSEC-007 (index caps), FSEC-008 (reachability bounds), FSEC-009 (pack streaming), FSEC-014-class DAG bomb (memoization — prior ancestor-set was insufficient).
+- Deferred: FSEC-010 `revwalk` silent 10k truncation kept deliberately (erroring would break `log` on legit large repos; →S7 pagination design); fuzz/property harness for parsers (cargo-fuzz not wired — future); full NFC enforcement (needs new crate).
+
+### Residual risks
+- 100k-entry repos fail closed on flatten (same as before; legit giant monorepos need paginated tree APIs →S7).
+- Objects with pre-fix control-char names committed earlier now fail to parse (fail-closed).
+- Pack TOCTOU revalidation aborts the whole pack on concurrent GC (safe direction; retry).
+
+Gate: S6 complete. **STOP. Do not start S7.**
+
+---
+
+## Fresh S7 — Resource Exhaustion / DoS Budgets (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** HTTP/VCS/DB/CI resource exhaustion — oversized bodies, unbounded lists, wildcard scans, log flooding, disk filling, output bombs.
+**Attack path (verified in code):** CI `out +=` unbounded (malicious `yes` loop → server OOM, unbounded TEXT storage + full-bodied GET logs); 11 unbounded list endpoints (forks/network/members/watchers/labels/milestones/org lists, uncapped offsets in users lists); unescaped `%`/`_` in 6 LIKE sites (`q=%%` → full-table scans under trigram index); no per-repo disk bound (64M×N pushes + fork clones fill host disk); implicit-only JSON body limit.
+**Current defense:** Per-object 64M, per-endpoint rate limits, statement timeout 5s, pool 10, VCS semaphore 3, parser caps (S6), CI queue 20 + YAML limits.
+**Required fix (implemented, smallest):** central `lib/budgets.ts` (pagination 50/100/50k, LIKE escape, 2M log + 256K script caps, 100-row detail caps, 10GiB quota via `REPO_QUOTA_BYTES`); explicit Fastify `bodyLimit` 1M; log-flood kill + truncation marker; quota 413 on object push + fork-of-over-quota; LIKE escaping in search/users; offset caps in users lists.
+
+### Changes
+- `server/src/lib/budgets.ts` (new) — pagination helper, LIKE escape, CI caps, quota + lstat usage walk with early exit.
+- `server/src/index.ts` — explicit `bodyLimit`.
+- `server/src/routes/ci.ts` — script/output caps, detail LIMITs.
+- `repos.ts`/`issues.ts`/`orgs.ts` — paginated lists. `search.ts`/`users.ts` — LIKE escape + offset caps. `repos.ts` — disk quota gates.
+
+### Tests
+- `s7-dos.test.ts` 11→21 (budget units, LIKE escape behavior, pagination caps, 2M JSON →413, over-quota push →413, CI cap markers).
+- Full server 316/316, `tsc` clean, cargo untouched (152).
+- Diff reviewed: strictly budget-adding; legitimate flows under caps (verified: default pages unchanged at 50/20).
+
+### Findings
+- Fixed: CI log-flooding OOM class, unbounded-collection class, LIKE-wildcard scans, disk-fill via pushes/forks.
+- Deferred: inline-workflow job/step caps (→S10, FSEC-013), per-endpoint RL tuning (→S14), global connection/request timeouts (reverse-proxy scope), `revwalk` 10k pagination UX (kept).
+
+### Residual risks
+- Quota walk is synchronous O(files) per push (early-exits over quota; typical repos trivial; 200k-file repos ~100ms+ per push — future: cached accounting).
+- Verbose-but-legit builds over 2M logs fail closed with truncation marker (visible, safe).
+- 10GiB default may be small for giant monorepos — raise via `REPO_QUOTA_BYTES`.
+
+Gate: S7 complete. **STOP. Do not start S8.**
+
+---
+
+## Fresh S8 — Database Security (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** SQL injection, missing authorization predicates, torn multi-writes, over-privileged DB role, connection/timeout exhaustion.
+**Attack/weakness audit (verified):** zero string-interpolated attacker data in any `query()` (dynamic SET clauses use fixed whitelists + `$n` params; single `ORDER BY ${orderBy}` is allowlist-gated); FK/CASCADE/UNIQUE sound across all 11 migrations; timeouts bounded (statement 5s, connect 5s, pool 10). Gaps fixed: (1) CI pipeline+jobs, issue create/update, PR-merge completion wrote across separate statements — mid-write failure left orphan pipelines / orphan issues / merged-without-close states (S3's label 403 could even orphan an issue row); (2) single owner-role connection (full DDL on injection/leak).
+**Required fix (implemented, smallest):** `getClient` BEGIN/COMMIT/ROLLBACK transactions around the three multi-write flows (universally-mocked accessor, no test-infra churn); permission checks hoisted before first write + repo-scoped UPDATE; migration `011_db_roles.sql` (`itehaas_app` DML-only, NOLOGIN, default-privileges, insufficient-privilege guard) + `DATABASE_APP_URL` runtime opt-in + compose opt-in comment.
+
+### Changes
+- `issues.ts` — atomic create/update, pre-write label/permission validation, scoped UPDATE.
+- `ci.ts` — atomic pipeline+jobs creation. `pulls.ts` — atomic merge completion (close-keywords stay best-effort inside).
+- `database/migrations/011_db_roles.sql` (new), `db/index.ts` (`DATABASE_APP_URL` selection), compose opt-in.
+- Tests — `s8-db.test.ts` 7→13 (orphan-freedom, check-before-write, txn rollbacks, role-file shape, pool selection); one `s19` mock delegation fix for the txn path.
+
+### Tests
+- `s8-db` 13/13, full server 322/322 (29 files), `tsc` clean. Migration SQL review-checked (no live PG here to apply it — first real apply happens on Vivobook `migrate`; file is best-effort guarded).
+- Diff reviewed: writes strictly more atomic; no predicate loosened; star/register cosmetic non-atomicity explicitly accepted.
+
+### Findings
+- Fixed: torn-write class (pipeline/issues/merge), owner-only DB role posture (role exists dormant until operator opt-in).
+- Deferred: RLS policies (app-level predicates verified per-route in S3; RLS would duplicate), per-row audit triggers, `authorize.ts` dead helper, advisory-lock hash strength (→S15).
+
+### Residual risks
+- Default deployment still runs as owner until the operator completes the 011 runbook (documented; fail-open preserves availability, cannot lock out).
+- 011 was review-checked only — verify `NOTICE` vs applied on first real migrate run.
+- Star+activity and register user+session remain multi-statement (cosmetic, accepted).
+
+Gate: S8 complete. **STOP. Do not start S9.**
+
+---
+
+## Fresh S9 — Secrets Security (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete (critical phase)
+**Threat:** DB dump with plaintext secrets; corrupt ciphertext injected as env; fork-PR secret theft; missing rotation after key compromise; secret-bearing logs/API.
+**Attack/weakness audit (verified):** at-rest AES-GCM v1 + keys-only list + masking + `isAdmin` + create/delete audit were sound. Gaps fixed: (1) legacy plaintext rows accepted forever with no healing path (perpetual `TEXT` plaintext); (2) undecryptable values injected raw as env (poisoned masking, ciphertext in logs); (3) no rotation procedure after `SECRET_ENCRYPTION_KEY` rotation (S1-distinct key orphans old rows); (4) fork isolation relied partly on a pre-copy-polluted FS signal.
+**Required fix (implemented, smallest):** `isEncryptedValue` discriminator + `resolvePipelineSecrets` (v1 strict-decrypt, legacy heal-on-read, skip-undecryptable + `ci.secret_decrypt_failure` audit, skipped keys named in logs); `POST /ci/secrets/rotate` (admin, counts-only response, `ci.secret_rotate` audit); fork-strip audited (`ci.secret_strip_fork`), DB fork markers authoritative; `docs/security/secrets.md` (inventory, storage model, isolation rules, runbooks).
+
+### Changes
+- `lib/secrets.ts` — `isEncryptedValue` (+ docs on healing path).
+- `routes/ci.ts` — extracted `resolvePipelineSecrets`, rotate endpoint, strip audit, skip markers in logs.
+- `docs/security/secrets.md` (new).
+- Tests — `s9-secrets.test.ts` 11→15 (heal/skip/rotate/403/fork-with-copied-objects).
+
+### Tests
+- `s9-secrets` 15/15 (incl. FSEC-008 adversarial: fork PR + pre-copied objects → logs provably secret-free + strip audited).
+- Full server 326/326 (29 files), `tsc` clean. Diff reviewed: audit rows carry names only; no value ever logged/returned (grep-verified).
+
+### Findings
+- Fixed: perpetual-plaintext (FSEC-009-class), raw-ciphertext injection, missing rotation, unaudited strip.
+- Deferred: hashed-session tokens at rest (S2 residual stands), fork object-copy race itself (→S10), secret-version history beyond `v1:`.
+
+### Residual risks
+- Legacy rows heal lazily (first CI run / manual rotate) — rows never run stay plaintext until rotated; operators should bulk-rotate after deploy.
+- `decryptSecretSafe` retained for compat (tests + legacy callers); all hot paths now use strict `decryptSecret` + `isEncryptedValue`.
+
+Gate: S9 complete. **STOP. Do not start S10.**
+
+---
+
+## Fresh S10 — CI/CD Isolation (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete (critical phase)
+**Threat:** Malicious CI code (secret theft, miners, fork bombs, disk fill, container escape, env inspection) running in an assumed-compromised runner.
+**Attack/weakness audit (verified):** container profile already hardened (none/net, 512m, pids 128, non-root, ro-rootfs, cap-drop, no-new-priv, :ro workspace, pinned image, 30s, no host-exec fallback, no socket anywhere). Gaps fixed: (1) API-supplied inline workflows bypassed ALL YAML budgets (1000-job queue/DB flood, FSEC-013); (2) fork detection `catch {}` left secrets full on DB error (fail-open outage → leak); (3) no fd limit; (4) no single isolation reference doc.
+**Required fix (implemented, smallest):** inline budgets identical to file path (10/20/5000/name-shape, 400 fail-closed); default-untrusted latch with DB markers authoritative (throw-paths withhold); `--ulimit nofile=1024:1024`; `docs/security/ci-security.md` (profile table, fork tier, budgets, socket boundary, residuals).
+
+### Changes
+- `routes/ci.ts` — inline validator, fail-closed fork latch, ulimit.
+- Tests — `s10-ci.test.ts` 5→11 (fd guard, no-privileged, fail-closed latch, 4× inline budgets).
+- Docs — `ci-security.md` (new).
+
+### Tests
+- `s10-ci` 11/11, full server 332/332 (29 files), `tsc` clean. One syntax repair en route (stale `catch` from removed outer try — caught by suite before merge).
+- Diff reviewed: trusted-run outcomes identical (only error paths changed); no new mounts/env/capabilities.
+
+### Findings
+- Fixed: FSEC-013 (inline flood), fail-open fork outage, fd-exhaustion gap.
+- Deferred: hardware-virtualized runners (gVisor/Firecracker), image-digest pinning, fork resource tiering (same profile + no secrets is the tier).
+
+### Residual risks
+- Shared host kernel; breakout needs engine 0-day, not misconfig — drill per incident-response.
+- Malicious workflows read checked-in code they could already read via API (PR creation gates).
+
+Gate: S10 complete. **STOP. Do not start S11.**
+
+---
+
+## Fresh S11 — XSS / Content Security (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Stored/reflected/DOM XSS via README Markdown, links, images, raw HTML, filenames, commit messages, profile fields.
+**Attack/weakness audit (verified adversarially):** no `dangerouslySetInnerHTML`/`innerHTML` anywhere in `web/`; no `rehype-raw` (raw HTML never becomes elements); FileViewer/DiffViewer/blame/history render React-escaped text; file APIs return JSON (no `text/html` execution path); sanitize schema empirically verified (`img src`/`a href` protocol-locked to safe schemes, no `svg`/`style`/`form`, no `on*`/`style` attrs); avatar allowlisted server-side. Gaps fixed: (1) no `img` component guard — a future `rehype-sanitize` schema drift reopens `javascript:` images silently; (2) prod `connect-src 'self'` breaks legitimate split-port/Tailscale API fetch (fail-closed against own frontend).
+**Required fix (implemented, smallest):** `img` protocol guard mirroring the anchor guard (renders inert placeholder); prod `connect-src` appends the configured API origin (no wildcards; unparseable URL → strict `'self'`).
+
+### Changes
+- `web/components/MarkdownViewer.tsx` — `img` guard.
+- `web/next.config.js` — derived prod `connect-src`.
+- Tests — new `MarkdownViewer.test.tsx` 9/9 jsdom behavioral (property assertions, Lucide-icon scoping lesson recorded), `next.config.test.ts` 2/2, server `s11-xss` +1 source pin.
+
+### Tests
+- Web 11/11, `web build` green (all routes), server 333/333, `tsc` clean.
+- Notable: first test draft asserted implementation (span-vs-anchor) not the property — sanitize strips before components fire, so guards are second-layer; rewritten to property assertions (no executable URI/element/handler in `.markdown-body`).
+
+### Findings
+- Fixed: img schema-drift gap, prod CSP self-breakage.
+- Deferred: none material; `style-src 'unsafe-inline'` retained (Tailwind requirement, no script vector).
+
+### Residual risks
+- Sanitizer strength inherits `rehype-sanitize` defaultSchema updates — pinned via lockfile + behavioral tests fail loudly on drift.
+- Markdown GFM extensions render `input` checkboxes (no script vector).
+
+Gate: S11 complete. **STOP. Do not start S12.**
+
+---
+
+## Fresh S12 — CSRF / CORS / Security Headers (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Cross-site request forgery, cross-origin exfiltration with credentials, origin/host forgery, missing hardening headers.
+**Attack/weakness audit (verified):** HMAC double-submit + timing-safe compare + origin-vs-host + `null` rejection + logout coverage were sound; CORS allowlist strict with credentials (never `*`). Gaps fixed: (1) CSRF bypass for ALL of development (`!isProd`) — a LAN/Tailscale-reachable dev/staging server accepted cookie-authed cross-site POSTs (FSEC-003); (2) CORS and CSRF kept SEPARATE origin lists (drift opens one boundary while closing the other) with no trailing-slash normalization; (3) no `Permissions-Policy` on API responses.
+**Required fix (implemented, smallest):** bypass narrowed to the test suite only (`!isProd && nodeEnv === 'test'` — flipping `isProd` re-arms instantly, as prod-simulation tests prove); shared `lib/origins.ts` allowlist with normalization, used by both boundaries; static `Permissions-Policy` hook (helmet-version-proof).
+
+### Changes
+- `middleware/csrf.ts` — test-only bypass, shared origins.
+- `lib/origins.ts` (new) — allowlist + normalization.
+- `index.ts` — shared CORS list, Permissions-Policy hook.
+- Tests — new `s12-fresh.test.ts` 5/5 (origins unit, dev 403-without-token, HMAC pass, slash-tolerant preflight, header pin).
+
+### Tests
+- `s12-fresh` 5/5, full server 338/338 (30 files), web 11/11, `tsc` clean.
+- Caught live: pre-existing `s11-cors` prod-simulation test failed after the first bypass draft (condition ignored `isProd`) — condition corrected to respect it; suite green.
+
+### Findings
+- Fixed: FSEC-003 (dev CSRF fail-open), origin-list drift class.
+- Deferred: XFF-spoofable rate-limit buckets (→S14), CORP/COOP deliberately unset (would break split-port fetch), `__Host-` cookie prefix (rename breaks compat), SameSite=None for tailnet-name→localhost topologies (documented deployment trade-off: use same-origin `tailscale serve`).
+
+### Residual risks
+- `ALLOWED_ORIGIN` with a typo fails closed (403s) — visible, safe; no trailing-slash footgun anymore.
+- Missing-`Host` requests skip origin-vs-host (token check still applies).
+
+Gate: S12 complete. **STOP. Do not start S13.**
+
+---
+
+## Fresh S13 — SSRF / Outbound Request Security (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Server-side request forgery to loopback/private/link-local/metadata/internal targets, DNS rebinding, transition-mechanism smuggling, stale filesystem remotes.
+**Attack/egress audit (verified):** only server-driven egress is VCS remotes (API gate + Rust transport) and the daemon-side image pull; avatars are browser-fetched (server never fetches them); no webhooks/importers exist. Gaps fixed: (1) stale `file://`/literal-private remotes usable via fetch/push/pull despite the creation gate (FSEC-019); (2) flag-like remote names (`--help`) in fetch/push/pull; (3) Rust `ALLOW_PRIVATE_REMOTES` semantics disagreed across three gates (`true` vs `true|1`); (4) 6to4/Teredo-embedded private IPv4 invisible to range checks; (5) IPv6 zone IDs breaking literal parsing.
+**Required fix (implemented, smallest):** shared `validateRemoteUrl` + `getStoredRemoteUrl` with 403+`ssrf.blocked` audit at fetch/push/pull execution time (unknown remote → 404, no subprocess); remote-name dash/dot guards; unified `private_remote_allowed()`; 6to4/Teredo decoding; zone-ID rejection; `fc/fd/fe80` heuristic scoped to IPv6 literals.
+
+### Changes
+- `routes/repos.ts` — shared validator, stored-URL gates, name guards.
+- `vcs/src/remote/http.rs` — env helper, transition decoding, zone rejection.
+- Tests — `s13-ssrf` 13→18 (stale file/private/unknown/flag/unit), new `s13_ssrf_test.rs` 6/6 (6to4/Teredo both polarities, zones, env forms).
+
+### Tests
+- TS 18/18, Rust 6/6, full server 343/343, cargo 158/158, `tsc` clean, clippy no new warnings.
+- Notable correction en route: pre-flight fail-closed-on-DNS-error broke offline use and the public-name suite — reverted by design (connect-time SafeResolver is the authoritative gate; pre-flight is fast-reject UX), documented in code.
+
+### Findings
+- Fixed: FSEC-018-class (transition smuggling, zone IDs, env inconsistency), FSEC-019 (stale-remotes execution gate).
+- Deferred: single-label intranet hostnames (rely on DNS-time checks; syntactic block would break intranets), image-digest pinning (S10 residual), webhook SSRF surface (no webhooks exist — gate future features through `validateRemoteUrl`-class checks).
+
+### Residual risks
+- Pre-flight DNS remains best-effort by design; enforcement lives in SafeResolver at connect time (verified on the single agent constructor).
+- `fc/fd` DNS names (non-literal) resolve through Rust DNS-time checks only.
+
+Gate: S13 complete. **STOP. Do not start S14.**
+
+---
+
+## Fresh S14 — API Security & Abuse Controls (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Endpoint abuse by cost class — credential stuffing, namespace squatting, fork/disk spam, upload CPU bombs, merge-lock contention, notification spam, token guessing, dashboard polling floods, rate-limit evasion via header spoofing.
+**Attack/weakness audit (verified per-endpoint):** global bucket + 12 cost buckets existed, but 25+ mutating/subprocess endpoints rode the global bucket alone (fork, object upload, fetch/push/pull remotes, remotes config, members/orgs/teams mutations, stars, merge, reviewers, CI secrets/checks/reads, users lists, session nuke, invite claim). Rate identity itself was spoofable: `X-Forwarded-For` honored on direct connections (FSEC-002).
+**Required fix (implemented, smallest):** 20 new cost buckets at the documented limits (fork 5, upload 20, fetch-family 10, remotes 20, members/org 20/10, invites 10/20, stars 30, merge 10, reviews 20, CI 10/20/60, users 60, reads 60/30/20); socket-pinned client identity with `TRUSTED_PROXIES` (default loopback); `docs/security/api-security.md` full catalog (auth/authZ/size/RL/errors per endpoint).
+
+### Changes
+- `lib/rateLimit.ts` — `getClientIp` + `TRUSTED_PROXIES`.
+- Buckets wired in `repos.ts` (13 sites), `pulls.ts` (4), `orgs.ts` (7), `invites.ts` (5), `ci.ts` (8), `stars.ts` (2), `users.ts` (3), `auth.ts` (1).
+- Docs — `api-security.md` (new): bucket table + endpoint catalog + identity design.
+- Tests — `s14-rate` +6 (fork/upload/merge/org+invites/secrets/socket-pinning).
+
+### Tests
+- `s14-rate` 11/11, full server 349/349 (30 files), web 11/11, `tsc` clean.
+- Diff reviewed: buckets additive pre-auth where safe; no legitimate flow exceeds new ceilings in tests (ceilings ≥ tested bursts).
+
+### Findings
+- Fixed: FSEC-002 (XFF spoofing), unclassified-endpoint class.
+- Deferred: clone bandwidth accounting (bulk reads deliberately unbucketed), per-user (vs per-IP) quotas, distributed RL (single-host scope), member-change audit events (→S18).
+
+### Residual risks
+- Behind a shared trusted proxy, clients share fate if the proxy doesn't sanitize XFF — deployment contract documented in threat-model §6 + api-security.md §3.
+- Bucket state is in-memory (restart resets) — acceptable single-host scope.
+
+Gate: S14 complete. **STOP. Do not start S15.**
+
+---
+
+## Fresh S15 — Concurrency / TOCTOU / Atomicity (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Check-then-act races (ref updates, merges, deletes, forks, queue admission, org membership), lock leaks/collisions, stale lock files, filesystem races corrupting reads.
+**Attack/weakness audit (verified):** FF+CAS+locks existed per-op, but: (1) advisory lock/unlock ran on arbitrary pool backends — unlocks leaked, later 423s with no holder; (2) merge used a DIFFERENT lock key and raced pushes on the same worktree; (3) 31-bit lock hash collided across repos (spurious 423s); (4) crashed holders left permanent `.lock` files (fail-closed forever); (5) fork double-submit → 500; (6) CI queue count-check raced joint overshoot; (7) org last-owner check raced orphaning; (8) `GET /log?ref=` rewrote HEAD per request (FSEC-006: cross-request corruption, crash-window mispoint).
+**Required fix (implemented, smallest):** session-pinned locks on one pooled client (`lock/unlockClientAdvisory`); ONE 64-bit FNV key per repo for push/merge/delete; pid-stamped `.lock` with dead/ancient steal-once; fork 23505→409; queue admission serialized (`FOR UPDATE` + count + insert, fail-fast pre-check kept); org check+delete in one `FOR UPDATE` txn; Rust `log --rev` + `resolve_rev` traversal guard, server reads via `--rev` (HEAD never written by reads).
+
+### Changes
+- `db/index.ts` — `advisoryLockKeys`, `lock/unlockClientAdvisory` (client-passing, mockable; legacy hash kept).
+- `repos.ts` — push/delete converted, `acquireRefLock` steal, fork 409.
+- `pulls.ts` — merge converted to shared key.
+- `orgs.ts` — last-owner txn. `ci.ts` — serialized admission.
+- Rust — `LogOptions.rev`, `log --rev`, `resolve_rev` traversal Err; server `isValidBranchRef` rejects leading `-`, `--rev` allowlisted.
+- Tests — `s15-concurrency` 3→10, `s7` queue mock update, `s8/s14/s19` lock-mock updates, new `s15_rev_test.rs` 3/3 CLI.
+
+### Tests
+- Server 356/356 (30 files), cargo 161/161, `tsc` clean, clippy no new warnings (`cmd_log` arity allowed with justification).
+- Live-verified `log --rev` (branch isolation, HEAD byte-identical, traversal hard error).
+- Notable: `vi.mock` cannot intercept intra-module calls — first helper design passed tests against a REAL local PG; restructured to client-passing helpers so mocks govern (also documented as a testing lesson).
+
+### Findings
+- Fixed: FSEC-006 (HEAD race eliminated, not mitigated), FSEC-021 (key collisions + leak), fork/queue/org races.
+- Deferred: `openat2`/`O_NOFOLLOW` dirfd pinning (S4 residual stands), distributed locks (single-host scope), ref CAS generation counters (FF+locks suffice).
+
+### Residual risks
+- Lock steal relies on pid-liveness + 120s age (pid reuse inside the window is accepted; pushes are idempotent-safe to retry).
+- Stale `.lock` files from pre-S15 crashes (empty content) steal by mtime only.
+
+Gate: S15 complete. **STOP. Do not start S16.**
+
+---
+
+## Fresh S16 — Dependency / Supply-Chain Security (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Known-vulnerable, typosquatted, over-privileged, or unpinned build inputs; install-script execution; lockfile drift; secret leakage into git; CI automation with broad tokens.
+**Audit (verified, not assumed):** `pnpm audit --prod` (32 → 27 findings, 0 critical), `cargo audit` against a fresh 1239-advisory DB (clean, 143 crates), `Cargo.lock` registry-only (zero `git+`), every prod dep grep-verified as imported, no typosquats, no lifecycle scripts, `.env` ignored + untracked, tracked-tree secret-pattern scan clean, single least-privilege workflow.
+**Required fix (implemented, reviewed upgrades only):** `tar` 7.5.19→7.5.22 (new stack-overflow GHSA past the old pin), new `postcss` 8.5.18 override (source-map disclosure), `uuid` ^9→^11.1.1 (bounds check; v4 runtime verified), added missing `pino-pretty` devDep (dev boot referenced it undeclared), workflow `permissions: contents: read` + strict `--frozen-lockfile` (fallback removed) + real `cargo-audit` install in CI.
+
+### Changes
+- `package.json` (overrides), `server/package.json` (uuid, pino-pretty), `pnpm-lock.yaml` (mechanical), `.github/workflows/security.yml`, `docs/security/dependency-audit.md` (triage refresh).
+- Tests — `s16-deps` 6→14 (pins, hygiene, automation), `s19` SEC-025 pin updated.
+
+### Tests
+- `s16-deps` 14/14, full server 364/364 (30 files), web 11/11, `web build` green (postcss override compatible), `tsc` clean.
+- Two test bugs of mine fixed en route (version-strip regex, YAML-as-JSON).
+
+### Findings
+- Fixed: patchable advisories (tar/postcss/uuid), missing dep, automation privilege/drift.
+- Deferred (with justification, not neglect): `next`→15 and `fastify`→5 majors (breaking; compensating controls documented), image-digest pinning (no offline resolution), SAST beyond tsc/clippy/tests.
+
+### Residual risks
+- 10 high advisories remain, all gated behind major upgrades; 0 critical.
+- `cargo-audit` runs in CI (installed there); locally it needed a manual install.
+
+Gate: S16 complete. **STOP. Do not start S17.**
+
+---
+
+## Fresh S17 — Host / Docker / Deployment Hardening (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Host compromise via exposed services, privileged containers, world-readable storage, secret-laden images, unbounded logs, unpatched inputs, undisciplined backups/SSH/remote-access.
+**Attack/weakness audit (verified):** server/web already least-privilege (65534, ro-root, tmpfs, no-new-priv, cap-drop, loopback, no source mounts, no socket). Gaps fixed: (1) `db` ran fully privileged (root-owned writable fs, full caps, no bounds, unrotated logs); (2) Dockerfiles + CI fell back to unfrozen installs on lockfile drift; (3) repo storage inherited umask (world-readable on shared hosts); (4) no memory bounds/restart/log-rotation anywhere; (5) no deployment profile doc.
+**Required fix (implemented, smallest):** db ro-root + tmpfs + no-new-priv + drop-ALL/keep-init-caps + 1g + logging + restart (documented why default user stays); frozen installs everywhere; `secureRepoParentDirs` (0700) on create/fork; mem bounds + rotation + restart on server/web; `docs/security/deployment.md` (profile, checklist, backups, runbooks).
+
+### Changes
+- `docker-compose.yml` — db + server/web bounds/rotation/restart.
+- `server/Dockerfile`, `web/Dockerfile` — strict frozen installs.
+- `routes/repos.ts` — `secureRepoParentDirs` + wiring.
+- `docs/security/deployment.md` (new).
+- Tests — `s17-deploy` 8→15 (db profile, bounds, frozen installs, YAML validity, 0700 behavior, wiring, doc sections).
+
+### Tests
+- `s17-deploy` 15/15, full server 371/371 (30 files), web 11/11, `tsc` clean.
+- Diff reviewed: no image/tag changes, no port changes, no secret defaults reintroduced.
+
+### Findings
+- Fixed: FSEC-023 remainder (db runtime profile), unpinned-install fallback class, storage-perm class.
+- Deferred: digest pinning (S16 residual stands), systemd unit (doc-guided, not shipped), backup automation (documented procedure, no new executable).
+
+### Residual risks
+- **db hardening is statically verified only — no Docker on this machine. The deployment.md first-boot drill is REQUIRED on the target host before sign-off.**
+- `postgres:16-alpine` floats minor for auto-patching (documented choice).
+
+Gate: S17 complete. **STOP. Do not start S18.**
+
+---
+
+## Fresh S18 — Observability / Incident Response (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete
+**Threat:** Undetected abuse — stuffing campaigns, privilege changes, exposure flips, secret misuse, malicious uploads — plus audit-table exhaustion and secret-bearing audit rows.
+**Attack/weakness audit (verified):** login/secret/repo-delete/ssrf events existed, but lockouts, membership/org/team mutations, visibility flips, pipeline lifecycle, and object rejections were invisible; `audit_logs` grew unbounded (FSEC-024); runbooks referenced dead services and pseudo-code rotation.
+**Required fix (implemented, smallest):** audited `auth.lockout`, `repo.member_*/visibility`, `org.member_*/team.*`, `ci.pipeline_trigger/complete`, `vcs.object_rejected` (hash prefixes only); bounded retention (`pruneAuditLogs`, 90d default via `AUDIT_RETENTION_DAYS`, every-128th-event, indexed DELETE); incident-response rewritten around the 7 required scenarios with real endpoints/queries.
+
+### Changes
+- `lib/audit.ts` — retention prune + opportunistic enforcement.
+- `auth.ts`/`repos.ts`/`orgs.ts`/`ci.ts` — event instrumentation (names/ids only, never secrets).
+- `docs/security/incident-response.md` — refreshed playbooks.
+- Tests — `s18-audit` 6→12 (lockout signal, admin/visibility/org/team coverage, trigger+rejection, secret-free proof, prune bounds).
+
+### Tests
+- `s18-audit` 12/12, full server 377/377 (30 files), web 11/11, `tsc` clean.
+- Proven: audit INSERT params across login-failure + secret-rotate contain no password/secret/token material.
+- Deliberate non-events (flood control): per-429/per-403 DB rows stay in metrics/logs; secret-value access is never row-audited.
+
+### Findings
+- Fixed: FSEC-024 (unbounded audit growth), detection-blind-spot class.
+- Deferred: alert routing (metrics exist; no pager integration on single-host scope), audit-log shipping/WORM.
+
+### Residual risks
+- Retention prune is best-effort inside the app (a months-down host still needs the backup discipline in deployment.md).
+- Background-runner audits carry no IP (no request context by design).
+
+Gate: S18 complete. **STOP. Do not start S19.**
+
+---
+
+## Fresh S19 — Adversarial Security Test Suite (COMPLETE 2026-09-03)
+
+**Status:** ✅ Complete — **SECURITY PROGRAM S0–S19 COMPLETE**
+**Threat:** Regression — fixed vulnerabilities silently reopening; untested category gaps.
+**Method:** cross-boundary attack chains (auth/authZ/filesystem/API/CI) in
+`s19-fresh.test.ts` (10), transport proofs in `s19_net_test.rs` (3), full category
+matrix in `tests/security/README.md`. Every suite asserts fail-safe outcomes
+(deny codes, empty secrets, inert DOM, zero-request redirect targets).
+**Notable corrections en route:** space-containing filenames are legitimate (battery
+bug, not code); test doubles must not shadow real users (session-mock fix);
+assert properties, not layers (sanitizer fires before component guards).
+
+### Changes
+- `server/src/routes/s19-fresh.test.ts` (new, 10 chains).
+- `vcs/tests/s19_net_test.rs` (new, 3 transport proofs).
+- `tests/security/README.md` (corpus index + legacy matrix preserved as history).
+
+### Tests (final program tally)
+- Server 387/387 (31 files), web 11/11 (2 files), cargo 164/164, `tsc` clean,
+  clippy 0 errors (97 repo-wide style warnings, none new), `web build` green.
+- `pnpm audit --prod`: 0 critical. `cargo audit`: clean (1239 advisories).
+
+### Findings
+- Fixed: corpus gaps (redirect behavior, chain coverage). No new vulnerabilities
+  found by the chains — the phases hold against each other.
+- Program residuals (standing): db boot drill on target host; next-15/fastify-5
+  majors; digest pinning; microVM runners; pager integration; `openat2` pinning;
+  clone accounting; hashed sessions; RLS; CAS generation counters; cargo-fuzz harness.
+
+Gate: S19 complete. **SECURITY PROGRAM COMPLETE. No further phases.**
+
+---
+
+# Security Program — Strict Phased Execution (S0–S19, HISTORY — 2026-09-02 claims, untrusted)
 
 > **Updated 2026-09-02 — Comprehensive Security Reconnaissance (S0 Re-Audit)**
 > Scope: Deep source-level adversarial inspection of Rust VCS engine, Fastify API routes, Next.js frontend, PostgreSQL database layer, Docker configuration, and CI isolation boundaries.

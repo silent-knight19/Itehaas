@@ -101,8 +101,11 @@ describe('S19 Comprehensive Adversarial Verification (SEC-001 - SEC-026)', () =>
   // SEC-002
   it('SEC-002: Docker Compose requires non-empty environment passwords', async () => {
     const compose = fs.readFileSync('../docker-compose.yml', 'utf8');
-    expect(compose).toContain('CHANGE ME');
+    // S1-fresh: fail-closed mandatory interpolation, no hardcoded weak defaults.
+    expect(compose).toContain('${POSTGRES_PASSWORD:?');
     expect(compose).toContain('POSTGRES_PASSWORD');
+    const active = compose.split('\n').filter(l => !l.trim().startsWith('#'));
+    expect(active.some(l => l.includes('POSTGRES_PASSWORD: itehaas'))).toBe(false);
   });
 
   // SEC-003
@@ -316,8 +319,12 @@ describe('S19 Comprehensive Adversarial Verification (SEC-001 - SEC-026)', () =>
       if (text.includes('FROM sessions s JOIN users u')) return { rows: [alice] };
       if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'repo-alice', visibility: 'public' }] };
       if (text.includes('SELECT owner_id FROM repositories')) return { rows: [{ owner_id: 'u-alice' }] };
-      if (text.includes('pg_try_advisory_lock')) return { rows: [{ locked: false }] };
       return { rows: [] };
+    });
+    // S15: the merge lock is session-pinned via getClient — contested here.
+    mockClientQuery.mockImplementation(async (text: string) => {
+      if (text.includes('pg_try_advisory_lock')) return { rows: [{ locked: false }] };
+      return { rows: [], rowCount: 0 };
     });
     const app = await buildApp();
     const res = await app.inject({
@@ -367,6 +374,9 @@ describe('S19 Comprehensive Adversarial Verification (SEC-001 - SEC-026)', () =>
       if (text.includes('INSERT INTO issues')) return { rows: [{ id: 'iss-1', title: 'Feature idea' }] };
       return { rows: [] };
     });
+    // S8: issue creation runs in a getClient transaction — serve client queries
+    // from the same matchers (the mock splits pool vs client query fns).
+    mockClientQuery.mockImplementation(async (text: string, params?: any[]) => mockQuery(text, params));
     const app = await buildApp();
     const res = await app.inject({
       method: 'POST',
@@ -403,7 +413,7 @@ describe('S19 Comprehensive Adversarial Verification (SEC-001 - SEC-026)', () =>
   // SEC-025
   it('SEC-025: Production dependencies contain zero critical vulnerabilities', async () => {
     const rootPkg = JSON.parse(fs.readFileSync('../package.json', 'utf8'));
-    expect(rootPkg.pnpm?.overrides?.tar).toBe('7.5.19');
+    expect(rootPkg.pnpm?.overrides?.tar).toBe('7.5.22');
     expect(rootPkg.pnpm?.overrides?.next).toBe('14.2.35');
   });
 

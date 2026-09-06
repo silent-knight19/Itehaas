@@ -1,9 +1,21 @@
 /** @type {import('next').NextConfig} */
 const isDev = process.env.NODE_ENV !== 'production';
 
+// S11: the web UI calls the API over fetch, often cross-origin in self-hosted
+// split-port deployments (web :3000, api :3001) or via Tailscale names. A static
+// `connect-src 'self'` in production would fail closed on legitimate API calls,
+// so the configured API origin is allowlisted explicitly (still no wildcards).
+let apiConnectSrc = '';
+try {
+  const apiOrigin = new URL(process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001').origin;
+  if (apiOrigin && apiOrigin !== 'null') apiConnectSrc = ` ${apiOrigin}`;
+} catch {
+  // Unparseable API URL: keep strict 'self' only (fail closed).
+}
+
 const cspHeader = isDev
   ? "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*; frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
-  : "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'";
+  : `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'${apiConnectSrc}; frame-ancestors 'none'; object-src 'none'; base-uri 'self'`;
 
 const nextConfig = {
   reactStrictMode: true,

@@ -33,6 +33,13 @@ pub fn is_forbidden_component(name: &str) -> bool {
     if name.contains('/') || name.contains('\\') || name.contains('\0') {
         return true;
     }
+    // S4: control/format characters — terminal/log injection and FS normalization tricks
+    // (C0/C1 controls, DEL, soft hyphen, bidi overrides, BOM/ZWNBSP).
+    if name.chars().any(|c| {
+        c.is_control() || c == '\u{7f}' || matches!(c, '\u{ad}' | '\u{200e}' | '\u{200f}' | '\u{feff}')
+    }) {
+        return true;
+    }
     if name.ends_with('.') || name.ends_with(' ') {
         return true;
     }

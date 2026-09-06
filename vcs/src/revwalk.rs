@@ -21,6 +21,9 @@ pub struct LogOptions {
     pub grep: Option<String>,
     pub follow: Option<String>,
     pub paths: Vec<String>,
+    /// S15: start the walk at this rev (branch/tag/commit) instead of HEAD.
+    /// Lets API readers query a branch without mutating `.itehaas/HEAD`.
+    pub rev: Option<String>,
 }
 
 pub struct LogEntry {
@@ -109,7 +112,17 @@ pub fn walk_log(repo: &Path, opts: &LogOptions) -> Result<Vec<LogEntry>> {
     let hasher = crate::hash::new_hasher(algo)?;
     // Collect starting points
     let mut starts: Vec<Hash> = Vec::new();
-    if opts.all {
+    // S15: explicit rev overrides HEAD (validated by resolve_rev; unknown revs
+    // yield an empty walk, matching the "branch may not exist" fallback callers
+    // already implement — but traversal attempts are hard errors, never silent).
+    if let Some(rev) = &opts.rev {
+        match crate::refs::resolve_rev(repo, rev) {
+            Ok(Some(h)) => starts.push(h),
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+        // Fall through to the empty-starts return below when unresolvable.
+    } else if opts.all {
         // All refs/heads + tags + HEAD
         for b in crate::refs::list_branches(repo).unwrap_or_default() {
             if let Ok(Some(h)) = crate::refs::read_ref(repo, &format!("refs/heads/{}", b)) {

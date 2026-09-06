@@ -26,6 +26,20 @@ pub struct HttpRefs {
     pub hasher: String,
 }
 
+/// S13: single gate for the private-remote escape hatch, shared by the pre-flight
+/// hostname check, the connecting resolver, and base validation. Accepts "true"
+/// or "1" (previously the three call sites disagreed, so `=1` bypassed one gate
+/// while satisfying another).
+fn private_remote_allowed() -> bool {
+    for var in ["ALLOW_PRIVATE_REMOTES", "ALLOW_LOCALHOST_REMOTE"] {
+        match std::env::var(var).as_deref() {
+            Ok("true") | Ok("1") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// S13/SEC-018: DNS Rebinding defense.
 /// Resolves hostname and validates all resolved IP addresses immediately prior to socket connection.
 struct SafeResolver;
@@ -34,8 +48,7 @@ impl ureq::Resolver for SafeResolver {
     fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
         use std::net::ToSocketAddrs;
         let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
-        let allow_private = std::env::var("ALLOW_PRIVATE_REMOTES").map(|v| v == "true" || v == "1").unwrap_or(false)
-            || std::env::var("ALLOW_LOCALHOST_REMOTE").map(|v| v == "true" || v == "1").unwrap_or(false);
+        let allow_private = private_remote_allowed();
         for a in &addrs {
             if !allow_private && is_private_ip(&a.ip()) {
                 return Err(std::io::Error::new(
@@ -65,9 +78,13 @@ fn is_private_host(host: &str) -> bool {
     if lower == "localhost" || lower.starts_with("localhost:")
         || lower == "metadata.google.internal" || lower.starts_with("metadata.google.internal:")
         || lower.ends_with(".internal") || lower.ends_with(".local") {
-        let allow = std::env::var("ALLOW_PRIVATE_REMOTES").map(|v| v == "true" || v == "1").unwrap_or(false)
-            || std::env::var("ALLOW_LOCALHOST_REMOTE").map(|v| v == "true" || v == "1").unwrap_or(false);
+        let allow = private_remote_allowed();
         return !allow;
+    }
+    // S13-fresh: reject IPv6 zone IDs (`fe80::1%eth0`). The `%` scope breaks
+    // literal-IP parsing below and can smuggle link-local targets past the check.
+    if host.contains('%') {
+        return true;
     }
     // Strip port if present (but careful with IPv6)
     let h = if host.starts_with('[') {
@@ -94,8 +111,13 @@ fn is_private_host(host: &str) -> bool {
     if let Ok(ip) = h.parse::<std::net::IpAddr>() {
         return is_private_ip(&ip);
     }
-    // For DNS names, try to resolve (best-effort, no network in tests, so just check via ToSocketAddrs)
-    // We attempt to resolve host:80
+    // For DNS names, try to resolve (best-effort pre-flight via ToSocketAddrs).
+    // NOTE (S13): this stays best-effort DELIBERATELY. A fail-closed pre-flight
+    // (block on resolution failure) would break offline/air-gapped use and is NOT
+    // needed for safety: the connecting SafeResolver re-resolves the same name at
+    // socket time and refuses private IPs there, and a name that fails to resolve
+    // here fails identically at connect time (no connection happens). This gate's
+    // job is fast rejection with clear errors, not final enforcement.
     use std::net::ToSocketAddrs;
     if let Ok(addrs) = (h.to_owned() + ":80").to_socket_addrs() {
         for addr in addrs {
@@ -142,6 +164,23 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
                 if is_private_ip(&std::net::IpAddr::V4(v4)) {
                     return true;
                 }
+            }
+            // S13-fresh: 6to4 transition addresses embed a full IPv4 address in
+            // segments 1-2 (2002:<v4-high>:<v4-low>::/48). An attacker can smuggle
+            // e.g. 127.0.0.1 as [2002:7f00:1::1], which no range check above sees.
+            let seg = v6.segments();
+            if seg[0] == 0x2002 {
+                let oct = [(seg[1] >> 8) as u8, (seg[1] & 0xff) as u8,
+                           (seg[2] >> 8) as u8, (seg[2] & 0xff) as u8];
+                return is_private_ip(&std::net::IpAddr::V4(std::net::Ipv4Addr::new(oct[0], oct[1], oct[2], oct[3])));
+            }
+            // S13-fresh: Teredo (2001::/32) obfuscates the client IPv4 address in
+            // the low 32 bits (bitwise NOT). Decode and inspect it the same way.
+            if seg[0] == 0x2001 && seg[1] == 0x0000 {
+                let raw = ((seg[6] as u32) << 16) | (seg[7] as u32);
+                let client = !raw;
+                let oct = [(client >> 24) as u8, (client >> 16) as u8, (client >> 8) as u8, client as u8];
+                return is_private_ip(&std::net::IpAddr::V4(std::net::Ipv4Addr::new(oct[0], oct[1], oct[2], oct[3])));
             }
             // fc00::/7 unique local
             let seg0 = v6.segments()[0];
@@ -208,8 +247,8 @@ pub fn validate_http_base(base: &str) -> Result<String> {
             // Allow names like "a..b" — Git permits, so we permit
         }
     }
-    // S12: private/link-local/loopback block (unless ALLOW_PRIVATE_REMOTES=true)
-    if std::env::var("ALLOW_PRIVATE_REMOTES").unwrap_or_default() != "true" {
+    // S12: private/link-local/loopback block (unless the S13 escape hatch is set)
+    if !private_remote_allowed() {
         // Extract host from URL: after "://" until "/" or ":" (but careful IPv6)
         let without_scheme = if trimmed.starts_with("https://") {
             &trimmed["https://".len()..]

@@ -9,7 +9,8 @@ RUN cargo build --release
 FROM node:20.18.1-alpine3.19 AS builder
 WORKDIR /app
 COPY server/package.json server/pnpm-lock.yaml* ./
-RUN corepack enable && pnpm install --frozen-lockfile || npm install
+# S16/S17: strict frozen lockfile — never silently resolve fresh (unaudited) versions.
+RUN corepack enable && pnpm install --frozen-lockfile
 COPY server .
 RUN npm run build
 

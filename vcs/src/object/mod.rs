@@ -119,6 +119,16 @@ fn parse_tree(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
         let hash_bytes = body[pos..pos + hash_len].to_vec();
         let hash = Hash::new(algo, hash_bytes)?;
         pos += hash_len;
+        // S6-fresh: enforce the same name policy as the write path (TreeEntry::new).
+        // parse_tree previously bypassed it by constructing TreeEntry literally, so a
+        // crafted object could smuggle control chars / .itehaas segments / reserved
+        // names past the parser (checkout blocked them later, but diff/status/flatten
+        // operated on them). Fail closed here instead.
+        if tree::is_forbidden_component(&name) {
+            return Err(ItehaasError::InvalidObject(format!(
+                "tree: forbidden entry name {name:?}"
+            )));
+        }
         entries.push(TreeEntry { mode, name, hash });
     }
     // Validate sorted & dedup? Tree::new does it. But we need to allow unsorted input to detect?
@@ -147,7 +157,22 @@ fn parse_commit(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
         return Err(ItehaasError::ObjectTooLarge { size: body.len(), limit: 64 * 1024 * 1024 });
     }
     let text = String::from_utf8(body).map_err(|_| ItehaasError::InvalidObject("commit: invalid utf8".into()))?;
-    let lines: Vec<&str> = text.split('\n').collect();
+    // S6-fresh: header-first scan. The message may contain millions of newlines; a
+    // whole-body split('\n') would allocate a gigantic Vec<&str> (32M newlines in a
+    // 64M body ≈ hundreds of MB) before any limit is checked. Headers are bounded
+    // (tree + ≤100 parents + author + committer), so split the header only.
+    let blank = text.find("\n\n").ok_or_else(|| ItehaasError::InvalidObject("commit: missing blank line after committer".into()))?;
+    let header = &text[..blank];
+    let message = text[blank + 2..].to_string();
+    // S6: message limit 1M
+    if message.len() > 1_000_000 {
+        return Err(ItehaasError::InvalidObject(format!("commit message too large: {}", message.len())));
+    }
+    let lines: Vec<&str> = header.split('\n').collect();
+    // Header line bound: tree(1) + parents(≤100) + author(1) + committer(1) = ≤103.
+    if lines.len() > 128 {
+        return Err(ItehaasError::InvalidObject(format!("commit: too many header lines: {}", lines.len())));
+    }
     let mut idx = 0usize;
     let mut tree: Option<Hash> = None;
     let mut parents = Vec::new();
@@ -186,23 +211,11 @@ fn parse_commit(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
     committer = Some(parse_signature(lines[idx].strip_prefix("committer ").unwrap())?);
     idx += 1;
 
-    // blank line
-    if idx >= lines.len() || !lines[idx].is_empty() {
+    // All header lines must be consumed (the blank line was already split off above).
+    if idx != lines.len() {
         return Err(ItehaasError::InvalidObject(
-            "commit: missing blank line after committer".into(),
+            "commit: trailing data after committer".into(),
         ));
-    }
-    idx += 1;
-
-    // rest is message (may contain newlines, re-join with \n)
-    let message = if idx < lines.len() {
-        lines[idx..].join("\n")
-    } else {
-        String::new()
-    };
-    // S6: message limit 1M
-    if message.len() > 1_000_000 {
-        return Err(ItehaasError::InvalidObject(format!("commit message too large: {}", message.len())));
     }
 
     Ok(Object::Commit(Commit {
@@ -220,7 +233,19 @@ fn parse_tag(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
         return Err(ItehaasError::ObjectTooLarge { size: body.len(), limit: 64 * 1024 * 1024 });
     }
     let text = String::from_utf8(body).map_err(|_| ItehaasError::InvalidObject("tag: invalid utf8".into()))?;
-    let lines: Vec<&str> = text.split('\n').collect();
+    // S6-fresh: header-first scan (same line-count bomb class as commits).
+    let blank = text.find("\n\n").ok_or_else(|| ItehaasError::InvalidObject("tag: missing blank line after tagger".into()))?;
+    let header = &text[..blank];
+    let message = text[blank + 2..].to_string();
+    // S6: tag message limit
+    if message.len() > 1_000_000 {
+        return Err(ItehaasError::InvalidObject(format!("tag message too large: {}", message.len())));
+    }
+    let lines: Vec<&str> = header.split('\n').collect();
+    // Header is exactly 4 lines (object/type/tag/tagger).
+    if lines.len() > 16 {
+        return Err(ItehaasError::InvalidObject(format!("tag: too many header lines: {}", lines.len())));
+    }
     let mut idx = 0;
     if idx >= lines.len() || !lines[idx].starts_with("object ") {
         return Err(ItehaasError::InvalidObject("tag: missing object".into()));
@@ -248,20 +273,11 @@ fn parse_tag(algo: crate::hash::HashAlgo, body: Vec<u8>) -> Result<Object> {
     }
     let tagger = parse_signature(lines[idx].strip_prefix("tagger ").unwrap())?;
     idx += 1;
-    if idx >= lines.len() || !lines[idx].is_empty() {
+    // All header lines must be consumed (the blank line was already split off above).
+    if idx != lines.len() {
         return Err(ItehaasError::InvalidObject(
-            "tag: missing blank line after tagger".into(),
+            "tag: trailing data after tagger".into(),
         ));
-    }
-    idx += 1;
-    let message = if idx < lines.len() {
-        lines[idx..].join("\n")
-    } else {
-        String::new()
-    };
-    // S6: tag message limit
-    if message.len() > 1_000_000 {
-        return Err(ItehaasError::InvalidObject(format!("tag message too large: {}", message.len())));
     }
     Ok(Object::Tag(Tag {
         object,

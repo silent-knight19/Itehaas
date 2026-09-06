@@ -231,4 +231,176 @@ describe('S8 Database / SQL Security', () => {
     expect(rollbackCalled).toBe(true);
     expect(releaseCalled).toBe(true);
   });
+
+  describe('S8-fresh: atomic multi-writes and least privilege', () => {
+    it('issues create leaves no orphan row when label check 403s', async () => {
+      const texts: string[] = [];
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        texts.push(text);
+        if (text.includes('FROM sessions s JOIN users u')) {
+          if (params?.[0] === 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') return { rows: [{ id: 'u-charlie', username: 'charlie' }] };
+          return { rows: [] };
+        }
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-pub', visibility: 'public' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        if (text.includes('SELECT id FROM labels WHERE repo_id=$1')) return { rows: [] }; // unknown label
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/pub/issues',
+        headers: { cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+        payload: { title: 't', body: 'b', labels: ['brand-new-label'] },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(texts.some((t) => t.includes('INSERT INTO issues'))).toBe(false);
+      await app.close();
+    });
+
+    it('issues PATCH checks permissions before any UPDATE', async () => {
+      const texts: string[] = [];
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        texts.push(text);
+        if (text.includes('FROM sessions s JOIN users u')) {
+          if (params?.[0] === 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') return { rows: [{ id: 'u-charlie', username: 'charlie' }] };
+          return { rows: [] };
+        }
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-pub', visibility: 'public' }] };
+        if (text.includes('SELECT author_id, repo_id FROM issues WHERE id=$1 AND repo_id=$2')) {
+          return { rows: [{ author_id: 'u-charlie', repo_id: 'r-pub' }] };
+        }
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/api/repos/alice/pub/issues/iss-1',
+        headers: { cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+        payload: { title: 'new', labels: ['x'] },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(texts.some((t) => t.includes('UPDATE issues SET'))).toBe(false);
+      await app.close();
+    });
+
+    it('CI run rolls back pipeline when a job insert fails (no orphan queued run)', async () => {
+      const texts: string[] = [];
+      const commit = 'a'.repeat(64);
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        texts.push(text);
+        if (text.includes('FROM sessions s JOIN users u')) {
+          if (params?.[0] === 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') return { rows: [{ id: 'u-alice', username: 'alice' }] };
+          return { rows: [] };
+        }
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r1', visibility: 'private' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT count(*)::int as c FROM ci_pipelines')) return { rows: [{ c: 0 }] };
+        if (text.includes('INSERT INTO ci_pipelines')) return { rows: [{ id: 'p-orphan', status: 'queued' }] };
+        if (text.includes('INSERT INTO ci_jobs')) throw new Error('simulated job insert failure');
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/repo/ci/run',
+        headers: { cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+        payload: { ref: 'main', commit },
+      });
+      expect(res.statusCode).toBe(500);
+      expect(texts).toContain('ROLLBACK');
+      await app.close();
+    });
+
+    it('PR merge rolls back status when activity insert fails (atomic completion)', async () => {
+      const texts: string[] = [];
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        texts.push(text);
+        if (text.includes('FROM sessions s JOIN users u')) {
+          if (params?.[0] === 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') return { rows: [{ id: 'u-alice', username: 'alice' }] };
+          return { rows: [] };
+        }
+        if (text.includes('FROM repositories r JOIN users u')) {
+          return { rows: [{ id: 'r1', visibility: 'private', default_branch: 'main' }] };
+        }
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        // S15 session-pinned lock (via getClient, shared mock here).
+        if (text.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+        if (text.includes('pg_advisory_unlock')) return { rows: [], rowCount: 0 };
+        if (text.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+        if (text.includes('pg_advisory_unlock')) return { rows: [], rowCount: 0 };
+        if (text.includes('SELECT source_branch, target_branch, status, is_draft, title, body FROM pull_requests')) {
+          return { rows: [{ source_branch: 'feature', target_branch: 'main', status: 'open', is_draft: false, title: 'plain merge', body: '' }] };
+        }
+        if (text.includes('SELECT decision FROM pr_reviews')) return { rows: [] };
+        if (text.includes('UPDATE pull_requests SET status')) return { rows: [], rowCount: 1 };
+        if (text.includes('INSERT INTO activity')) throw new Error('simulated activity failure');
+        return { rows: [], rowCount: 0 };
+      });
+      const { execItehaas } = await import('../lib/vcs');
+      const vcs = await import('../lib/vcs');
+      const spy = vi.spyOn(vcs, 'execItehaas').mockImplementation(async (args: string[]) => {
+        if (args[0] === 'branch') return { stdout: 'main\nfeature\n', stderr: '', code: 0 };
+        if (args[0] === 'checkout') return { stdout: '', stderr: '', code: 0 };
+        if (args[0] === 'merge') return { stdout: 'Merge made', stderr: '', code: 0 };
+        return { stdout: '', stderr: '', code: 0 };
+      });
+      void execItehaas;
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/repo/pulls/pr-1/merge',
+        headers: { cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+      });
+      expect(res.statusCode).toBe(500);
+      expect(texts).toContain('ROLLBACK');
+      expect(texts.some((t) => t.includes('UPDATE pull_requests SET status'))).toBe(true);
+      spy.mockRestore();
+      await app.close();
+    });
+
+    it('011_db_roles defines least privilege (DML only, NOLOGIN, guarded)', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const candidates = [
+        path.join(process.cwd(), 'database/migrations/011_db_roles.sql'),
+        path.join(process.cwd(), '../database/migrations/011_db_roles.sql'),
+      ];
+      const found = candidates.find((c) => fs.existsSync(c));
+      expect(found).toBeDefined();
+      const sql = fs.readFileSync(found!, 'utf8');
+      expect(sql).toContain('CREATE ROLE itehaas_app WITH NOLOGIN');
+      expect(sql).toMatch(/GRANT SELECT, INSERT, UPDATE, DELETE/);
+      expect(sql).not.toMatch(/GRANT ALL/i);
+      // No baked-in credential: PASSWORD may appear in prose, never as 'literal'.
+      expect(sql).not.toMatch(/PASSWORD\s*'/);
+      expect(sql).toContain('insufficient_privilege');
+      expect(sql).toContain('ALTER DEFAULT PRIVILEGES');
+    });
+
+    it('runtime pool prefers DATABASE_APP_URL when set', async () => {
+      const prev = process.env.DATABASE_APP_URL;
+      try {
+        delete process.env.DATABASE_APP_URL;
+        const db1: any = await import('../db/index');
+        expect(db1.isLeastPrivilegeDb()).toBe(false);
+        process.env.DATABASE_APP_URL = 'postgres://itehaas_app:strong-pwd-here-1234567890@db:5432/itehaas';
+        // Re-evaluate via fresh import to avoid module cache staleness
+        vi.resetModules();
+        const db2: any = await import('../db/index');
+        expect(db2.isLeastPrivilegeDb()).toBe(true);
+      } finally {
+        if (prev === undefined) delete process.env.DATABASE_APP_URL;
+        else process.env.DATABASE_APP_URL = prev;
+        vi.resetModules();
+      }
+    });
+  });
 });

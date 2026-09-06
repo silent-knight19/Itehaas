@@ -132,6 +132,14 @@ fn test_is_forbidden_component_blocks_case_and_aliases() {
     assert!(is_forbidden_component("foo."));
     assert!(is_forbidden_component("foo "));
 
+    // S4-fresh: control/format characters (terminal/log injection, FS tricks)
+    assert!(is_forbidden_component("a\x00b"));
+    assert!(is_forbidden_component("a\x07b"));
+    assert!(is_forbidden_component("a\x1bb"));
+    assert!(is_forbidden_component("a\x7fb"));
+    assert!(is_forbidden_component("a\u{200e}b"));
+    assert!(is_forbidden_component("a\u{feff}b"));
+
     // Safe names
     assert!(!is_forbidden_component("README.md"));
     assert!(!is_forbidden_component("main.rs"));
@@ -156,7 +164,13 @@ fn test_tree_entry_creation_rejects_forbidden_names() {
     assert!(TreeEntry::new(0o100644, ".git".into(), dummy_hash.clone()).is_err());
     assert!(TreeEntry::new(0o100644, "CON".into(), dummy_hash.clone()).is_err());
     assert!(TreeEntry::new(0o100644, "..".into(), dummy_hash.clone()).is_err());
+    // S4-fresh: control/format characters rejected
+    assert!(TreeEntry::new(0o100644, "a\x00b".into(), dummy_hash.clone()).is_err());
+    assert!(TreeEntry::new(0o100644, "a\u{200e}b".into(), dummy_hash.clone()).is_err());
 
     // Legitimate name should succeed
-    assert!(TreeEntry::new(0o100644, "safe_file.rs".into(), dummy_hash).is_ok());
+    assert!(TreeEntry::new(0o100644, "safe_file.rs".into(), dummy_hash.clone()).is_ok());
+    // S4-fresh: internationalized names keep working
+    assert!(TreeEntry::new(0o100644, "café.txt".into(), dummy_hash.clone()).is_ok());
+    assert!(TreeEntry::new(0o100644, "日本語.md".into(), dummy_hash).is_ok());
 }

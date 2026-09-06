@@ -118,7 +118,15 @@ pub fn checkout(
     for (path, _) in &current_map {
         if !target_map.contains_key(path) {
             let abs = repo.join(path);
+            // S4 (FSEC-011): re-validate containment immediately before delete.
+            // A parent dir swapped for a symlink after the status check would otherwise
+            // redirect remove_file outside the repo (rename race / TOCTOU).
+            ensure_no_symlink_and_inside_repo(repo, &abs)?;
             if abs.exists() {
+                // Re-check the link itself without following: never delete through a symlink.
+                if fs::symlink_metadata(&abs).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                    return Err(ItehaasError::Other(format!("refusing to delete through symlink: {}", abs.display())));
+                }
                 fs::remove_file(&abs)?;
                 // Try to remove empty parent dirs (e.g., src/ if empty)
                 if let Some(parent) = abs.parent() {
@@ -256,7 +264,12 @@ pub fn checkout_forced(
     for (path, _) in &current_map {
         if !target_map.contains_key(path) {
             let abs = repo.join(path);
+            // S4 (FSEC-011): same delete guard as checkout (symlink-swap race).
+            ensure_no_symlink_and_inside_repo(repo, &abs)?;
             if abs.exists() {
+                if fs::symlink_metadata(&abs).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                    return Err(ItehaasError::Other(format!("refusing to delete through symlink: {}", abs.display())));
+                }
                 fs::remove_file(&abs)?;
                 if let Some(parent) = abs.parent() {
                     let mut cur = parent.to_path_buf();

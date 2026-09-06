@@ -42,6 +42,27 @@ export function validateDatabaseUrl(url: string, isProduction: boolean): void {
         throw new Error(`[config] DATABASE_URL contains insecure default credentials "${pat}" in production. Rotate them.`);
       }
     }
+    // S1-fresh: reject missing/weak DB passwords and common weak patterns in production.
+    // Attack: postgres://itehaas:1234@db/... passes length checks but is brute-forceable.
+    try {
+      const u = new URL(url);
+      const pwd = u.password || '';
+      if (!pwd) {
+        throw new Error('[config] DATABASE_URL must include a password in production.');
+      }
+      if (pwd.length < 12) {
+        throw new Error(`[config] DATABASE_URL password too short in production (min 12 chars, got ${pwd.length}).`);
+      }
+      const weak = ['changeme', 'change-me', 'password', 'admin', '123456', 'qwerty', 'letmein', 'itehaas'];
+      for (const w of weak) {
+        if (pwd.toLowerCase().includes(w)) {
+          throw new Error(`[config] DATABASE_URL password contains weak pattern "${w}" in production. Rotate it.`);
+        }
+      }
+    } catch (e: any) {
+      if (e.message && e.message.startsWith('[config] DATABASE_URL')) throw e;
+      // URL already validated above; ignore unexpected parse errors here.
+    }
   }
 }
 
@@ -66,6 +87,24 @@ export function validateReposRoot(reposRoot: string, isProduction: boolean): voi
     const parent = path.dirname(resolved);
     if (!fs.existsSync(parent)) {
       throw new Error(`[config] REPOS_ROOT parent directory does not exist: ${parent}`);
+    }
+  }
+  // S1-fresh: in production, reject world-writable parents (TOCTOU/symlink plant via /tmp-like dirs).
+  if (isProduction && process.platform !== 'win32') {
+    let cur = resolved;
+    for (let i = 0; i < 16; i++) {
+      try {
+        const st = fs.statSync(cur);
+        if ((st.mode & 0o002) !== 0) {
+          throw new Error(`[config] REPOS_ROOT parent is world-writable (${st.mode.toString(8)}): ${cur}`);
+        }
+      } catch (e: any) {
+        if (e.message && e.message.startsWith('[config] REPOS_ROOT parent is world-writable')) throw e;
+        // Missing component: check its parent next.
+      }
+      const parent = path.dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
     }
   }
 }
@@ -94,6 +133,12 @@ export function validateItehaasBin(binPath: string, isProduction: boolean): void
         throw new Error(`[config] ITEHAAS_BIN is insecure: world-writable binary (${stat.mode.toString(8)}): ${resolved}`);
       }
     }
+  }
+}
+
+export function validatePort(port: number): void {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`[config] PORT must be an integer 1-65535, got ${port}`);
   }
 }
 
@@ -139,7 +184,26 @@ export function validateStartupConfig(cfg: AppConfig, env: NodeJS.ProcessEnv = p
         throw new Error(`[config] COOKIE_SECRET contains insecure default pattern "${pat}" in production. Rotate it.`);
       }
     }
+    // S1-fresh: SECRET_ENCRYPTION_KEY must be explicitly set and distinct from COOKIE_SECRET.
+    // Attack: omitting it silently couples CI-secret encryption to session signing; rotation breaks all secrets.
+    if (!env.SECRET_ENCRYPTION_KEY) {
+      throw new Error('[config] SECRET_ENCRYPTION_KEY is required in production (must be explicitly set, min 32 chars, distinct from COOKIE_SECRET).');
+    }
+    if (!cfg.secretEncryptionKey || cfg.secretEncryptionKey.length < 32) {
+      throw new Error(`[config] SECRET_ENCRYPTION_KEY too short in production (min 32 chars, got ${cfg.secretEncryptionKey ? cfg.secretEncryptionKey.length : 0}).`);
+    }
+    for (const pat of insecureCookiePatterns) {
+      if (cfg.secretEncryptionKey.toLowerCase().includes(pat)) {
+        throw new Error(`[config] SECRET_ENCRYPTION_KEY contains insecure default pattern "${pat}" in production. Rotate it.`);
+      }
+    }
+    if (cfg.secretEncryptionKey === cfg.cookieSecret) {
+      throw new Error('[config] SECRET_ENCRYPTION_KEY must be distinct from COOKIE_SECRET in production.');
+    }
   }
+
+  // 2b. Port validation (all envs — fail fast on misconfiguration)
+  validatePort(cfg.port);
 
   // 3. Database URL validation
   validateDatabaseUrl(cfg.databaseUrl, isProduction);
@@ -150,9 +214,12 @@ export function validateStartupConfig(cfg: AppConfig, env: NodeJS.ProcessEnv = p
   // 5. VCS binary validation
   validateItehaasBin(cfg.itehaasBin, isProduction);
 
-  // 6. Host binding in production
-  if (isProduction && cfg.host === '0.0.0.0' && env.ALLOW_ALL_INTERFACES !== 'true') {
-    throw new Error('[config] Binding to 0.0.0.0 is forbidden in production without ALLOW_ALL_INTERFACES=true.');
+  // 6. Host binding in production (IPv4 + IPv6 any-address)
+  // Attack: HOST=:: bypasses a naive === '0.0.0.0' check and binds all interfaces.
+  const normalizedHost = (cfg.host || '').trim();
+  const anyHosts = new Set(['0.0.0.0', '::', '::0', '0:0:0:0:0:0:0:0', '[::]']);
+  if (isProduction && anyHosts.has(normalizedHost) && env.ALLOW_ALL_INTERFACES !== 'true') {
+    throw new Error(`[config] Binding to ${normalizedHost} is forbidden in production without ALLOW_ALL_INTERFACES=true.`);
   }
 }
 

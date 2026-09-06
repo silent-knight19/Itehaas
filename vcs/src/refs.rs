@@ -199,6 +199,12 @@ pub fn current_branch(repo: &Path) -> Result<Option<String>> {
 
 /// Resolve a rev: branch name, hash, or HEAD. Phase 2 minimal: HEAD or hash.
 pub fn resolve_rev(repo: &Path, rev: &str) -> Result<Option<Hash>> {
+    // S15: traversal guard — rev flows into `refs/heads/{rev}` path joins (and
+    // since S15 also arrives via `log --rev` from the API). Fail closed here so a
+    // malicious rev can never escape `.itehaas/`, regardless of caller validation.
+    if rev.contains("..") || rev.starts_with('/') || rev.contains('\\') || rev.contains('\0') {
+        return Err(ItehaasError::InvalidObject(format!("invalid rev (traversal): {:?}", rev)));
+    }
     // Handle HEAD~n suffix
     if rev.contains('~') {
         let parts: Vec<&str> = rev.splitn(2, '~').collect();

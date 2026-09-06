@@ -494,4 +494,139 @@ describe('S2 Authentication Hardening', () => {
     expect(queryParams).toEqual(['user-victim']);
     await app.close();
   });
+
+  describe('S2-fresh: adversarial auth (DoS bounds, revocation, replay)', () => {
+    it('oversized login password (>128) -> 400 without argon2 burn', async () => {
+      const spy = vi.spyOn(authLib, 'verifyPassword');
+      mockQuery.mockImplementation(async () => ({ rows: [], rowCount: 0 }));
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'alice', password: 'x'.repeat(10000) },
+      });
+      expect(res.statusCode).toBe(400);
+      // Must reject at schema layer before any password verification.
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+      await app.close();
+    });
+
+    it('oversized login username (>255) -> 400', async () => {
+      mockQuery.mockImplementation(async () => ({ rows: [], rowCount: 0 }));
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'a'.repeat(1000), password: 'whatever123' },
+      });
+      expect(res.statusCode).toBe(400);
+      await app.close();
+    });
+
+    it('oversized currentPassword (>128) -> 400 without argon2 burn', async () => {
+      const spy = vi.spyOn(authLib, 'verifyPassword');
+      mockQuery.mockImplementation(async (text: string) => {
+        if (text.includes('FROM sessions s JOIN users u')) {
+          return { rows: [{ id: 'user-1', username: 'alice', email: 'alice@example.com' }] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/password',
+        cookies: { itehaas_session: '11111111-1111-1111-1111-111111111111' },
+        payload: { currentPassword: 'y'.repeat(10000), newPassword: 'BrandNewSecurePassword123!' },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+      await app.close();
+    });
+
+    it('password-change rate limit 5/min -> 6th returns 429', async () => {
+      const hash = await authLib.hashPassword('CorrectOldPassword123!');
+      mockQuery.mockImplementation(async (text: string) => {
+        if (text.includes('FROM sessions s JOIN users u')) {
+          return { rows: [{ id: 'user-1', username: 'alice', email: 'alice@example.com' }] };
+        }
+        if (text.includes('SELECT password_hash FROM users WHERE id')) {
+          return { rows: [{ password_hash: hash }] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      for (let i = 0; i < 5; i++) {
+        const res = await app.inject({
+          method: 'POST',
+          url: '/api/auth/password',
+          cookies: { itehaas_session: '11111111-1111-1111-1111-111111111111' },
+          payload: { currentPassword: 'WrongPassword!', newPassword: 'BrandNewSecurePassword123!' },
+        });
+        expect(res.statusCode).toBe(401);
+      }
+      const res6 = await app.inject({
+        method: 'POST',
+        url: '/api/auth/password',
+        cookies: { itehaas_session: '11111111-1111-1111-1111-111111111111' },
+        payload: { currentPassword: 'WrongPassword!', newPassword: 'BrandNewSecurePassword123!' },
+      });
+      expect(res6.statusCode).toBe(429);
+      await app.close();
+    });
+
+    it('logout with malformed session -> 200 without DB delete (no crash, no oracle)', async () => {
+      let deleteCalled = false;
+      mockQuery.mockImplementation(async (text: string) => {
+        if (text.includes('DELETE FROM sessions WHERE id = $1')) deleteCalled = true;
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/logout',
+        headers: { cookie: 'itehaas_session=not-a-uuid!!!' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().ok).toBe(true);
+      expect(deleteCalled).toBe(false);
+      await app.close();
+    });
+
+    it('expired/revoked session -> GET /me 401 and clears cookie (replay fails)', async () => {
+      mockQuery.mockImplementation(async (text: string) => {
+        if (text.includes('FROM sessions s JOIN users u')) return { rows: [] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/auth/me',
+        cookies: { itehaas_session: '11111111-1111-1111-1111-111111111111' },
+      });
+      expect(res.statusCode).toBe(401);
+      const setCookie = String(res.headers['set-cookie'] || '');
+      expect(setCookie).toContain('itehaas_session');
+      await app.close();
+    });
+
+    it('malformed Bearer token -> protected route 401 (no DB hit on garbage)', async () => {
+      let dbHit = false;
+      mockQuery.mockImplementation(async (text: string) => {
+        if (text.includes('FROM sessions s JOIN users u')) dbHit = true;
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/password',
+        headers: { authorization: 'Bearer not-a-uuid!!!' },
+        payload: { currentPassword: 'x', newPassword: 'BrandNewSecurePassword123!' },
+      });
+      expect(res.statusCode).toBe(401);
+      expect(dbHit).toBe(false);
+      await app.close();
+    });
+  });
 });

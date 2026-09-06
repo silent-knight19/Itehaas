@@ -181,6 +181,91 @@ describe('S4 Filesystem / Path Traversal & Symlink', () => {
     expect(() => actual.repoPathFor('..%2f', 'repo')).toThrow();
   });
 
+  describe('S4-fresh: dot-segments, symlinks, aliasing, unicode, depth', () => {
+    it('repoPathFor rejects dot-segment identities (aliasing)', async () => {
+      const actual: any = await vi.importActual('../lib/vcs');
+      expect(() => actual.repoPathFor('.', 'repo')).toThrow(/invalid owner\/repo/);
+      expect(() => actual.repoPathFor('alice', '.')).toThrow(/invalid owner\/repo/);
+      expect(() => actual.repoPathFor('..', '..')).toThrow();
+      expect(actual.isValidOwnerRepo('.', 'repo')).toBe(false);
+      expect(actual.isValidOwnerRepo('alice', '..')).toBe(false);
+      expect(actual.isValidOwnerRepo('alice', 'repo')).toBe(true);
+    });
+
+    it('validateOwnerRepo rejects dot-segments', async () => {
+      const fs = await import('fs');
+      const os = await import('os');
+      const path = await import('path');
+      // Exercise the real repoPathFor symlink-parent refusal with a planted link
+      // inside the mocked repos root (/tmp/itehaas_test).
+      const actual: any = await vi.importActual('../lib/vcs');
+      const root = '/tmp/itehaas_test';
+      fs.mkdirSync(root, { recursive: true });
+      const realDir = fs.mkdtempSync(path.join(root, 'real-'));
+      const link = path.join(root, `link-${Date.now()}`);
+      try { fs.symlinkSync(realDir, link); } catch {}
+      const linkName = path.basename(link);
+      expect(() => actual.repoPathFor(linkName, 'repo')).toThrow(/traversal/);
+      try { fs.unlinkSync(link); fs.rmSync(realDir, { recursive: true, force: true }); } catch {}
+    });
+
+    it('isValidFilePath blocks control/format chars but allows i18n names', async () => {
+      const { isValidFilePath } = await import('./repos');
+      expect(isValidFilePath('a\x00b')).toBe(false);
+      expect(isValidFilePath('a\x07b')).toBe(false);
+      expect(isValidFilePath('a\x7fb')).toBe(false);
+      expect(isValidFilePath('a‎b')).toBe(false);
+      expect(isValidFilePath('a﻿b')).toBe(false);
+      expect(isValidFilePath('.git\x00/config')).toBe(false);
+      // Legitimate internationalized names keep working
+      expect(isValidFilePath('café.txt')).toBe(true);
+      expect(isValidFilePath('日本語.md')).toBe(true);
+      expect(isValidFilePath('docs/über_spec.md')).toBe(true);
+    });
+
+    it('isValidFilePath blocks very deep paths', async () => {
+      const { isValidFilePath } = await import('./repos');
+      expect(isValidFilePath(`${'a/'.repeat(300)}f`)).toBe(false); // >500 total
+      expect(isValidFilePath(`${'x'.repeat(101)}/f`)).toBe(false); // >100 per part
+      expect(isValidFilePath('a/b/c.txt')).toBe(true);
+    });
+
+    it('copyMissingObjects refuses symlink dirs, non-hex entries, .tmp files; copies sha1+sha256', async () => {
+      const fs = await import('fs');
+      const os = await import('os');
+      const path = await import('path');
+      const { copyMissingObjects } = await import('./pulls');
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'itehaas-s4copy-'));
+      const src = path.join(tmp, 'src');
+      const dst = path.join(tmp, 'dst');
+      const srcObj = path.join(src, '.itehaas', 'objects');
+      const dstObj = path.join(dst, '.itehaas', 'objects');
+      fs.mkdirSync(srcObj, { recursive: true });
+      fs.mkdirSync(dstObj, { recursive: true });
+      // Legit sha256 object
+      const good256 = 'ab' + 'c'.repeat(62);
+      fs.mkdirSync(path.join(srcObj, 'ab'), { recursive: true });
+      fs.writeFileSync(path.join(srcObj, 'ab', 'c'.repeat(62)), Buffer.from('obj256'));
+      // Legit sha1 object
+      fs.mkdirSync(path.join(srcObj, 'cd'), { recursive: true });
+      fs.writeFileSync(path.join(srcObj, 'cd', 'e'.repeat(38)), Buffer.from('objsha1'));
+      // Non-hex junk + tmp file must be skipped
+      fs.writeFileSync(path.join(srcObj, 'cd', 'ZZ-not-hex-value-0000000000000000000000'), Buffer.from('junk'));
+      fs.writeFileSync(path.join(srcObj, 'cd', '.tmp-123-456-abcdef0123456789'), Buffer.from('tmp'));
+      // Symlinked fanout dir pointing outside must not be followed
+      const outside = path.join(tmp, 'outside');
+      fs.mkdirSync(outside, { recursive: true });
+      fs.writeFileSync(path.join(outside, 'secret'), Buffer.from('secret'));
+      try { fs.symlinkSync(outside, path.join(srcObj, 'ef')); } catch {}
+      const n = await copyMissingObjects(src, dst);
+      expect(n).toBe(2);
+      expect(fs.existsSync(path.join(dstObj, 'ab', 'c'.repeat(62)))).toBe(true);
+      expect(fs.existsSync(path.join(dstObj, 'cd', 'e'.repeat(38)))).toBe(true);
+      expect(fs.existsSync(path.join(dstObj, 'ef', 'secret'))).toBe(false);
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+    });
+  });
+
   it('validateRepoPath symlink parent blocked (S4-01)', async () => {
     const fs = await import('fs');
     const os = await import('os');

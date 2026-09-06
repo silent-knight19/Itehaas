@@ -238,4 +238,169 @@ describe('S9 Secret Management', () => {
     expect(masked).not.toContain(jsonEsc);
     expect(masked).toContain('***');
   });
+
+  describe('S9-fresh: at-rest healing, skip-undecryptable, rotation, fork isolation', () => {
+    it('resolvePipelineSecrets decrypts v1, heals plaintext at rest, skips corrupt', async () => {
+      const { resolvePipelineSecrets } = await import('./ci');
+      const healed: { id: string; value: string }[] = [];
+      const audits: string[] = [];
+      const goodCipher = encryptSecret('live-secret-value');
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('SELECT id, key, value FROM ci_secrets')) {
+          return { rows: [
+            { id: 's-plain', key: 'LEGACY', value: 'plaintext-row' },
+            { id: 's-good', key: 'LIVE', value: goodCipher },
+            { id: 's-bad', key: 'BROKEN', value: 'v1:corrupt-not-base64!!!' },
+          ] };
+        }
+        if (text.includes('UPDATE ci_secrets SET value=$1 WHERE id=$2')) {
+          healed.push({ id: params?.[1], value: params?.[0] });
+          return { rows: [], rowCount: 1 };
+        }
+        if (text.includes('INSERT INTO audit_logs')) {
+          audits.push(String(params?.[1]));
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const { env, skipped } = await resolvePipelineSecrets('r1');
+      // v1 decrypts, plaintext accepted, corrupt skipped (never injected raw)
+      expect(env.LEGACY).toBe('plaintext-row');
+      expect(env.LIVE).toBe('live-secret-value');
+      expect(env.BROKEN).toBeUndefined();
+      expect(skipped).toEqual(['BROKEN']);
+      // Plaintext row healed to v1 ciphertext
+      expect(healed.length).toBe(1);
+      expect(healed[0].id).toBe('s-plain');
+      expect(healed[0].value.startsWith('v1:')).toBe(true);
+      expect(decryptSecret(healed[0].value)).toBe('plaintext-row');
+      // Decrypt failure audited
+      expect(audits).toContain('ci.secret_decrypt_failure');
+    });
+
+    it('POST /ci/secrets/rotate re-encrypts all rows, returns counts not values', async () => {
+      const rotated: { id: string; value: string }[] = [];
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) {
+          if (params?.[0] === 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') return { rows: [{ id: 'u-alice', username: 'alice' }] };
+          return { rows: [] };
+        }
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r1' }] };
+        if (text.includes('SELECT owner_id FROM repositories')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT id, value FROM ci_secrets')) {
+          return { rows: [
+            { id: 's-1', value: 'old-plaintext' },
+            { id: 's-2', value: encryptSecret('already-v1') },
+            { id: 's-3', value: 'v1:garbage!!!' },
+          ] };
+        }
+        if (text.includes('UPDATE ci_secrets SET value=$1 WHERE id=$2')) {
+          rotated.push({ id: params?.[1], value: params?.[0] });
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/repo/ci/secrets/rotate',
+        headers: { cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ ok: true, rotated: 2, skipped: 1 });
+      // Response carries no secret material
+      expect(JSON.stringify(res.json())).not.toContain('old-plaintext');
+      expect(JSON.stringify(res.json())).not.toContain('already-v1');
+      // Healed rows decrypt under the current key
+      for (const r of rotated) {
+        expect(r.value.startsWith('v1:')).toBe(true);
+        expect(['old-plaintext', 'already-v1']).toContain(decryptSecret(r.value));
+      }
+      await app.close();
+    });
+
+    it('POST /ci/secrets/rotate requires admin (read member -> 403)', async () => {
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        if (text.includes('FROM sessions s JOIN users u')) {
+          if (params?.[0] === 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb') return { rows: [{ id: 'u-bob', username: 'bob' }] };
+          return { rows: [] };
+        }
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r1' }] };
+        if (text.includes('SELECT owner_id FROM repositories')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [{ role: 'read' }] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/repo/ci/secrets/rotate',
+        headers: { cookie: 'itehaas_session=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' },
+      });
+      expect(res.statusCode).toBe(403);
+      await app.close();
+    });
+
+    it('fork PR run with pre-copied objects still gets empty secrets (FSEC-008 scenario)', async () => {
+      const texts: string[] = [];
+      const jobLogs: string[] = [];
+      const secretCipher = encryptSecret('prod-deploy-token-xyz');
+      mockQuery.mockImplementation(async (text: string, params?: any[]) => {
+        texts.push(text);
+        if (text.includes('FROM sessions s JOIN users u')) {
+          if (params?.[0] === 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') return { rows: [{ id: 'u-alice', username: 'alice' }] };
+          return { rows: [] };
+        }
+        if (text.includes('FROM repositories r JOIN users u')) return { rows: [{ id: 'r-up', visibility: 'public' }] };
+        if (text.includes('SELECT owner_id FROM repositories WHERE id = $1')) return { rows: [{ owner_id: 'u-alice' }] };
+        if (text.includes('SELECT role FROM repository_members')) return { rows: [{ role: 'write' }] };
+        if (text.includes('SELECT tr.permission')) return { rows: [] };
+        if (text.includes('SELECT count(*)::int as c FROM ci_pipelines')) return { rows: [{ c: 0 }] };
+        if (text.includes('INSERT INTO ci_pipelines')) return { rows: [{ id: 'p-fork', status: 'queued' }] };
+        if (text.includes('INSERT INTO ci_jobs')) return { rows: [], rowCount: 1 };
+        if (text.includes("UPDATE ci_pipelines SET status='running'")) return { rows: [], rowCount: 1 };
+        if (text.includes('SELECT id, name FROM ci_jobs')) return { rows: [{ id: 'j1', name: 'build' }] };
+        // Secrets table holds the production secret (v1 at rest)
+        if (text.includes('SELECT id, key, value FROM ci_secrets')) {
+          return { rows: [{ id: 's-1', key: 'DEPLOY_TOKEN', value: secretCipher }] };
+        }
+        // Fork-PR detection: pipeline belongs to a fork branch authored by an outsider.
+        // Objects were pre-copied by copyMissingObjects (so the FS signal is polluted) —
+        // isolation must still hold via DB fork markers.
+        if (text.includes('is_fork_pr')) {
+          return { rows: [{ ref: 'main', branch: 'fork/eve/exfil', commit_hash: 'a'.repeat(64), created_by: 'u-eve', is_fork_pr: true }] };
+        }
+        if (text.includes('SELECT 1 FROM repository_members WHERE repo_id=$1 AND user_id=$2')) return { rows: [] };
+        if (text.includes('SELECT workflow_json FROM ci_pipelines')) return { rows: [{ workflow_json: null }] };
+        if (text.includes('UPDATE ci_jobs SET status=')) {
+          const logsParam = params?.[1];
+          if (typeof logsParam === 'string') jobLogs.push(logsParam);
+          return { rows: [], rowCount: 1 };
+        }
+        if (text.includes('SELECT EXTRACT(EPOCH')) return { rows: [{ ms: 5 }] };
+        if (text.includes('UPDATE ci_pipelines SET status=')) return { rows: [], rowCount: 1 };
+        if (text.includes('INSERT INTO audit_logs')) return { rows: [], rowCount: 1 };
+        return { rows: [], rowCount: 0 };
+      });
+      const app = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/repos/alice/up/ci/run',
+        headers: { cookie: 'itehaas_session=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+        payload: { ref: 'main', commit: 'a'.repeat(64) },
+      });
+      expect(res.statusCode).toBe(201);
+      // Let the background runPipeline finish (mocked queries resolve immediately).
+      for (let i = 0; i < 50 && jobLogs.length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(jobLogs.length).toBeGreaterThan(0);
+      for (const logs of jobLogs) {
+        expect(logs).not.toContain('prod-deploy-token-xyz');
+      }
+      // Fork strip was audited
+      expect(texts.some((t) => t.includes('INSERT INTO audit_logs'))).toBe(true);
+      await app.close();
+    });
+  });
 });

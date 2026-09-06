@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import { sessionCookieName, csrfTokenForSession } from '../lib/auth';
 import { config } from '../config';
+import { getAllowedOrigins } from '../lib/origins';
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -44,18 +45,9 @@ export async function csrfCheck(req: any, reply: any): Promise<void> {
       return reply.status(403).send({ error: 'invalid origin' });
     }
     if (host && originHost !== host) {
-      const devOrigins = [
-        'http://localhost:3000',
-        'http://localhost:3001',
-        'http://127.0.0.1:3000',
-        'http://127.0.0.1:3001',
-      ];
-      const prodOrigins = ['https://itehaas.tailnet.ts.net', 'https://itehaas.local'];
-      const allowed = process.env.ALLOWED_ORIGIN
-        ? process.env.ALLOWED_ORIGIN.split(',').map((s) => s.trim()).filter(Boolean)
-        : config.isProd
-          ? prodOrigins
-          : [...devOrigins, ...prodOrigins];
+      // S12-fresh: shared allowlist (same list as CORS — drift would open one
+      // boundary while closing the other). Entries are slash-normalized.
+      const allowed = getAllowedOrigins(process.env, config.isProd);
 
       if (!allowed.includes(origin)) {
         return reply.status(403).send({ error: 'cross-origin request forbidden' });
@@ -66,9 +58,13 @@ export async function csrfCheck(req: any, reply: any): Promise<void> {
   const headerToken = (req.headers['x-csrf-token'] as string | undefined) || (req.headers['x-xsrf-token'] as string | undefined);
   const cookieToken = (req.cookies as any)?.['csrf_token'] as string | undefined;
 
-  // SEC-004: In production, fail-closed unconditionally.
-  // In development/test, allow missing csrf_token cookie for backward-compatible test injection.
-  if (!config.isProd && !cookieToken && !headerToken) return;
+  // S12-fresh (FSEC-003): fail closed outside the test suite. The old bypass
+  // (`!isProd`) disabled CSRF for ALL of development, so a staging/dev server
+  // reachable on the LAN/Tailscale accepted cookie-authed cross-site POSTs.
+  // Real clients (web/lib/api.ts) forward the csrf_token cookie as a header, so
+  // enforcement works in dev; only automated tests skip it — and flipping isProd
+  // on (as prod-simulation tests do) re-arms enforcement immediately.
+  if (!config.isProd && config.nodeEnv === 'test' && !cookieToken && !headerToken) return;
 
   const expected = csrfTokenForSession(sessionId);
   let ok = false;

@@ -16,6 +16,7 @@ import { orgRoutes } from './routes/orgs';
 import { inviteRoutes } from './routes/invites';
 import { searchRoutes } from './routes/search';
 import { metrics, incHttpRequest, incAuthFailure, incRateLimited, renderMetrics } from './lib/metrics';
+import { getAllowedOrigins } from './lib/origins';
 
 async function buildApp() {
   if (typeof (config as any).validateStartupConfig === 'function') {
@@ -23,6 +24,10 @@ async function buildApp() {
   }
   const app = Fastify({
     trustProxy: true,
+    // S7: explicit JSON body budget (default would also be 1MiB — pinned so a
+    // framework upgrade cannot silently lift it; octet-stream uploads use their
+    // own 64M parser in repos.ts).
+    bodyLimit: 1_048_576,
     logger: {
       level: process.env.LOG_LEVEL || 'info',
       transport: process.env.NODE_ENV === 'development' ? { target: 'pino-pretty' } : undefined,
@@ -56,18 +61,8 @@ async function buildApp() {
     hidePoweredBy: true,
   });
   // S12/SEC-003: CORS allowlist — strict origin validation, reject null, maxAge preflight caching
-  const devOrigins = [
-    'http://localhost:3000',
-    'http://localhost:3001',
-    'http://127.0.0.1:3000',
-    'http://127.0.0.1:3001',
-  ];
-  const defaultProdOrigins = ['https://itehaas.tailnet.ts.net', 'https://itehaas.local'];
-  const allowedOrigins = process.env.ALLOWED_ORIGIN
-    ? process.env.ALLOWED_ORIGIN.split(',').map((s) => s.trim()).filter(Boolean)
-    : config.isProd
-      ? defaultProdOrigins
-      : [...devOrigins, ...defaultProdOrigins];
+  // S12-fresh: list comes from lib/origins (single source shared with CSRF checks).
+  const allowedOrigins = getAllowedOrigins(process.env, config.isProd);
 
   await app.register(fastifyCors, {
     origin: (origin, cb) => {
@@ -80,6 +75,15 @@ async function buildApp() {
     methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'X-XSRF-Token', 'X-Requested-With'],
     maxAge: 86400,
+  });
+
+  // S12-fresh: Permissions-Policy (helmet v11 has no stable option for it here;
+  // a static hook is version-proof). Mirrors the web tier policy.
+  app.addHook('onSend', async (_req, reply, payload) => {
+    if (!reply.hasHeader('permissions-policy')) {
+      reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    }
+    return payload;
   });
 
   // Support empty JSON bodies gracefully without throwing FST_ERR_CTP_EMPTY_JSON_BODY

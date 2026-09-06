@@ -51,6 +51,17 @@ export function MarkdownViewer({ content, title = "README.md" }: MarkdownViewerP
                 </a>
               );
             },
+            // S11: defense in depth behind rehype-sanitize (whose schema already
+            // restricts img src to http/https). If the schema ever drifts, a
+            // javascript:/data: image source still renders as inert alt text.
+            img: ({ src, alt, ...props }: any) => {
+              const s = String(src || '');
+              if (/^\s*(javascript|data|vbscript):/i.test(s)) {
+                return <span className="text-fg-muted text-xs">[blocked image: {alt || 'unsafe source'}]</span>;
+              }
+              // eslint-disable-next-line @next/next/no-img-element
+              return <img src={s} alt={alt || ''} loading="lazy" {...props} />;
+            },
           }}
         >
           {content}

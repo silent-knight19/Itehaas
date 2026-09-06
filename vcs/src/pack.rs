@@ -11,57 +11,80 @@ use crate::object::store;
 /// Returns (pack_path, count, original_bytes, packed_bytes)
 
 pub fn create_pack(repo: &Path) -> Result<(PathBuf, usize, u64, u64)> {
-    let algo = crate::config::read_hasher(repo)?;
+    let _algo = crate::config::read_hasher(repo)?;
     let objects_dir = repo.join(".itehaas").join("objects");
     let pack_dir = objects_dir.join("pack");
     fs::create_dir_all(&pack_dir)?;
 
+    // S6-fresh (FSEC-009): two-pass streaming. The old code read every loose object
+    // into `entries: Vec<(String, Vec<u8>)>` before enforcing any limit — a repo with
+    // thousands of large blobs blew the heap. Pass 1 collects (hex, size) metadata
+    // only and enforces count/size budgets; pass 2 streams each file to the pack.
     // Collect reachable hashes (like gc)
-    let mut hashes: Vec<String> = Vec::new();
+    let mut metas: Vec<(String, PathBuf, u64)> = Vec::new();
     let mut original_bytes: u64 = 0;
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
 
     for entry in walkdir::WalkDir::new(&objects_dir).min_depth(2).max_depth(3) {
         let e = match entry { Ok(v)=>v, Err(_)=>continue };
         let path = e.path();
-        if !path.is_file() { continue; }
+        // S6-fresh: lstat — never follow a planted symlink inside the CAS.
+        let md = match fs::symlink_metadata(path) { Ok(m)=>m, Err(_)=>continue };
+        if !md.is_file() { continue; }
         if path.components().any(|c| c.as_os_str()=="pack") { continue; }
         let parent = path.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         let file = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        if parent.len()!=2 || file.len()!=62 { continue; }
+        // S6-fresh: strict fanout names — 2-hex dir, 62-hex (SHA-256) or 38-hex (SHA-1)
+        // file. The old `file.len()!=62` check silently dropped SHA-1 objects.
+        if parent.len() != 2 || !parent.chars().all(|c| c.is_ascii_hexdigit()) { continue; }
+        if (file.len() != 62 && file.len() != 38) || !file.chars().all(|c| c.is_ascii_hexdigit()) { continue; }
         let hex = format!("{}{}", parent, file);
-        let data = fs::read(path)?;
-        original_bytes += data.len() as u64;
-        entries.push((hex, data));
+        let len = md.len();
+        // S6/SEC-015: bound declared entry size before reading (heap-exhaustion guard).
+        if len > 64 * 1024 * 1024 {
+            return Err(crate::error::ItehaasError::InvalidObject(format!("pack entry too large: {} ({} bytes)", hex, len)));
+        }
+        original_bytes = original_bytes.saturating_add(len);
+        // S6/SEC-017: bound cumulative size before buffering anything.
+        if original_bytes > 512 * 1024 * 1024 {
+            return Err(crate::error::ItehaasError::Other("pack total uncompressed data exceeds 512 MiB limit".into()));
+        }
+        metas.push((hex, path.to_path_buf(), len));
     }
 
-    if entries.is_empty() {
+    if metas.is_empty() {
         return Err(crate::error::ItehaasError::Other("no objects to pack".into()));
     }
 
     // S6/SEC-017: limit pack size to prevent unbounded memory allocation
-    if entries.len() > 10000 {
-        return Err(crate::error::ItehaasError::InvalidObject(format!("pack too many entries: {}", entries.len())));
-    }
-    if original_bytes > 512 * 1024 * 1024 {
-        return Err(crate::error::ItehaasError::Other("pack total uncompressed data exceeds 512 MiB limit".into()));
+    if metas.len() > 10000 {
+        return Err(crate::error::ItehaasError::InvalidObject(format!("pack too many entries: {}", metas.len())));
     }
 
     // Sort for determinism
-    entries.sort_by(|a,b| a.0.cmp(&b.0));
+    metas.sort_by(|a,b| a.0.cmp(&b.0));
 
     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let pack_name = format!("pack-{:x}-{:x}.pack", timestamp, entries.len());
+    let pack_name = format!("pack-{:x}-{:x}.pack", timestamp, metas.len());
     let pack_path = pack_dir.join(pack_name);
     let mut out = fs::File::create(&pack_path)?;
 
     out.write_all(b"ITEHAAS PACK v1\n")?;
-    out.write_all(&(entries.len() as u32).to_be_bytes())?;
+    out.write_all(&(metas.len() as u32).to_be_bytes())?;
 
-    for (hex, data) in &entries {
+    let mut hashes = Vec::new();
+    for (hex, data_path, len) in &metas {
+        // Re-lstat at write time (TOCTOU: path swapped for a symlink/fifo between passes).
+        let md = fs::symlink_metadata(data_path).map_err(|_| crate::error::ItehaasError::Other(format!("pack entry vanished: {}", hex)))?;
+        if !md.is_file() || md.len() != *len {
+            return Err(crate::error::ItehaasError::Other(format!("pack entry changed during packing: {}", hex)));
+        }
+        let data = fs::read(data_path)?;
+        if data.len() as u64 != *len {
+            return Err(crate::error::ItehaasError::Other(format!("pack entry changed during packing: {}", hex)));
+        }
         out.write_all(hex.as_bytes())?;
         out.write_all(&(data.len() as u32).to_be_bytes())?;
-        out.write_all(data)?;
+        out.write_all(&data)?;
         hashes.push(hex.clone());
     }
 
@@ -70,7 +93,7 @@ pub fn create_pack(repo: &Path) -> Result<(PathBuf, usize, u64, u64)> {
     // Optionally we could delete loose objects after pack, but leave for gc to prune.
     // For now, keep loose; pack is additive.
 
-    Ok((pack_path, entries.len(), original_bytes, packed_bytes))
+    Ok((pack_path, metas.len(), original_bytes, packed_bytes))
 }
 
 pub fn list_packs(repo: &Path) -> Result<Vec<PathBuf>> {

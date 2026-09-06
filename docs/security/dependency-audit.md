@@ -15,11 +15,22 @@ A comprehensive dependency and supply chain security audit was performed across 
 
 | Package | Affected Versions | Current Resolution | Severity | Reachability Analysis | Disposition |
 |---|---|---|---|---|---|
-| `tar` | `<7.5.19` (critical DoS / arbitrary write) | Overridden to `7.5.19` via root `package.json:pnpm.overrides` | High (previously Critical) | Used transitively by `@mapbox/node-pre-gyp` during native module compilation (`argon2`). Uncontrolled recursion on member selection is not reachable in production server runtime. | **MITIGATE** (Lockfile overridden to `7.5.19`; 0 critical advisories). |
+| `tar` | ≤7.5.20 (uncontrolled recursion → stack-overflow DoS) | Overridden to `7.5.22` via root `package.json:pnpm.overrides` (S16-fresh bump from 7.5.19) | High | Used transitively by `@mapbox/node-pre-gyp` during native module compilation (`argon2`): install-time surface, not production runtime. | **UPGRADE** (Lockfile verified `tar@7.5.22`; 0 critical advisories). |
+| `postcss` | ≤8.5.11 / ≤8.5.17 (source-map disclosure + traversal) | Overridden to `8.5.18` via root overrides (S16-fresh; was ACCEPT/build-time-only) | High | Build-time CSS postprocessing (Next/Tailwind). Patched anyway — cheap, verified by green `web build`. | **UPGRADE**. |
+| `uuid` | <11.1.1 (buffer-bounds check) | Bumped `server` to `^11.1.1` (S16-fresh) | Moderate | Our single call is arg-less `v4()` (vulnerable path needs caller buffer) — patched regardless; runtime import verified. | **UPGRADE**. |
 | `next` | `<14.2.35` (cache poisoning / SSR DoS) | Upgraded to `14.2.35` in `web/package.json` and root overrides | High (previously Critical) | Next.js server actions and caching layer. Replaced vulnerable versions with patched `14.2.35`. | **UPGRADE** (Verified in `s16-deps.test.ts`). |
 | `vitest` | `<3.2.6` (test runner devDep) | Upgraded to `>=3.2.6` across workspaces | Moderate | DevDependency only. Not included in production bundles or runtime Docker containers. | **UPGRADE** (Pinned in devDependencies). |
 | `find-my-way` | `<9.7.0` (HTTP/2 route DoS) | Fastify 4.x transitively bundles `find-my-way@8.2.2` | High | Fastify server in Itehaas operates over HTTP/1.1 behind reverse proxies (Nginx / Cloudflare) with HTTP/2 disabled on node process. The HTTP/2 DoS vector is unreachable. | **ACCEPT / MITIGATED BY ARCHITECTURE** (Documented residual risk until Fastify 5 upgrade). |
-| `postcss` | `<8.5.18` (Source map path traversal) | Bundled transitively by Next.js / Geist | High | Build-time CSS postprocessing only. Does not execute on production request paths. | **ACCEPT** (Build-time only). |
+
+### Fresh S16 re-audit (2026-09-03)
+
+- `pnpm audit --prod`: 27 findings (3 low / 14 moderate / 10 high), **0 critical** — CI gate holds. Remaining highs require majors: `next` 8 (needs v15.5), `fastify` 1 + `find-my-way` 1 (need Fastify 5). Deferred with compensating controls (CSP, body caps, RL, custom JSON parser); no blind major upgrades.
+- `cargo audit` (fresh advisory DB, 1239 advisories, 143 crates): **clean, exit 0**.
+- `Cargo.lock`: 142 registry deps, zero `git+` sources.
+- `pino-pretty` was referenced by the dev logger but missing from manifests — added as devDep (dev boot could crash on first log write).
+- All prod manifests reviewed: every dependency imported somewhere; no typosquats; no install lifecycle scripts; `.env` ignored + untracked; tracked tree secret-scan clean.
+- Images: `node:20.18.1-alpine3.19` / `rust:1.80-alpine3.19` pinned; `postgres:16-alpine` floats minor (digest pinning deferred — no offline resolution).
+- Workflow: `permissions: contents: read`, strict `--frozen-lockfile` (fallback removed), `cargo-audit` installed in CI instead of soft-skipped.
 
 ---
 

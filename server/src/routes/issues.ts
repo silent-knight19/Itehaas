@@ -1,8 +1,9 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { query } from '../db';
+import { query, getClient } from '../db';
 import { getSessionUser, requireAuth } from '../middleware/auth';
 import { canRead, canWrite } from '../lib/permissions';
+import { parsePagination } from '../lib/budgets';
 
 function validateOwnerRepo(owner: string, repo: string) {
   return /^[a-zA-Z0-9._-]{1,100}$/.test(owner) && /^[a-zA-Z0-9._-]{1,100}$/.test(repo);
@@ -113,44 +114,69 @@ export async function issueRoutes(app: FastifyInstance) {
       if (m.rows.length === 0) return reply.status(400).send({ error: 'milestone not found' });
       milestoneId = m.rows[0].id;
     }
-    const res = await query(`INSERT INTO issues (repo_id, author_id, title, body, milestone_id) VALUES ($1,$2,$3,$4,$5) RETURNING id, title, body, status, milestone_id, created_at`, [repoMeta.id, user.id, title, body, milestoneId]);
-    const issueId = res.rows[0].id;
-    // Labels
-    for (const lname of labels) {
-      const l = await query(`SELECT id FROM labels WHERE repo_id=$1 AND name=$2`, [repoMeta.id, lname]);
-      let labelId: string;
-      if (l.rows.length === 0) {
-        // Auto-create label with default color if not exists
-        const nl = await query(`INSERT INTO labels (repo_id, name) VALUES ($1,$2) RETURNING id`, [repoMeta.id, lname]);
-        labelId = nl.rows[0].id;
-      } else labelId = l.rows[0].id;
-      await query(`INSERT INTO issue_labels (issue_id, label_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [issueId, labelId]);
-    }
-    // Assignees
-    for (const username of assignees) {
-      const u = await query(`SELECT id FROM users WHERE username=$1`, [username]);
-      if (u.rows.length === 0) continue;
-      await query(`INSERT INTO issue_assignees (issue_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [issueId, u.rows[0].id]);
-      try { await query(`INSERT INTO notifications (user_id, type, payload) VALUES ($1,'issue_assigned',$2)`, [u.rows[0].id, JSON.stringify({ repo: `${owner}/${repo}`, issue_id: issueId, title })]); } catch {}
-    }
-    await query(`INSERT INTO activity (repo_id, user_id, action, payload) VALUES ($1,$2,'issue_open', $3)`, [repoMeta.id, user.id, JSON.stringify({ issue_id: issueId, title })]);
-    // Mentions in title/body
-    try {
-      const text = `${title} ${body}`;
-      const mentionRegex = /@([a-zA-Z0-9._-]{3,32})/g;
-      const seen = new Set<string>();
-      let m: RegExpExecArray | null;
-      while ((m = mentionRegex.exec(text)) !== null) {
-        const uname = m[1];
-        if (uname === user.username || seen.has(uname)) continue;
-        seen.add(uname);
-        const u = await query(`SELECT id FROM users WHERE username=$1`, [uname]);
-        if (u.rows.length > 0) {
-          try { await query(`INSERT INTO notifications (user_id, type, payload) VALUES ($1,'mention',$2)`, [u.rows[0].id, JSON.stringify({ repo: `${owner}/${repo}`, issue_id: issueId, by: user.username })]); } catch {}
-        }
+    // S8: pre-validate label creation BEFORE the first write — a reader tagging an
+    // unknown label must get 403 without leaving an orphan issue row behind.
+    if (!canW && labels.length > 0) {
+      for (const lname of labels) {
+        const l = await query(`SELECT id FROM labels WHERE repo_id=$1 AND name=$2`, [repoMeta.id, lname]);
+        if (l.rows.length === 0) return reply.status(403).send({ error: 'label creation requires write permission' });
       }
-    } catch {}
-    const enriched = await enrichIssue(res.rows[0]);
+    }
+    // S8: atomic issue creation — issue + labels + assignees + activity + mention
+    // notifications commit together; a mid-write failure rolls back instead of
+    // leaving partial rows (uses getClient directly: universally mocked in tests).
+    const client = await getClient();
+    let issueRow: any;
+    try {
+      await client.query('BEGIN');
+      const res = await client.query(`INSERT INTO issues (repo_id, author_id, title, body, milestone_id) VALUES ($1,$2,$3,$4,$5) RETURNING id, title, body, status, milestone_id, created_at`, [repoMeta.id, user.id, title, body, milestoneId]);
+      issueRow = res.rows[0];
+      const issueId = issueRow.id;
+      // Labels — S3: readers on public repos may tag existing labels, but creating
+      // new labels requires write (pre-validated above, so this branch only auto-creates for writers).
+      for (const lname of labels) {
+        const l = await client.query(`SELECT id FROM labels WHERE repo_id=$1 AND name=$2`, [repoMeta.id, lname]);
+        let labelId: string;
+        if (l.rows.length === 0) {
+          // Auto-create label with default color if not exists
+          const nl = await client.query(`INSERT INTO labels (repo_id, name) VALUES ($1,$2) RETURNING id`, [repoMeta.id, lname]);
+          labelId = nl.rows[0].id;
+        } else labelId = l.rows[0].id;
+        await client.query(`INSERT INTO issue_labels (issue_id, label_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [issueId, labelId]);
+      }
+      // Assignees — S3: assigning requires write (prevents notification spam by strangers).
+      // Public reporters' assignee lists are silently dropped to preserve issue creation.
+      for (const username of (canW ? assignees : [])) {
+        const u = await client.query(`SELECT id FROM users WHERE username=$1`, [username]);
+        if (u.rows.length === 0) continue;
+        await client.query(`INSERT INTO issue_assignees (issue_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [issueId, u.rows[0].id]);
+        try { await client.query(`INSERT INTO notifications (user_id, type, payload) VALUES ($1,'issue_assigned',$2)`, [u.rows[0].id, JSON.stringify({ repo: `${owner}/${repo}`, issue_id: issueId, title })]); } catch {}
+      }
+      await client.query(`INSERT INTO activity (repo_id, user_id, action, payload) VALUES ($1,$2,'issue_open', $3)`, [repoMeta.id, user.id, JSON.stringify({ issue_id: issueId, title })]);
+      // Mentions in title/body
+      try {
+        const text = `${title} ${body}`;
+        const mentionRegex = /@([a-zA-Z0-9._-]{3,32})/g;
+        const seen = new Set<string>();
+        let m: RegExpExecArray | null;
+        while ((m = mentionRegex.exec(text)) !== null) {
+          const uname = m[1];
+          if (uname === user.username || seen.has(uname)) continue;
+          seen.add(uname);
+          const u = await client.query(`SELECT id FROM users WHERE username=$1`, [uname]);
+          if (u.rows.length > 0) {
+            try { await client.query(`INSERT INTO notifications (user_id, type, payload) VALUES ($1,'mention',$2)`, [u.rows[0].id, JSON.stringify({ repo: `${owner}/${repo}`, issue_id: issueId, by: user.username })]); } catch {}
+          }
+        }
+      } catch {}
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw e;
+    } finally {
+      client.release();
+    }
+    const enriched = await enrichIssue(issueRow);
     return reply.status(201).send({ issue: enriched });
   });
 
@@ -191,6 +217,12 @@ export async function issueRoutes(app: FastifyInstance) {
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
+    // S8: authorize every mutation BEFORE the first write — a 403/400 below must not
+    // leave a partially-updated issue behind (previously the title UPDATE ran before
+    // the label/assignee permission checks).
+    if (parsed.data.milestone !== undefined && !canW) return reply.status(403).send({ error: 'milestone changes require write permission' });
+    if (parsed.data.labels !== undefined && !canW) return reply.status(403).send({ error: 'label changes require write permission' });
+    if (parsed.data.assignees !== undefined && !canW) return reply.status(403).send({ error: 'assignee changes require write permission' });
     const fields: string[] = [];
     const vals: any[] = [];
     let idx = 1;
@@ -205,45 +237,65 @@ export async function issueRoutes(app: FastifyInstance) {
         fields.push(`milestone_id=$${idx++}`); vals.push(m.rows[0].id);
       }
     }
-    if (fields.length > 0) {
-      vals.push(id);
-      const res = await query(`UPDATE issues SET ${fields.join(', ')}, updated_at=now() WHERE id=$${idx} RETURNING id, title, body, status, milestone_id, updated_at`, vals);
-      if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
-    }
-    // Labels
-    if (parsed.data.labels !== undefined) {
-      await query(`DELETE FROM issue_labels WHERE issue_id=$1`, [id]);
-      for (const lname of parsed.data.labels) {
-        const l = await query(`SELECT id FROM labels WHERE repo_id=$1 AND name=$2`, [repoMeta.id, lname]);
-        let labelId: string;
-        if (l.rows.length === 0) {
-          const nl = await query(`INSERT INTO labels (repo_id, name) VALUES ($1,$2) RETURNING id`, [repoMeta.id, lname]);
-          labelId = nl.rows[0].id;
-        } else labelId = l.rows[0].id;
-        await query(`INSERT INTO issue_labels (issue_id, label_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [id, labelId]);
+    // S8: atomic issue update — scalar fields + label/assignee replacement commit
+    // together (repo-scoped UPDATE: defense in depth alongside the scoped SELECT above).
+    const pclient = await getClient();
+    try {
+      await pclient.query('BEGIN');
+      if (fields.length > 0) {
+        vals.push(id, repoMeta.id);
+        const res = await pclient.query(`UPDATE issues SET ${fields.join(', ')}, updated_at=now() WHERE id=$${idx} AND repo_id=$${idx + 1} RETURNING id, title, body, status, milestone_id, updated_at`, vals);
+        if (res.rows.length === 0) {
+          await pclient.query('ROLLBACK');
+          return reply.status(404).send({ error: 'not found' });
+        }
       }
-    }
-    // Assignees
-    if (parsed.data.assignees !== undefined) {
-      await query(`DELETE FROM issue_assignees WHERE issue_id=$1`, [id]);
-      for (const username of parsed.data.assignees) {
-        const u = await query(`SELECT id FROM users WHERE username=$1`, [username]);
-        if (u.rows.length === 0) continue;
-        await query(`INSERT INTO issue_assignees (issue_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [id, u.rows[0].id]);
+      // Labels
+      if (parsed.data.labels !== undefined) {
+        await pclient.query(`DELETE FROM issue_labels WHERE issue_id=$1`, [id]);
+        for (const lname of parsed.data.labels) {
+          const l = await pclient.query(`SELECT id FROM labels WHERE repo_id=$1 AND name=$2`, [repoMeta.id, lname]);
+          let labelId: string;
+          if (l.rows.length === 0) {
+            const nl = await pclient.query(`INSERT INTO labels (repo_id, name) VALUES ($1,$2) RETURNING id`, [repoMeta.id, lname]);
+            labelId = nl.rows[0].id;
+          } else labelId = l.rows[0].id;
+          await pclient.query(`INSERT INTO issue_labels (issue_id, label_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [id, labelId]);
+        }
       }
+      // Assignees
+      if (parsed.data.assignees !== undefined) {
+        await pclient.query(`DELETE FROM issue_assignees WHERE issue_id=$1`, [id]);
+        for (const username of parsed.data.assignees) {
+          const u = await pclient.query(`SELECT id FROM users WHERE username=$1`, [username]);
+          if (u.rows.length === 0) continue;
+          await pclient.query(`INSERT INTO issue_assignees (issue_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [id, u.rows[0].id]);
+        }
+      }
+      await pclient.query('COMMIT');
+    } catch (e) {
+      try { await pclient.query('ROLLBACK'); } catch {}
+      throw e;
+    } finally {
+      pclient.release();
     }
-    const res = await query(`SELECT i.id, i.title, i.body, i.status, i.milestone_id, i.updated_at FROM issues i WHERE i.id=$1`, [id]);
+    const res = await query(`SELECT i.id, i.title, i.body, i.status, i.milestone_id, i.updated_at FROM issues i WHERE i.id=$1 AND i.repo_id=$2`, [id, repoMeta.id]);
+    if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const enriched = await enrichIssue(res.rows[0]);
     return reply.send({ issue: enriched });
   });
 
-  // Comments
+  // Comments — S3: scope child lookups to the parent repo (BOLA: known UUID from
+  // another repo must not leak/accept via this repo's path).
   app.get('/api/repos/:owner/:repo/issues/:id/comments', async (req, reply) => {
     const { owner, repo, id } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     const repoMeta = await getRepoId(owner, repo);
     if (!repoMeta) return reply.status(404).send({ error: "not found" });
     const user = await getSessionUser(req as any);
     if (!(await canRead(repoMeta.id, user?.id ?? null, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
+    const parent = await query(`SELECT id FROM issues WHERE id=$1 AND repo_id=$2`, [id, repoMeta.id]);
+    if (parent.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     const res = await query(`SELECT c.id, c.body, c.created_at, u.username as author FROM issue_comments c JOIN users u ON c.author_id=u.id WHERE c.issue_id=$1 ORDER BY c.created_at`, [id]);
     return reply.send({ comments: res.rows });
   });
@@ -255,6 +307,7 @@ export async function issueRoutes(app: FastifyInstance) {
     const rlCom = crCom(req as any, 'comments', 30, 60 * 1000);
     if (!rlCom.allowed) return rlrCom(reply as any, rlCom.resetMs);
     const { owner, repo, id } = req.params as any;
+    if (!validateOwnerRepo(owner, repo)) return reply.status(400).send({ error: 'invalid owner/repo' });
     const repoMeta = await getRepoId(owner, repo);
     if (!repoMeta) return reply.status(404).send({ error: "not found" });
     if (!(await canRead(repoMeta.id, user.id, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
@@ -289,7 +342,10 @@ export async function issueRoutes(app: FastifyInstance) {
     if (!repoMeta) return reply.status(404).send({ error: "not found" });
     const user = await getSessionUser(req as any);
     if (!(await canRead(repoMeta.id, user?.id ?? null, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
-    const res = await query(`SELECT id, name, color, description FROM labels WHERE repo_id=$1 ORDER BY name`, [repoMeta.id]);
+    // S7: output budget.
+    const labelPage = parsePagination(req.query as any);
+    if ('error' in labelPage) return reply.status(400).send({ error: labelPage.error });
+    const res = await query(`SELECT id, name, color, description FROM labels WHERE repo_id=$1 ORDER BY name LIMIT $2 OFFSET $3`, [repoMeta.id, labelPage.limit, labelPage.offset]);
     return reply.send({ labels: res.rows });
   });
   app.post('/api/repos/:owner/:repo/labels', async (req, reply) => {
@@ -329,7 +385,10 @@ export async function issueRoutes(app: FastifyInstance) {
     if (!repoMeta) return reply.status(404).send({ error: "not found" });
     const user = await getSessionUser(req as any);
     if (!(await canRead(repoMeta.id, user?.id ?? null, repoMeta.visibility))) return reply.status(404).send({ error: 'not found' });
-    const res = await query(`SELECT id, title, description, due_date, status, created_at, updated_at FROM milestones WHERE repo_id=$1 ORDER BY created_at`, [repoMeta.id]);
+    // S7: output budget.
+    const msPage = parsePagination(req.query as any);
+    if ('error' in msPage) return reply.status(400).send({ error: msPage.error });
+    const res = await query(`SELECT id, title, description, due_date, status, created_at, updated_at FROM milestones WHERE repo_id=$1 ORDER BY created_at LIMIT $2 OFFSET $3`, [repoMeta.id, msPage.limit, msPage.offset]);
     return reply.send({ milestones: res.rows });
   });
   app.post('/api/repos/:owner/:repo/milestones', async (req, reply) => {
@@ -383,7 +442,7 @@ export async function issueRoutes(app: FastifyInstance) {
     if (fields.length === 0) return reply.status(400).send({ error: 'no fields' });
     vals.push(id);
     const res = await query(`UPDATE milestones SET ${fields.join(', ')}, updated_at=now() WHERE id=$${idx} AND repo_id=$${idx+1} RETURNING *`, [...vals, repoMeta.id]);
-    // Note: need correct placeholder count
+    if (res.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     return reply.send({ milestone: res.rows[0] });
   });
 }

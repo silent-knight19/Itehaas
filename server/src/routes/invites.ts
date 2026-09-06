@@ -20,6 +20,10 @@ export async function inviteRoutes(app: FastifyInstance) {
   app.post('/api/orgs/:org/invites', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: invite spam class — 10/min.
+    { const { checkRateLimit: crInv, rateLimitReply: rlrInv } = await import('../lib/rateLimit');
+      const rlInv = crInv(req as any, 'invites', 10, 60 * 1000);
+      if (!rlInv.allowed) return rlrInv(reply as any, rlInv.resetMs); }
     const { org } = req.params as any;
     const orgRes = await query(`SELECT id FROM organizations WHERE name=$1`, [org]);
     if (orgRes.rows.length === 0) return reply.status(404).send({ error: 'org not found' });
@@ -53,6 +57,10 @@ export async function inviteRoutes(app: FastifyInstance) {
   app.post('/api/repos/:owner/:repo/invites', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: invite spam class — 10/min.
+    { const { checkRateLimit: crInv, rateLimitReply: rlrInv } = await import('../lib/rateLimit');
+      const rlInv = crInv(req as any, 'invites', 10, 60 * 1000);
+      if (!rlInv.allowed) return rlrInv(reply as any, rlInv.resetMs); }
     const { owner, repo } = req.params as any;
     const repoRes = await query(`SELECT r.id FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (repoRes.rows.length === 0) return reply.status(404).send({ error: 'not found' });
@@ -85,6 +93,10 @@ export async function inviteRoutes(app: FastifyInstance) {
   app.post('/api/orgs/:org/teams/:team/invites', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: invite spam class — 10/min.
+    { const { checkRateLimit: crInv, rateLimitReply: rlrInv } = await import('../lib/rateLimit');
+      const rlInv = crInv(req as any, 'invites', 10, 60 * 1000);
+      if (!rlInv.allowed) return rlrInv(reply as any, rlInv.resetMs); }
     const { org, team } = req.params as any;
     const orgRes = await query(`SELECT id FROM organizations WHERE name=$1`, [org]);
     if (orgRes.rows.length === 0) return reply.status(404).send({ error: 'org not found' });
@@ -121,6 +133,10 @@ export async function inviteRoutes(app: FastifyInstance) {
   app.post('/api/invites/:token/accept', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: token-guessing defense in depth (256-bit tokens; RL is a backstop) — 20/min.
+    { const { checkRateLimit: crClm, rateLimitReply: rlrClm } = await import('../lib/rateLimit');
+      const rlClm = crClm(req as any, 'invites_claim', 20, 60 * 1000);
+      if (!rlClm.allowed) return rlrClm(reply as any, rlClm.resetMs); }
     const { token } = req.params as any;
     const client = await getClient();
     try {
@@ -171,15 +187,25 @@ export async function inviteRoutes(app: FastifyInstance) {
     }
   });
 
-  // Reject invite
+  // Reject invite — S3: same ownership/expiry gates as accept (a leaked token must not
+  // let strangers reject others' invites, and expired invites must expire, not linger).
   app.post('/api/invites/:token/reject', async (req, reply) => {
     const user = await requireAuth(req, reply);
     if (!user) return;
+    // S14: token-guessing defense in depth (256-bit tokens; RL is a backstop) — 20/min.
+    { const { checkRateLimit: crClm, rateLimitReply: rlrClm } = await import('../lib/rateLimit');
+      const rlClm = crClm(req as any, 'invites_claim', 20, 60 * 1000);
+      if (!rlClm.allowed) return rlrClm(reply as any, rlClm.resetMs); }
     const { token } = req.params as any;
     const invRes = await query(`SELECT * FROM invites WHERE token=$1 AND status='pending'`, [token]);
     if (invRes.rows.length === 0) return reply.status(404).send({ error: 'invite not found' });
     const inv = invRes.rows[0];
+    if (inv.expires_at && new Date(inv.expires_at) < new Date()) {
+      await query(`UPDATE invites SET status='expired' WHERE id=$1`, [inv.id]);
+      return reply.status(410).send({ error: 'invite expired' });
+    }
     if (inv.invited_user_id && inv.invited_user_id !== user.id) return reply.status(403).send({ error: 'not for you' });
+    if (!inv.invited_user_id && inv.email && inv.email !== user.email) return reply.status(403).send({ error: 'email mismatch' });
     await query(`UPDATE invites SET status='rejected' WHERE id=$1`, [inv.id]);
     return reply.send({ ok: true });
   });
