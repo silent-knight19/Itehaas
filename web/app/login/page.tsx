@@ -1,8 +1,7 @@
 "use client";
 import React, { useState } from "react";
-import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowRight, AlertCircle } from "lucide-react";
+import { ArrowRight, AlertCircle, Loader2 } from "lucide-react";
 import { Api } from "../../lib/api";
 import { useToast } from "../../components/Toast";
 import { Logo } from "../../components/Logo";
@@ -12,36 +11,40 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const router = useRouter();
   const { toast } = useToast();
 
   React.useEffect(() => {
     Api.me().then((res) => {
       if (res.ok && res.json?.user) {
-        router.replace("/");
+        window.location.href = "/";
       }
     });
-  }, [router]);
+  }, []);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    const cleanUsername = username.trim();
+    if (!cleanUsername || !password) {
+      setErr("Please enter both username and password.");
+      return;
+    }
+
     setLoading(true);
     setErr(null);
 
-    const res = await Api.login({ username: username.trim(), password });
-    setLoading(false);
-
-    if (res.ok) {
-      toast("Signed in", "success");
-      router.push("/");
-    } else {
-      setErr(res.json?.error || "Invalid username or password.");
+    try {
+      const res = await Api.login({ username: cleanUsername, password });
+      if (res.ok) {
+        toast("Signed in successfully", "success");
+        window.location.href = "/";
+      } else {
+        setLoading(false);
+        setErr(res.json?.error || "Invalid username or password.");
+      }
+    } catch (e: any) {
+      setLoading(false);
+      setErr(e.message || "Failed to connect to authentication server.");
     }
-  }
-
-  function fillDemo() {
-    setUsername("demo_user");
-    setPassword("demopassword123");
   }
 
   return (
@@ -66,15 +69,19 @@ export default function LoginPage() {
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="space-y-3">
+          <form onSubmit={handleSubmit} className="space-y-3" autoComplete="on">
             <div className="space-y-1">
-              <label className="text-xs font-medium text-fg-secondary">
+              <label htmlFor="login-username" className="text-xs font-medium text-fg-secondary">
                 Username or Email
               </label>
               <input
+                id="login-username"
+                name="username"
+                type="text"
+                autoComplete="username"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="demo_user"
+                placeholder="Enter username or email"
                 required
                 autoFocus
                 className="w-full rounded-sm border border-border-default bg-bg-subtle px-3 py-1.5 text-xs text-fg placeholder-fg-subtle focus:border-border-emphasis focus:outline-none"
@@ -82,11 +89,14 @@ export default function LoginPage() {
             </div>
 
             <div className="space-y-1">
-              <label className="text-xs font-medium text-fg-secondary">
+              <label htmlFor="login-password" className="text-xs font-medium text-fg-secondary">
                 Password
               </label>
               <input
+                id="login-password"
+                name="password"
                 type="password"
+                autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••••••"
@@ -100,25 +110,23 @@ export default function LoginPage() {
               disabled={loading}
               className="w-full flex items-center justify-center gap-1.5 rounded-sm bg-accent py-1.5 text-xs font-medium text-white hover:bg-accent-hover disabled:opacity-50 transition-colors"
             >
-              <span>{loading ? "Signing in…" : "Sign In"}</span>
-              <ArrowRight className="h-3 w-3" />
+              {loading ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <span>Signing in…</span>
+                </>
+              ) : (
+                <>
+                  <span>Sign In</span>
+                  <ArrowRight className="h-3 w-3" />
+                </>
+              )}
             </button>
           </form>
 
-          {/* Demo helper */}
-          <div className="rounded-xs border border-border-subtle bg-bg-subtle p-2 text-center">
-            <button
-              type="button"
-              onClick={fillDemo}
-              className="text-xs text-fg-muted hover:text-fg font-mono transition-colors"
-            >
-              Fill demo credentials (demo_user)
-            </button>
-          </div>
-
-          <div className="text-center text-xs text-fg-muted">
+          <div className="text-center text-xs text-fg-muted pt-1 border-t border-border-subtle">
             No account yet?{" "}
-            <Link href="/register" className="text-fg-secondary hover:text-fg underline">
+            <Link href="/register" className="text-fg-secondary hover:text-fg underline font-medium">
               Create account
             </Link>
           </div>

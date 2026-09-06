@@ -6,6 +6,7 @@ import { cleanupExpiredSessions, requireAuth } from '../middleware/auth';
 import { checkRateLimit, rateLimitReply, isLoginLocked, recordLoginFail, clearLoginFails, getLoginLockMs } from '../lib/rateLimit';
 import * as argon2 from 'argon2';
 import { auditLog } from '../lib/audit';
+import { config } from '../config';
 
 // Dummy hash for timing-equalization when user not found (argon2id, m=65536, t=3, p=1)
 // Generated from `argon2.hash('dummy-timing-password-for-enumeration-mitigation', {type:argon2id,memoryCost:65536,timeCost:3,parallelism:1})`
@@ -30,13 +31,14 @@ async function getDummyHash(): Promise<string> {
 export async function authRoutes(app: FastifyInstance) {
   // Register
   app.post('/api/auth/register', async (req, reply) => {
-    // S2: rate-limit register 3/min per IP (brute-force / enumeration)
-    const rlReg = checkRateLimit(req as any, 'register', 3, 60 * 1000);
+    // S2: rate-limit register 3/min per IP (brute-force / enumeration) in test/prod, relaxed in dev
+    const regLimit = config.nodeEnv === 'development' ? 30 : 3;
+    const rlReg = checkRateLimit(req as any, 'register', regLimit, 60 * 1000);
     if (!rlReg.allowed) return rateLimitReply(reply, rlReg.resetMs);
     await cleanupExpiredSessions();
     const schema = z.object({
-      username: z.string().min(3).max(32),
-      email: z.string().max(255).email(),
+      username: z.string().trim().min(3).max(32),
+      email: z.string().trim().toLowerCase().max(255).email(),
       password: z.string().min(8).max(128),
     });
     const parsed = schema.safeParse(req.body);
@@ -44,10 +46,12 @@ export async function authRoutes(app: FastifyInstance) {
       return reply.status(400).send({ error: parsed.error.issues[0].message });
     }
     const { username, email, password } = parsed.data;
+    const cleanUsername = username.trim();
+    const cleanEmail = email.trim().toLowerCase();
 
-    const uErr = validateUsername(username);
+    const uErr = validateUsername(cleanUsername);
     if (uErr) return reply.status(400).send({ error: uErr });
-    const eErr = validateEmail(email);
+    const eErr = validateEmail(cleanEmail);
     if (eErr) return reply.status(400).send({ error: eErr });
     const pErr = validatePassword(password);
     if (pErr) return reply.status(400).send({ error: pErr });
@@ -57,7 +61,7 @@ export async function authRoutes(app: FastifyInstance) {
     try {
       const res = await query(
         `INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, created_at`,
-        [username, email, hash]
+        [cleanUsername, cleanEmail, hash]
       );
       const user = res.rows[0];
       // S18: audit register
@@ -67,6 +71,7 @@ export async function authRoutes(app: FastifyInstance) {
       const expires = newSessionExpiry();
       const sess = await query(`INSERT INTO sessions (user_id, expires_at) VALUES ($1, $2) RETURNING id`, [user.id, expires]);
       const sessionId = sess.rows[0].id;
+      const csrfToken = csrfTokenForSession(sessionId);
 
       reply.setCookie(sessionCookieName(), sessionId, {
         path: '/',
@@ -76,7 +81,7 @@ export async function authRoutes(app: FastifyInstance) {
         expires,
       });
       // S11: set csrf_token double-submit cookie
-      reply.setCookie('csrf_token', csrfTokenForSession(sessionId), {
+      reply.setCookie('csrf_token', csrfToken, {
         path: '/',
         httpOnly: false,
         secure: process.env.NODE_ENV === 'production',
@@ -84,7 +89,10 @@ export async function authRoutes(app: FastifyInstance) {
         expires,
       });
 
-      return reply.status(201).send({ user: { id: user.id, username: user.username, email: user.email, created_at: user.created_at } });
+      return reply.status(201).send({
+        user: { id: user.id, username: user.username, email: user.email, created_at: user.created_at },
+        csrf_token: csrfToken,
+      });
     } catch (e: any) {
       if (e.code === '23505') {
         // S2: generic 409 to avoid enumeration (don't reveal which field)
@@ -97,55 +105,62 @@ export async function authRoutes(app: FastifyInstance) {
 
   // Login
   app.post('/api/auth/login', async (req, reply) => {
-    // S2: global login rate-limit 5/min per IP
-    const rlLogin = checkRateLimit(req as any, 'login', 5, 60 * 1000);
+    // S2: global login rate-limit 5/min per IP in test/prod, relaxed in dev
+    const loginLimit = config.nodeEnv === 'development' ? 60 : 5;
+    const rlLogin = checkRateLimit(req as any, 'login', loginLimit, 60 * 1000);
     if (!rlLogin.allowed) return rateLimitReply(reply, rlLogin.resetMs);
     await cleanupExpiredSessions();
     // S2-fresh: bound input lengths BEFORE argon2 (fail fast on CPU-bomb payloads).
     // Attack: 10MB password → argon2.verify burn. Register caps at 128; login must match.
     const schema = z.object({
-      username: z.string().min(1).max(255),
+      username: z.string().trim().min(1).max(255),
       password: z.string().min(1).max(128),
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.issues[0].message });
     const { username, password } = parsed.data;
+    const cleanUsername = username.trim();
+    const lockoutKey = cleanUsername.toLowerCase();
 
     // S2: brute-force lockout 5 fails → 15m per username+ip
-    if (isLoginLocked(req as any, username)) {
-      const until = getLoginLockMs(req as any, username);
+    if (isLoginLocked(req as any, lockoutKey)) {
+      const until = getLoginLockMs(req as any, lockoutKey);
       const retrySec = Math.max(1, Math.ceil((until - Date.now()) / 1000));
       reply.header('Retry-After', String(retrySec));
       // S18: lockout is a detection signal (credential-stuffing indicator).
-      await auditLog({ action: 'auth.lockout', target: username, req });
+      await auditLog({ action: 'auth.lockout', target: cleanUsername, req });
       return reply.status(429).send({ error: 'too many failed attempts, try again later' });
     }
 
-    const res = await query(`SELECT id, username, email, password_hash, created_at FROM users WHERE username = $1 OR email = $1`, [username]);
+    const res = await query(
+      `SELECT id, username, email, password_hash, created_at FROM users WHERE username = $1 OR email = $1 OR LOWER(username) = LOWER($1) OR LOWER(email) = LOWER($1)`,
+      [cleanUsername]
+    );
     if (res.rows.length === 0) {
       // S2: timing-equalization — do dummy argon2 verify so no-user vs wrong-pw timing similar
       try {
         const dummy = await getDummyHash();
         await verifyPassword(dummy, password);
       } catch {}
-      recordLoginFail(req as any, username);
+      recordLoginFail(req as any, lockoutKey);
       // S18: audit login failure (no user)
-      await auditLog({ action: 'auth.login_failure', target: username, req });
+      await auditLog({ action: 'auth.login_failure', target: cleanUsername, req });
       return reply.status(401).send({ error: 'invalid credentials' });
     }
     const user = res.rows[0];
     const ok = await verifyPassword(user.password_hash, password);
     if (!ok) {
-      recordLoginFail(req as any, username);
+      recordLoginFail(req as any, lockoutKey);
       // S18: audit login failure (wrong pw)
       await auditLog({ userId: user.id, action: 'auth.login_failure', target: user.username, req });
       return reply.status(401).send({ error: 'invalid credentials' });
     }
-    clearLoginFails(req as any, username);
+    clearLoginFails(req as any, lockoutKey);
 
     const expires = newSessionExpiry();
     const sess = await query(`INSERT INTO sessions (user_id, expires_at) VALUES ($1, $2) RETURNING id`, [user.id, expires]);
     const sessionId = sess.rows[0].id;
+    const csrfToken = csrfTokenForSession(sessionId);
 
     reply.setCookie(sessionCookieName(), sessionId, {
       path: '/',
@@ -155,7 +170,7 @@ export async function authRoutes(app: FastifyInstance) {
       expires,
     });
     // S11: set csrf_token
-    reply.setCookie('csrf_token', csrfTokenForSession(sessionId), {
+    reply.setCookie('csrf_token', csrfToken, {
       path: '/',
       httpOnly: false,
       secure: process.env.NODE_ENV === 'production',
@@ -165,13 +180,16 @@ export async function authRoutes(app: FastifyInstance) {
 
     // S18: audit login success
     await auditLog({ userId: user.id, action: 'auth.login_success', target: user.username, req });
-    return reply.send({ user: { id: user.id, username: user.username, email: user.email, created_at: user.created_at } });
+    return reply.send({
+      user: { id: user.id, username: user.username, email: user.email, created_at: user.created_at },
+      csrf_token: csrfToken,
+    });
   });
 
   // Logout
   app.post('/api/auth/logout', async (req, reply) => {
     // S2-fresh: validate UUID shape before DB hit (fail closed on garbage, no oracle).
-    const sessionId = (req.cookies as any)[sessionCookieName()];
+    const sessionId = (req.cookies as any)?.[sessionCookieName()];
     if (sessionId && /^[0-9a-fA-F-]{36}$/.test(sessionId)) {
       await query(`DELETE FROM sessions WHERE id = $1`, [sessionId]);
     }
@@ -182,7 +200,7 @@ export async function authRoutes(app: FastifyInstance) {
 
   // Me
   app.get('/api/auth/me', async (req, reply) => {
-    const sessionId = (req.cookies as any)[sessionCookieName()];
+    const sessionId = (req.cookies as any)?.[sessionCookieName()];
     if (!sessionId) return reply.status(401).send({ error: 'not authenticated' });
 
     const res = await query(
@@ -191,11 +209,16 @@ export async function authRoutes(app: FastifyInstance) {
     );
     if (res.rows.length === 0) {
       reply.clearCookie(sessionCookieName(), { path: '/' });
+      reply.clearCookie('csrf_token', { path: '/' });
       return reply.status(401).send({ error: 'not authenticated' });
     }
 
     const user = res.rows[0];
-    return reply.send({ user: { id: user.id, username: user.username, email: user.email, created_at: user.created_at } });
+    const csrfToken = csrfTokenForSession(sessionId);
+    return reply.send({
+      user: { id: user.id, username: user.username, email: user.email, created_at: user.created_at },
+      csrf_token: csrfToken,
+    });
   });
 
   // Change password (re-authentication required)

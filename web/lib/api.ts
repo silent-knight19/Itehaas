@@ -1,15 +1,48 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+let inMemoryCsrfToken: string | undefined = undefined;
 
-export type FetchOpts = RequestInit & { auth?: boolean };
+export function setCsrfToken(token?: string) {
+  inMemoryCsrfToken = token;
+}
 
-function getCsrfToken(): string | undefined {
+export function getCsrfToken(): string | undefined {
+  if (inMemoryCsrfToken) return inMemoryCsrfToken;
   if (typeof document === 'undefined') return undefined;
   const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
   return match ? decodeURIComponent(match[1]) : undefined;
 }
 
+export function getBaseUrl(): string {
+  const envUrl = process.env.NEXT_PUBLIC_API_URL;
+  if (envUrl !== undefined && envUrl !== '') {
+    if (typeof window !== 'undefined') {
+      try {
+        const parsed = new URL(envUrl);
+        // If both frontend and configured API URL are on localhost/127.0.0.1,
+        // use same-origin relative path so browser cookies and CSRF are completely same-origin.
+        if (
+          (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') &&
+          (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+        ) {
+          return '';
+        }
+      } catch {}
+    }
+    return envUrl.replace(/\/+$/, '');
+  }
+  // Browser default: use relative path proxied by Next.js rewrites
+  if (typeof window !== 'undefined') {
+    return '';
+  }
+  // SSR fallback
+  return (process.env.INTERNAL_API_URL || 'http://127.0.0.1:3001').replace(/\/+$/, '');
+}
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+
+export type FetchOpts = RequestInit & { auth?: boolean };
+
 export async function api(path: string, opts: FetchOpts = {}) {
-  const url = `${API_URL}${path}`;
+  const url = `${getBaseUrl()}${path}`;
   try {
     const headers: Record<string, string> = {};
     if (opts.body) {
@@ -35,6 +68,9 @@ export async function api(path: string, opts: FetchOpts = {}) {
     } catch {
       json = { raw: text };
     }
+    if (json?.csrf_token) {
+      setCsrfToken(json.csrf_token);
+    }
     return { res, json, ok: res.ok, status: res.status };
   } catch (err: any) {
     return {
@@ -56,7 +92,11 @@ export const Api = {
     api('/api/auth/register', { method: 'POST', body: JSON.stringify(payload) }),
   login: (payload: { username: string; password: string }) =>
     api('/api/auth/login', { method: 'POST', body: JSON.stringify(payload) }),
-  logout: () => api('/api/auth/logout', { method: 'POST' }),
+  logout: async () => {
+    const res = await api('/api/auth/logout', { method: 'POST' });
+    setCsrfToken(undefined);
+    return res;
+  },
 
   // Repositories
   listRepos: (options?: { mine?: boolean; all?: boolean; search?: string; limit?: number; offset?: number }) => {

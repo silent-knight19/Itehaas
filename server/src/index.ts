@@ -53,6 +53,7 @@ async function buildApp() {
         baseUri: ["'self'"],
       },
     },
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
     hsts: { maxAge: 63072000, includeSubDomains: true, preload: true },
     noSniff: true,
     frameguard: { action: 'deny' },

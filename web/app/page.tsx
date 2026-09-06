@@ -1,7 +1,7 @@
 "use client";
 import React, { useEffect, useState, Suspense } from "react";
 import Link from "next/link";
-import { useSearchParams, useRouter } from "next/navigation";
+import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import {
   FolderGit2,
   Plus,
@@ -49,6 +49,7 @@ function DashboardContent() {
 
   const searchParams = useSearchParams();
   const router = useRouter();
+  const pathname = usePathname();
   const { toast } = useToast();
 
   async function loadData() {
@@ -85,7 +86,7 @@ function DashboardContent() {
     if (searchParams.get("create") === "true") {
       setModalOpen(true);
     }
-  }, [searchParams, scope]);
+  }, [searchParams, scope, pathname]);
 
   async function handleCreateRepo(e: React.FormEvent) {
     e.preventDefault();
