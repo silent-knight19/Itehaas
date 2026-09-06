@@ -5,17 +5,25 @@ const isDev = process.env.NODE_ENV !== 'production';
 // split-port deployments (web :3000, api :3001) or via Tailscale names. A static
 // `connect-src 'self'` in production would fail closed on legitimate API calls,
 // so the configured API origin is allowlisted explicitly (still no wildcards).
-let apiConnectSrc = '';
-try {
-  const apiOrigin = new URL(process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001').origin;
-  if (apiOrigin && apiOrigin !== 'null') apiConnectSrc = ` ${apiOrigin}`;
-} catch {
-  // Unparseable API URL: keep strict 'self' only (fail closed).
+const candidateOrigins = [];
+for (const envVal of [process.env.NEXT_PUBLIC_API_URL, process.env.INTERNAL_API_URL]) {
+  if (envVal) {
+    try {
+      const parsed = new URL(envVal).origin;
+      if (parsed && parsed !== 'null') candidateOrigins.push(parsed);
+    } catch {}
+  }
 }
+if (candidateOrigins.length === 0) {
+  candidateOrigins.push('http://localhost:3001');
+}
+const apiConnectSrc = Array.from(new Set(candidateOrigins)).map((o) => ` ${o}`).join('');
 
+// Next.js App Router streaming & hydration requires inline scripts (self.__next_f.push).
+// In production without nonces, script-src MUST include 'unsafe-inline' (while omitting 'unsafe-eval').
 const cspHeader = isDev
   ? "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*; frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
-  : `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'${apiConnectSrc}; frame-ancestors 'none'; object-src 'none'; base-uri 'self'`;
+  : `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'${apiConnectSrc}; frame-ancestors 'none'; object-src 'none'; base-uri 'self'`;
 
 const nextConfig = {
   reactStrictMode: true,

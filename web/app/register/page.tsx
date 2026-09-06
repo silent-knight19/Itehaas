@@ -94,11 +94,7 @@ export default function RegisterPage() {
           )}
 
           <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleSubmit(e);
-            }}
-            action="javascript:void(0);"
+            onSubmit={handleSubmit}
             className="space-y-3"
             autoComplete="on"
           >
