@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile: compiles Rust VCS for target container architecture (SEC-026)
-FROM rust:1.80-alpine3.19 AS vcs-builder
+FROM rust:alpine AS vcs-builder
 WORKDIR /workspace
 RUN apk add --no-cache musl-dev
 COPY Cargo.toml Cargo.lock ./
