@@ -224,6 +224,16 @@ export function execItehaas(args: string[], opts: { cwd?: string; input?: string
         }
       }
 
+      // Ensure cwd exists if specified to prevent posix_spawn ENOENT crash
+      if (opts.cwd && !fs.existsSync(opts.cwd)) {
+        vcsSemaphore.release();
+        return resolve({
+          stdout: '',
+          stderr: `fatal: not a repository (directory does not exist: ${opts.cwd})`,
+          code: 1,
+        });
+      }
+
       // S5: never shell out — argv array only. shell:false is explicit (fail closed
       // against any future default change) and stdin is ignored unless the caller
       // supplies input, so a child waiting on stdin cannot wedge the semaphore.

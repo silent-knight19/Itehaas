@@ -138,6 +138,14 @@ export async function secureRepoParentDirs(repoPath: string): Promise<void> {
   } catch {}
 }
 
+// Ensure repo exists on disk (handles ephemeral cloud containers where DB is persistent but container disk resets)
+export async function ensureRepoOnDisk(repoPath: string): Promise<void> {
+  if (!fs.existsSync(path.join(repoPath, '.itehaas'))) {
+    await secureRepoParentDirs(repoPath);
+    await execItehaas(['init', repoPath]);
+  }
+}
+
 // S7: isAncestor cache (60s TTL)
 const isAncestorCache = new Map<string, { value: boolean; expires: number }>();
 function isAncestorCacheKey(repoPath: string, ancestor: string, descendant: string): string {
@@ -680,6 +688,7 @@ export async function repoRoutes(app: FastifyInstance) {
 
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    await ensureRepoOnDisk(repoPath);
 
     // Read hasher
     let hasher = 'sha256';
@@ -854,6 +863,7 @@ export async function repoRoutes(app: FastifyInstance) {
 
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    await ensureRepoOnDisk(repoPath);
 
     // Enforce size via Content-Length header if present
     const cl = (req.headers['content-length'] as string | undefined);
@@ -1027,6 +1037,7 @@ export async function repoRoutes(app: FastifyInstance) {
       await releaseDbLock();
       return reply.status(400).send({ error: e.message });
     }
+    await ensureRepoOnDisk(repoPath);
 
     const refPath = path.join(repoPath, '.itehaas', 'refs', 'heads', ...branch.split('/'));
     const lockPath = refPath + '.lock';
@@ -1259,6 +1270,7 @@ export async function repoRoutes(app: FastifyInstance) {
 
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    await ensureRepoOnDisk(repoPath);
     const maxCount = Math.min(Math.max(parseInt((req.query as any)?.max_count ?? '100', 10) || 100, 1), 200);
     const wantFull = (req.query as any)?.full === '1' || (req.query as any)?.full === 'true';
 
@@ -1722,6 +1734,7 @@ export async function repoRoutes(app: FastifyInstance) {
 
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    await ensureRepoOnDisk(repoPath);
     if (!/^[0-9a-f]{64}$/.test(hash)) return reply.status(400).send({ error: 'invalid hash' });
     const res = await execItehaas(['cat-file', '-p', hash], { cwd: repoPath });
     if (res.code !== 0) return reply.status(404).send({ error: 'not found' });
@@ -1750,6 +1763,7 @@ export async function repoRoutes(app: FastifyInstance) {
     if (branch !== 'HEAD' && !isValidBranchRef(branch)) return reply.status(400).send({ error: 'invalid ref' });
     let repoPath: string;
     try { repoPath = repoPathFor(owner, repo); } catch (e: any) { return reply.status(400).send({ error: e.message }); }
+    await ensureRepoOnDisk(repoPath);
     // Resolve branch to commit
     const branchRes = await execItehaas(['branch'], { cwd: repoPath });
     if (branchRes.code !== 0) return reply.status(404).send({ error: 'repo not initialized' });
