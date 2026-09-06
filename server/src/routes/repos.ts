@@ -845,10 +845,11 @@ export async function repoRoutes(app: FastifyInstance) {
     const r = await query(`SELECT r.id, r.visibility FROM repositories r JOIN users u ON r.owner_id=u.id WHERE u.username=$1 AND r.name=$2`, [owner, repo]);
     if (r.rows.length === 0) return reply.status(404).send({ error: 'not found' });
     if (!(await canWrite(r.rows[0].id, user.id))) return reply.status(403).send({ error: 'forbidden: write required' });
-    // Note: canWrite returns false for private anon, but canWrite checks isOwner or role write/admin; private push needs write, else 403
-    // S14: 64M uploads with inflate+hash CPU cost — 20/min per client.
+    // S14: 64M uploads with inflate+hash CPU cost (default 20 in test, 500 in prod/dev; configurable via OBJECT_UPLOAD_RATE_LIMIT).
     const { checkRateLimit: checkRLObj, rateLimitReply: rlObj } = await import('../lib/rateLimit');
-    const rlObjRes = checkRLObj(req as any, 'object_upload', 20, 60 * 1000);
+    const defaultObjLimit = process.env.NODE_ENV === 'test' ? 20 : 500;
+    const objLimit = parseInt(process.env.OBJECT_UPLOAD_RATE_LIMIT || String(defaultObjLimit), 10);
+    const rlObjRes = checkRLObj(req as any, 'object_upload', objLimit, 60 * 1000);
     if (!rlObjRes.allowed) return rlObj(reply as any, rlObjRes.resetMs);
 
     let repoPath: string;

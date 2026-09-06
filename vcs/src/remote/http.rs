@@ -632,19 +632,33 @@ pub fn upload_object_http(
     let url = format!("{}/objects/{}", base, hex);
     let token = token_from_env();
     let ag = agent();
-    let req = ag.post(&url);
-    let req = apply_auth(req, &token);
-    let req = req.set("Content-Type", "application/octet-stream");
-    let resp = req
-        .send_bytes(&data)
-        .map_err(|e| match e {
-            ureq::Error::Status(401, _) | ureq::Error::Status(403, _) => {
-                anyhow::anyhow!("push: authentication required (401/403); set ITEHAAS_TOKEN")
+    let mut attempts = 0;
+    let resp = loop {
+        attempts += 1;
+        let req = ag.post(&url);
+        let req = apply_auth(req, &token);
+        let req = req.set("Content-Type", "application/octet-stream");
+        match req.send_bytes(&data) {
+            Ok(r) => break r,
+            Err(ureq::Error::Status(429, resp)) if attempts <= 5 => {
+                let delay = resp.header("retry-after")
+                    .and_then(|h| h.parse::<u64>().ok())
+                    .unwrap_or(2);
+                std::thread::sleep(std::time::Duration::from_secs(delay.min(5)));
+                continue;
             }
-            ureq::Error::Status(409, _) => anyhow::anyhow!("push: remote rejected (conflict)"),
-            ureq::Error::Status(code, _) => anyhow::anyhow!("push: http {} uploading object {}", code, &hex[..7]),
-            ureq::Error::Transport(t) => anyhow::anyhow!("network error uploading object {}: {}", &hex[..7], t),
-        })?;
+            Err(e) => {
+                return Err(match e {
+                    ureq::Error::Status(401, _) | ureq::Error::Status(403, _) => {
+                        anyhow::anyhow!("push: authentication required (401/403); set ITEHAAS_TOKEN")
+                    }
+                    ureq::Error::Status(409, _) => anyhow::anyhow!("push: remote rejected (conflict)"),
+                    ureq::Error::Status(code, _) => anyhow::anyhow!("push: http {} uploading object {}", code, &hex[..7]),
+                    ureq::Error::Transport(t) => anyhow::anyhow!("network error uploading object {}: {}", &hex[..7], t),
+                });
+            }
+        }
+    };
     if resp.status() != 200 && resp.status() != 201 {
         anyhow::bail!("unexpected status {} uploading object {}", resp.status(), &hex[..7]);
     }
