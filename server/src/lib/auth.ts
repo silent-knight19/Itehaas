@@ -99,3 +99,17 @@ export function csrfTokenForSession(sessionId: string): string {
     return crypto.randomBytes(24).toString('base64url');
   }
 }
+
+export function isCookieSecure(req?: any): boolean {
+  if (process.env.COOKIE_SECURE === 'true') return true;
+  if (process.env.COOKIE_SECURE === 'false') return false;
+  if (req) {
+    if (req.protocol === 'https') return true;
+    const proto = req.headers?.['x-forwarded-proto'];
+    if (typeof proto === 'string' && proto.toLowerCase().includes('https')) return true;
+    const host = req.headers?.['host'] || '';
+    if (host.startsWith('localhost') || host.startsWith('127.0.0.1')) return false;
+  }
+  return config.isProd && req?.protocol === 'https';
+}
+

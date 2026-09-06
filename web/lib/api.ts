@@ -12,29 +12,32 @@ export function getCsrfToken(): string | undefined {
 }
 
 export function getBaseUrl(): string {
-  const envUrl = process.env.NEXT_PUBLIC_API_URL;
-  if (envUrl !== undefined && envUrl !== '') {
-    if (typeof window !== 'undefined') {
-      try {
-        const parsed = new URL(envUrl);
-        // If both frontend and configured API URL are on localhost/127.0.0.1,
-        // use same-origin relative path so browser cookies and CSRF are completely same-origin.
-        if (
-          (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') &&
-          (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
-        ) {
-          return '';
-        }
-      } catch {}
-    }
-    return envUrl.replace(/\/+$/, '');
-  }
-  // Browser default: use relative path proxied by Next.js rewrites
   if (typeof window !== 'undefined') {
-    return '';
+    const envUrl = process.env.NEXT_PUBLIC_API_URL;
+    if (!envUrl) return '';
+    try {
+      const parsed = new URL(envUrl);
+      // In the browser, if the configured API is localhost/127.0.0.1 or matches the current hostname,
+      // ALWAYS use relative path ("") so requests go through Next.js proxy rewrites.
+      // This prevents Mixed Content (https -> http:3001) and ERR_CONNECTION_REFUSED on deployed sites.
+      if (
+        parsed.hostname === 'localhost' ||
+        parsed.hostname === '127.0.0.1' ||
+        parsed.hostname === window.location.hostname
+      ) {
+        return '';
+      }
+      // If deployed over HTTPS, refuse insecure HTTP to prevent browser Mixed Content blocking
+      if (window.location.protocol === 'https:' && parsed.protocol === 'http:') {
+        return '';
+      }
+      return envUrl.replace(/\/+$/, '');
+    } catch {
+      return '';
+    }
   }
-  // SSR fallback
-  return (process.env.INTERNAL_API_URL || 'http://127.0.0.1:3001').replace(/\/+$/, '');
+  // SSR fallback: prioritize INTERNAL_API_URL, then NEXT_PUBLIC_API_URL, then local default
+  return (process.env.INTERNAL_API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:3001').replace(/\/+$/, '');
 }
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';

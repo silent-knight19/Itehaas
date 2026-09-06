@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { query } from '../db';
-import { hashPassword, verifyPassword, validateUsername, validatePassword, validateEmail, sessionCookieName, newSessionExpiry, csrfTokenForSession } from '../lib/auth';
+import { hashPassword, verifyPassword, validateUsername, validatePassword, validateEmail, sessionCookieName, newSessionExpiry, csrfTokenForSession, isCookieSecure } from '../lib/auth';
 import { cleanupExpiredSessions, requireAuth } from '../middleware/auth';
 import { checkRateLimit, rateLimitReply, isLoginLocked, recordLoginFail, clearLoginFails, getLoginLockMs } from '../lib/rateLimit';
 import * as argon2 from 'argon2';
@@ -73,10 +73,11 @@ export async function authRoutes(app: FastifyInstance) {
       const sessionId = sess.rows[0].id;
       const csrfToken = csrfTokenForSession(sessionId);
 
+      const secure = isCookieSecure(req);
       reply.setCookie(sessionCookieName(), sessionId, {
         path: '/',
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
+        secure,
         sameSite: 'lax',
         expires,
       });
@@ -84,7 +85,7 @@ export async function authRoutes(app: FastifyInstance) {
       reply.setCookie('csrf_token', csrfToken, {
         path: '/',
         httpOnly: false,
-        secure: process.env.NODE_ENV === 'production',
+        secure,
         sameSite: 'lax',
         expires,
       });
@@ -162,10 +163,11 @@ export async function authRoutes(app: FastifyInstance) {
     const sessionId = sess.rows[0].id;
     const csrfToken = csrfTokenForSession(sessionId);
 
+    const secure = isCookieSecure(req);
     reply.setCookie(sessionCookieName(), sessionId, {
       path: '/',
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
+      secure,
       sameSite: 'lax',
       expires,
     });
@@ -173,7 +175,7 @@ export async function authRoutes(app: FastifyInstance) {
     reply.setCookie('csrf_token', csrfToken, {
       path: '/',
       httpOnly: false,
-      secure: process.env.NODE_ENV === 'production',
+      secure,
       sameSite: 'lax',
       expires,
     });

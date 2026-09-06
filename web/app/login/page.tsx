@@ -46,11 +46,15 @@ export default function LoginPage() {
         router.refresh();
       } else {
         setLoading(false);
-        setErr(res.json?.error || "Invalid username or password.");
+        const errMsg = res.json?.error || "Invalid username or password.";
+        console.error("[Login] Authentication failed:", errMsg, res.status);
+        setErr(errMsg);
       }
     } catch (e: any) {
       setLoading(false);
-      setErr(e.message || "Failed to connect to authentication server.");
+      const errMsg = e.message || "Failed to connect to authentication server.";
+      console.error("[Login] Exception during sign in:", e);
+      setErr(errMsg);
     }
   }
 
@@ -76,7 +80,15 @@ export default function LoginPage() {
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="space-y-3" autoComplete="on">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSubmit(e);
+            }}
+            action="javascript:void(0);"
+            className="space-y-3"
+            autoComplete="on"
+          >
             <div className="space-y-1">
               <label htmlFor="login-username" className="text-xs font-medium text-fg-secondary">
                 Username or Email

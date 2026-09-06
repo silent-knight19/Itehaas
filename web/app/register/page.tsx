@@ -59,11 +59,15 @@ export default function RegisterPage() {
         router.refresh();
       } else {
         setLoading(false);
-        setErr(res.json?.error || "Registration failed.");
+        const errMsg = res.json?.error || "Registration failed.";
+        console.error("[Register] Account creation failed:", errMsg, res.status);
+        setErr(errMsg);
       }
     } catch (e: any) {
       setLoading(false);
-      setErr(e.message || "Failed to connect to registration server.");
+      const errMsg = e.message || "Failed to connect to registration server.";
+      console.error("[Register] Exception during registration:", e);
+      setErr(errMsg);
     }
   }
 
@@ -89,7 +93,15 @@ export default function RegisterPage() {
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="space-y-3" autoComplete="on">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSubmit(e);
+            }}
+            action="javascript:void(0);"
+            className="space-y-3"
+            autoComplete="on"
+          >
             <div className="space-y-1">
               <label htmlFor="reg-username" className="text-xs font-medium text-fg-secondary">
                 Username
