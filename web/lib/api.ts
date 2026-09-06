@@ -82,19 +82,32 @@ export async function api(path: string, opts: FetchOpts = {}) {
   }
 }
 
+export function notifyAuthChange() {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('itehaas-auth-change'));
+  }
+}
+
 export const Api = {
   // System
   health: () => api('/health'),
 
   // Auth
   me: () => api('/api/auth/me'),
-  register: (payload: { username: string; email: string; password: string }) =>
-    api('/api/auth/register', { method: 'POST', body: JSON.stringify(payload) }),
-  login: (payload: { username: string; password: string }) =>
-    api('/api/auth/login', { method: 'POST', body: JSON.stringify(payload) }),
+  register: async (payload: { username: string; email: string; password: string }) => {
+    const res = await api('/api/auth/register', { method: 'POST', body: JSON.stringify(payload) });
+    if (res.ok) notifyAuthChange();
+    return res;
+  },
+  login: async (payload: { username: string; password: string }) => {
+    const res = await api('/api/auth/login', { method: 'POST', body: JSON.stringify(payload) });
+    if (res.ok) notifyAuthChange();
+    return res;
+  },
   logout: async () => {
     const res = await api('/api/auth/logout', { method: 'POST' });
     setCsrfToken(undefined);
+    notifyAuthChange();
     return res;
   },
 

@@ -21,7 +21,8 @@ export function Navbar() {
   const [user, setUser] = useState<{ id: string; username: string; email: string } | null>(null);
   const [latency, setLatency] = useState<number | null>(null);
   const [isHealthy, setIsHealthy] = useState<boolean>(true);
-  const pathname = usePathname();
+  const rawPathname = usePathname();
+  const pathname = rawPathname || "";
   const router = useRouter();
 
   async function checkUserAndHealth() {
@@ -54,7 +55,12 @@ export function Navbar() {
   useEffect(() => {
     checkUserAndHealth();
     const interval = setInterval(checkUserAndHealth, 15000);
-    return () => clearInterval(interval);
+    const handleAuthChange = () => checkUserAndHealth();
+    window.addEventListener("itehaas-auth-change", handleAuthChange);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener("itehaas-auth-change", handleAuthChange);
+    };
   }, [pathname]);
 
   async function handleLogout() {

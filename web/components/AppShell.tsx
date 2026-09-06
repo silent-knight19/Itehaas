@@ -31,7 +31,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [notifOpen, setNotifOpen] = useState(false);
   const [notifLoading, setNotifLoading] = useState(false);
 
-  const pathname = usePathname();
+  const rawPathname = usePathname();
+  const pathname = rawPathname || "";
   const router = useRouter();
 
   async function loadState() {
@@ -57,6 +58,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     loadState();
+    const handleAuthChange = () => {
+      loadState();
+    };
+    window.addEventListener("itehaas-auth-change", handleAuthChange);
+    return () => {
+      window.removeEventListener("itehaas-auth-change", handleAuthChange);
+    };
   }, [pathname]);
 
   async function loadNotifications() {

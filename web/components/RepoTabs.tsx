@@ -27,7 +27,8 @@ export function RepoTabs({
   pullsCount,
   ciStatus,
 }: RepoTabsProps) {
-  const pathname = usePathname();
+  const rawPathname = usePathname();
+  const pathname = rawPathname || "";
   const basePath = `/${owner}/${repo}`;
 
   const isCode = pathname === basePath;

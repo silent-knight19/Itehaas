@@ -21,8 +21,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className={`dark ${GeistSans.variable} ${GeistMono.variable}`}>
-      <body className="h-screen w-screen overflow-hidden bg-canvas text-fg-secondary antialiased font-sans">
+    <html lang="en" className={`dark ${GeistSans.variable} ${GeistMono.variable}`} suppressHydrationWarning>
+      <body className="h-screen w-screen overflow-hidden bg-canvas text-fg-secondary antialiased font-sans" suppressHydrationWarning>
         <ToastProvider>
           <AppShell>{children}</AppShell>
         </ToastProvider>

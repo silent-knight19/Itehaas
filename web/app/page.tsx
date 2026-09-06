@@ -49,7 +49,8 @@ function DashboardContent() {
 
   const searchParams = useSearchParams();
   const router = useRouter();
-  const pathname = usePathname();
+  const rawPathname = usePathname();
+  const pathname = rawPathname || "";
   const { toast } = useToast();
 
   async function loadData() {
@@ -86,6 +87,9 @@ function DashboardContent() {
     if (searchParams.get("create") === "true") {
       setModalOpen(true);
     }
+    const handleAuthChange = () => loadData();
+    window.addEventListener("itehaas-auth-change", handleAuthChange);
+    return () => window.removeEventListener("itehaas-auth-change", handleAuthChange);
   }, [searchParams, scope, pathname]);
 
   async function handleCreateRepo(e: React.FormEvent) {

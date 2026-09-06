@@ -1,12 +1,14 @@
 "use client";
 import React, { useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { ArrowRight, AlertCircle, Loader2 } from "lucide-react";
 import { Api } from "../../lib/api";
 import { useToast } from "../../components/Toast";
 import { Logo } from "../../components/Logo";
 
 export default function LoginPage() {
+  const router = useRouter();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState<string | null>(null);
@@ -14,12 +16,16 @@ export default function LoginPage() {
   const { toast } = useToast();
 
   React.useEffect(() => {
+    let active = true;
     Api.me().then((res) => {
-      if (res.ok && res.json?.user) {
-        window.location.href = "/";
+      if (active && res.ok && res.json?.user) {
+        router.replace("/");
       }
     });
-  }, []);
+    return () => {
+      active = false;
+    };
+  }, [router]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -36,7 +42,8 @@ export default function LoginPage() {
       const res = await Api.login({ username: cleanUsername, password });
       if (res.ok) {
         toast("Signed in successfully", "success");
-        window.location.href = "/";
+        router.push("/");
+        router.refresh();
       } else {
         setLoading(false);
         setErr(res.json?.error || "Invalid username or password.");
