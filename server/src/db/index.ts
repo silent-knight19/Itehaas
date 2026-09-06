@@ -21,8 +21,6 @@ export const pool = new Pool({
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000, // S8: bound connection wait
-  // S8: statement timeout 5s via options (also set per-connect)
-  options: '-c statement_timeout=5000',
 });
 
 pool.on('connect', (client) => {

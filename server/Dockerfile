@@ -21,6 +21,7 @@ COPY --from=vcs-builder /vcs/target/release/itehaas /usr/local/bin/itehaas
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/package.json ./package.json
 COPY --from=builder /app/node_modules ./node_modules
+RUN mkdir -p /data/repos && chown -R node:node /data/repos && chmod 755 /data/repos
 USER node
 EXPOSE 3001
 CMD ["node", "dist/index.js"]

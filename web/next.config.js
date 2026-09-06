@@ -37,5 +37,19 @@ const nextConfig = {
       },
     ];
   },
+  async rewrites() {
+    const upstream = process.env.INTERNAL_API_URL;
+    if (!upstream) return [];
+    return [
+      {
+        source: '/api/:path*',
+        destination: `${upstream}/api/:path*`,
+      },
+      {
+        source: '/health',
+        destination: `${upstream}/health`,
+      },
+    ];
+  },
 };
 module.exports = nextConfig;
