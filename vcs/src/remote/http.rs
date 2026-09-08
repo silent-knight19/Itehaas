@@ -640,11 +640,12 @@ pub fn upload_object_http(
         let req = req.set("Content-Type", "application/octet-stream");
         match req.send_bytes(&data) {
             Ok(r) => break r,
-            Err(ureq::Error::Status(429, resp)) if attempts <= 5 => {
+            Err(ureq::Error::Status(429, resp)) if attempts <= 10 => {
                 let delay = resp.header("retry-after")
                     .and_then(|h| h.parse::<u64>().ok())
-                    .unwrap_or(2);
-                std::thread::sleep(std::time::Duration::from_secs(delay.min(5)));
+                    .unwrap_or(5);
+                let sleep_secs = delay.clamp(1, 65) + 1;
+                std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
                 continue;
             }
             Err(e) => {
